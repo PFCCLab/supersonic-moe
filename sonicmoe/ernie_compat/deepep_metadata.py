@@ -206,7 +206,7 @@ def deepep_topk_to_sonic_metadata(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
 
     # ── Phase 2: Sort by expert (argsort) ──────────────────────────────
     # sort_perm: expert-sorted position → token-major position
@@ -293,44 +293,6 @@ def deepep_topk_to_sonic_metadata(
     )
 
 
-def _copy_tpe_h2d_async(tpe_list: list[int], device: str):
-    """
-    Copy a list of ints to the device fully asynchronously.
-    The host buffer is queued until the copy has completed to avoid broken content.
-    """
-    if not _HAS_CUDA_ART:
-        return torch.tensor(tpe_list, dtype=torch.int32, device=device)
-
-    if hasattr(torch, "CUDAPinnedPlace"):
-        cpu_tensor = torch.to_tensor(tpe_list, dtype=torch.int32, place=torch.CUDAPinnedPlace())
-    else:
-        cpu_tensor = torch.tensor(tpe_list, dtype=torch.int32, pin_memory=True)
-    gpu_tensor = torch.empty_like(cpu_tensor, device=device)
-    current_stream = torch.cuda.current_stream(device)
-
-    (err,) = cudart.cudaMemcpyAsync(
-        gpu_tensor.data_ptr(),
-        cpu_tensor.data_ptr(),
-        cpu_tensor.nbytes if hasattr(cpu_tensor, "nbytes") else cpu_tensor.size * cpu_tensor.itemsize,
-        cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
-        getattr(current_stream, "stream_base", current_stream).cuda_stream,
-    )
-    assert err == cudart.cudaError_t.cudaSuccess, f"cudaMemcpyAsync failed: {err}"
-
-    event = torch.cuda.Event()
-    event.record()
-    pin_memory_queue.append((cpu_tensor, event))
-
-    while pin_memory_queue:
-        _, event = pin_memory_queue[0]
-        if event.query():
-            pin_memory_queue.popleft()
-        else:
-            break
-
-    return gpu_tensor
-
-
 # ── CUDA topk implementation ─────────────────────────────────────────────────
 
 
@@ -370,12 +332,12 @@ def _copy_tpe_h2d_async(tpe_list, device):
 
     event = torch.cuda.Event()
     event.record()
-    _pin_memory_queue.append((cpu_tensor, event))
+    pin_memory_queue.append((cpu_tensor, event))
 
-    while _pin_memory_queue:
-        _, ev = _pin_memory_queue[0]
+    while pin_memory_queue:
+        _, ev = pin_memory_queue[0]
         if ev.query():
-            _pin_memory_queue.popleft()
+            pin_memory_queue.popleft()
         else:
             break
 
@@ -422,7 +384,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
 
     expert_offsets = torch.empty([E + 1], dtype=torch.int32)
     seg_starts = torch.empty([E], dtype=torch.int32)
@@ -448,10 +410,18 @@ def _deepep_topk_to_sonic_metadata_cuda(
     naept = torch.empty(N_recv + 1, dtype=torch.int32, device=device)
     score_src_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
-    # Workspace: block_hist[B*E] + block_offset[B*E] + block_naept_sum[B] +
-    # block_naept_base[B] + 1 (legacy completion_flag tail).
     num_blocks = (N_recv + 31) // 32  # ROWS_PER_BLOCK = 32
-    cumsum_workspace = torch.empty([2 * num_blocks * E + 1], dtype=torch.int32)
+    # Workspace layout (must match kernel.cu's launcher partition):
+    #   block_hist[scatter_blocks*E] + block_offset[scatter_blocks*E]
+    #   + block_naept_sum[scatter_blocks] + block_naept_base[scatter_blocks]
+    # = 2*num_blocks*(E+1) int32 slots.
+    # NOTE: an earlier (pre-session-71) layout used `2*num_blocks*E + 1`
+    # (single int32 completion-flag tail). The session-71 kernel rewrite added
+    # per-block naept arrays but did not update this caller, causing the
+    # launcher to write `2*num_blocks` ints past the buffer end -> silent
+    # cudaErrorIllegalAddress in downstream consumers when the OOB region
+    # happens to sit on top of a live allocation. Keep this size exact.
+    cumsum_workspace = torch.empty([2 * num_blocks * (E + 1)], dtype=torch.int32)
 
     _stream_obj = torch.cuda.current_stream(device)
     stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream

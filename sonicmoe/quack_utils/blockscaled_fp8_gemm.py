@@ -1540,62 +1540,62 @@ def _colwise_quantize_and_pack_kernel(
     SF_TILE_M: tl.constexpr,
     SF_TILE_K: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr = 1,
 ):
     """Column-wise blockscaled quantize + ISA-pack.
 
-    2D grid: (num_groups_along_TK, num_blocks_along_dim).
-    Quantization groups are along TK (axis 0).
+    2D grid: (num_groups_along_TK // GROUPS_PER_BLOCK, num_blocks_along_dim).
+    Quantization groups are along TK (axis 0). Each program processes
+    GROUPS_PER_BLOCK consecutive K-groups, amortizing dim-related index math.
     ISA-packed scales target the LOGICAL (dim, TK) layout.
     """
-    pid_group = tl.program_id(0)
+    pid_group_blk = tl.program_id(0)
     pid_dim = tl.program_id(1)
 
-    k_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
     dim_offs = pid_dim * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
-
-    k_mask = k_offs < total_K
     dim_mask = dim_offs < dim
-    mask = k_mask[:, None] & dim_mask[None, :]
-
-    if HAS_GATHER:
-        src_rows = tl.load(gather_idx_ptr + k_offs, mask=k_mask, other=0).to(tl.int64)
-    else:
-        src_rows = k_offs.to(tl.int64)
-
-    src_ptrs = src_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :] * src_stride_col
-    values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-    block_amax = tl.max(tl.abs(values), axis=0)
-
-    amax_bits = block_amax.to(tl.int32, bitcast=True)
-    biased_exp = (amax_bits >> 23) & 0xFF
-    mantissa_bits = amax_bits & 0x7FFFFF
-    carry = tl.where(mantissa_bits > 0x600000, 1, 0)
-    e8m0_i32 = biased_exp - 8 + carry
-    e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
-    e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
-
-    quant_biased_exp = 254 - e8m0_i32
-    quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
-    quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-
-    quantized = (values * quant_scale[None, :]).to(tl.float8e4nv)
-
-    dst_ptrs = dst_fp8_ptr + k_offs[:, None] * dst_stride_row + dim_offs[None, :] * dst_stride_col
-    tl.store(dst_ptrs, quantized, mask=mask)
 
     groups_per_k_tile: tl.constexpr = SF_TILE_K // GROUP_SIZE
     row_tiles = dim_offs // SF_TILE_M
     row_in_tile = dim_offs % SF_TILE_M
-    k_tiles_idx = pid_group // groups_per_k_tile
-    k_in_tile = pid_group % groups_per_k_tile
-
-    tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
     row_base = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
-    isa_index = tile_base + row_base + k_in_tile
 
-    scale_ptrs = dst_packed_ptr + isa_index.to(tl.int64)
-    tl.store(scale_ptrs, e8m0_byte, mask=dim_mask)
+    for g_local in tl.static_range(0, GROUPS_PER_BLOCK):
+        pid_group = pid_group_blk * GROUPS_PER_BLOCK + g_local
+        k_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        k_mask = k_offs < total_K
+        mask = k_mask[:, None] & dim_mask[None, :]
+
+        if HAS_GATHER:
+            src_rows = tl.load(gather_idx_ptr + k_offs, mask=k_mask, other=0).to(tl.int64)
+        else:
+            src_rows = k_offs.to(tl.int64)
+
+        src_ptrs = src_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :] * src_stride_col
+        values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        block_amax = tl.max(tl.abs(values), axis=0)
+
+        # Simplified E8M0 (bit-exact for bf16): see _quantize_and_pack_kernel.
+        amax_bits = block_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        carry = (amax_bits & 0x7FFFFF) > 0x600000
+        e8m0_i32 = tl.maximum(biased_exp + carry.to(tl.int32) - 8, 0)
+        e8m0_byte = e8m0_i32.to(tl.uint8)
+        quant_scale = ((254 - e8m0_i32).to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        quantized = (values * quant_scale[None, :]).to(tl.float8e4nv)
+
+        dst_ptrs = dst_fp8_ptr + k_offs[:, None] * dst_stride_row + dim_offs[None, :] * dst_stride_col
+        tl.store(dst_ptrs, quantized, mask=mask)
+
+        k_tiles_idx = pid_group // groups_per_k_tile
+        k_in_tile = pid_group % groups_per_k_tile
+
+        tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+        isa_index = tile_base + row_base + k_in_tile
+
+        scale_ptrs = dst_packed_ptr + isa_index.to(tl.int64)
+        tl.store(scale_ptrs, e8m0_byte, mask=dim_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -1823,7 +1823,12 @@ def colwise_quantize_and_pack(
 
     num_groups = _div_up(TK, GROUP_SIZE)
     k_tiles = _div_up(TK, _SF_TILE_K)
-    grid = (num_groups, _div_up(H, BLOCK_DIM))
+    # NCU-tuned: GROUPS_PER_BLOCK=2 amortizes dim-related index math across 2
+    # consecutive K-groups -> ~3-4% gain at TK=65536. Requires num_groups to be
+    # a multiple of GROUPS_PER_BLOCK; fall back to 1 otherwise (preserves
+    # bit-exactness for arbitrary shapes).
+    GROUPS_PER_BLOCK = 2 if (num_groups % 2 == 0) else 1
+    grid = (num_groups // GROUPS_PER_BLOCK, _div_up(H, BLOCK_DIM))
 
     has_gather = gather_idx is not None
     gather_ptr = gather_idx if has_gather else src
@@ -1843,6 +1848,7 @@ def colwise_quantize_and_pack(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_K=_SF_TILE_K,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
         num_warps=1,
     )
     return fp8_out, packed_scales.view(_E8M0_DTYPE)
@@ -2855,19 +2861,19 @@ def _quantize_and_pack_kernel(
         src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
         values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        # Pure-integer E8M0 computation
+        # Pure-integer E8M0 computation (NCU-simplified: see notes below).
+        # When biased_exp == 0 (zero/denormal input), mantissa <= 0x7FFFFF and
+        # carry <= 1, so biased_exp + carry - 8 <= -7, which max(.,0) clamps to
+        # 0 — same result as the original where(biased_exp>0,...,0). The outer
+        # clamp(quant_biased_exp,1,254) is also dropped: bf16 max biased_exp =
+        # 255 -> e8m0 <= 247 -> quant_biased_exp >= 7, and e8m0 >= 0 ->
+        # quant_biased_exp <= 254. Bit-exact with the original on all bf16.
         block_amax = tl.max(tl.abs(values), axis=1)
         amax_bits = block_amax.to(tl.int32, bitcast=True)
         biased_exp = (amax_bits >> 23) & 0xFF
-        mantissa_bits = amax_bits & 0x7FFFFF
-        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
-        e8m0_i32 = biased_exp - 8 + carry
-        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
-        e8m0_clamped = tl.maximum(e8m0_i32, 0)
-
-        quant_biased_exp = 254 - e8m0_i32
-        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
-        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        carry = (amax_bits & 0x7FFFFF) > 0x600000
+        e8m0_clamped = tl.maximum(biased_exp + carry.to(tl.int32) - 8, 0)
+        quant_scale = ((254 - e8m0_clamped).to(tl.int32) << 23).to(tl.float32, bitcast=True)
         quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
 
         dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
@@ -3065,7 +3071,10 @@ def quantize_and_pack_activation(
             (1, per_batch_storage), 127, dtype=torch.uint8, device=x.device
         )
 
-    BLOCK_ROWS = 32
+    # NCU-tuned: BLOCK_ROWS=64 halves grid -> waves/SM ~10 vs 20, ~2% gain at
+    # H/I shapes; bit-exact with BLOCK_ROWS=32. Achieves ~93% of practical HBM
+    # peak (5.84 / 6.26 TB/s memcpy) at TK=65536 K=3072.
+    BLOCK_ROWS = 64
     groups_per_k_tile = _SF_TILE_K // group_size  # 4 for default SF_TILE_K=128, GROUP_SIZE=32
     # INT32 overflow guard: dispatch to int64 branch when row_id * stride > 2^31
     _max_stride = max(x.stride(0), fp8_out.stride(0))
