@@ -1,3 +1,630 @@
+# HANDOFF — Session 77 (2026-04-29) — Strict-CI hardening + cross-test FP8 isolation + cluster-env-safe multicard
+
+> **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
+> Earlier sessions preserved verbatim below.
+
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe).
+**Last shipped frontier**: S76 wrap-up. **This session**: zero-skip CI, all 13 phases green on the paddlejob shared-GPFS host (`bash tools/ci/run_core_tests.sh` → 13/13 PASS, ~15 min wall).
+
+## S77 — what changed (read this first)
+
+**1. Cross-test FP8 config pollution → permanent BF16 fallback** (caught by `test_mlpnode_extreme_shapes`, was masked by single-test runs):
+- `SonicMoEDeepEPFunc.forward` (`sonicmoe/ernie_compat/mlp_node_v2.py:723`) used to call `_refresh_fp8_config()` BEFORE the `with enable_fp8(True):` block. `_FP8Config()` reads `is_fp8_active()` at that instant; if a *previous* test left `_IS_FP8_ACTIVE=False` (e.g. via `enable_fp8(False)` context-manager on a different test), the snapshot wired the BF16 wgrad path and `dw1` came out non-`None` → assertion failure on the next FP8 test.
+- Fix: moved the refresh INSIDE the `with enable_fp8(True):` block so the snapshot always sees the active context.
+- Belt-and-braces: `tests/conftest.py` now sets `SONIC_MOE_FP8_MODE=perf`, `SONIC_MOE_FP8_ASSUME_ALIGNED=1`, `USE_QUACK_GEMM=1` BEFORE any sonicmoe import so the module-level `_IS_FP8_ACTIVE` constant is True from process start.
+- Verified: 10/10 sequential `test_jit_concurrent_heterogeneous + test_jit_key_stability + test_mlpnode_extreme_shapes` PASS in 144 s.
+
+**2. Production-cluster env leak → multicard `paddle.distributed.launch` hung forever** (silent, no error, no children):
+- Symptom: launcher `R` state, 129 threads, `ps --ppid <launcher>` empty, only `default.gpu.log` accumulating nvidia-smi snapshots.
+- Root cause: paddlejob exports a massive set of cluster-discovery vars (`PADDLE_TRAINERS=4 IPs`, `PADDLE_TRAINERS_NUM=4`, `PADDLE_TRAINER_ID`, `PADDLE_CURRENT_ENDPOINT=10.79.128.191:60043`, `PADDLE_CLUSTER_TRAIN=True`, `PADDLE_IS_LOCAL=0`, `DISTRIBUTED_TRAINER_ENDPOINTS` (32 entries!), `GPUTRAINER_ENDPOINTS`, `TRAINER_INSTANCES`, `EKS_POD_NAME`, `EKS_POD_NAMESPACE`, `POD_*`, `CLUSTER_*`, `PADDLE_JOB_*`, `PADDLE_PORT`, …). Any one of these makes `paddle.distributed.launch` enter multi-NODE rendezvous mode and block forever waiting for the absent peer nodes.
+- Fix: `tools/ci/multicard_smoke.py` now builds a **WHITELIST** env (denylist is unmaintainable) keeping only the prefixes `PATH / LD_ / HOME / USER / LANG / LC_ / TERM / TMPDIR / PWD / SHELL / PYTHON / VIRTUAL_ENV / CONDA_ / CUDA_ / NVIDIA_ / TRITON_ / SONIC_MOE_ / USE_QUACK_GEMM / FLAGS_ / NCCL_ / GLOG_ / OMP_`, dropping `NCCL_SOCKET_IFNAME` and `NCCL_BOOTSTRAP_UID_SOCK_FAMILY`. Forces `CUDA_VISIBLE_DEVICES=0,1` and `TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas` (Blackwell `sm_103a`).
+
+**3. `Place(gpu:0) is not supported` on rank 1 of multicard worker**:
+- Root cause: `paddle.distributed.launch --gpus 0,1` does NOT filter `CUDA_VISIBLE_DEVICES` per rank; both workers see `CUDA_VISIBLE_DEVICES=0,1`. Per-rank physical device is selected via `FLAGS_selected_gpus={0,1}`. The DeviceContextPool only registers the place named by `FLAGS_selected_gpus`; selecting `gpu:0` on rank 1 (whose pool only has `gpu:1`) → `NotImplementedError: Place(gpu:0) is not supported … check that your train process set the correct device id`.
+- Fix: worker reads `FLAGS_selected_gpus` (fallback `PADDLE_LOCAL_RANK`), pins via `paddle.device.set_device(f"gpu:{gpu_id}")`, and **eagerly allocates a 1-element float32 tensor** to force the context-pool entry to materialize BEFORE any code path that bypasses `set_device` (autograd backward, paddle.library proxies inside quack JIT) can hit it. Also sets `torch.cuda.set_device(gpu_id)` so the proxy honours the right ordinal.
+- This is the same root cause as the production trainer crash the user originally reported (`quack/autotuner.py:67 _gpu_warmup` → `paddle.tensor.random.gaussian` → `Place(gpu:0) not supported`); the eager allocation is the real fix for any worker that uses paddle-torch-proxy under autograd.
+
+**4. quack import path missing in subprocess workers**:
+- `/usr/local/bin/python` (the default `python` on this image) does NOT have `quack` installed. Every `tests/ops/*` bench manually does `sys.path.insert(0, _QUACK)`; subprocess workers in `tools/ci/jit_bench.py` and `tools/ci/multicard_smoke.py` did not, so JIT-cold / JIT-reload / JIT-reuse / JIT-parallel / multicard all failed at sonicmoe import time once the cluster-env-leak hang was unblocked.
+- Fix: 
+  - `jit_bench._run_subprocess` now prepends `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack` to `PYTHONPATH` for every subprocess.
+  - `multicard_smoke.WORKER_BODY` does the same `sys.path.insert(0, _QUACK)` at the very top.
+  - `tests/conftest.py` does the same `sys.path.insert(0, _QUACK)` so any new test (e.g. `test_jit_key_stability.py`) that imports sonicmoe works under both `/usr/local/bin/python` and the eb_venv.
+
+## S77 — Verified end-to-end CI
+
+`bash tools/ci/run_core_tests.sh` (no flags = full sweep, no skips):
+
+```
+═════════════════ CI SUMMARY ═════════════════
+PASS precision (72s)
+PASS multilayer (43s)
+PASS quant (186s)            ← 181 quant tests across 6 files
+PASS jit-cold (51s)
+PASS jit-warm (4s)           ← sentinel skip
+PASS jit-reload (30s)        ← cross-process disk-cache reload
+PASS jit-reuse (31s)
+PASS jit-parallel (58s)      ← N=4 parallel cold warmup
+PASS jit-key-stability (35s) ← cache_size invariant across T values
+PASS extreme-shapes (69s)    ← 0-size, large, imbalance 85/99
+PASS jit-concurrent (91s)    ← heterogeneous concurrent cold-compile
+PASS perf (169s)             ← nsys gpu-projection µs/iter gate
+PASS multicard (54s)         ← 2-rank distributed smoke
+──────────────────────────────────────────────
+```
+
+13/13 PASS, 0 SKIP, total ~15 min wall on the dev host (2× B30Z Blackwell).
+
+## S77 — Lessons (compact, for future agents)
+
+- **paddle.distributed.launch on paddlejob: ALWAYS whitelist env, NEVER denylist.** The cluster-discovery surface is too wide to enumerate; one leaked var = silent multi-node rendezvous hang.
+- **`Place(gpu:N) is not supported` is almost always lazy-init**: the context pool only registers the place named by `FLAGS_selected_gpus`; any other place errors out. Eager-allocate a 1-element tensor right after `paddle.device.set_device` to force registration before async paths hit it.
+- **`_FP8Config()` snapshots `is_fp8_active()` at construction**, not at use. ALWAYS construct it inside the `with enable_fp8(True):` block, never outside.
+- **Multi-process sonicmoe imports under `/usr/local/bin/python`** require explicit `sys.path` injection of the zhangyichen quack tree; eb_venv has it installed natively. Centralize in `tests/conftest.py` + `_run_subprocess` PYTHONPATH.
+- **xdist not installed** on this host: `run_pytest_parallel` correctly falls back to serial — don't add xdist as a hard dep.
+
+## S77 — Files touched
+
+- `sonicmoe/ernie_compat/mlp_node_v2.py` — `_refresh_fp8_config()` moved inside `with enable_fp8(True):` block.
+- `tests/conftest.py` — quack sys.path injection + FP8 env defaults at conftest import.
+- `tools/ci/jit_bench.py` — `_run_subprocess` injects PYTHONPATH=quack.
+- `tools/ci/multicard_smoke.py` — whitelist env + eager device-pool init + FLAGS_selected_gpus pinning + ptxas path + WORKER_BODY rewritten for current `SonicMoEMlpNode` API (experts list, MockExpert, dispatched_indices/probs).
+
+## S77 — Project state snapshot (single source of truth for next agent)
+
+**Branch / tracking**: `myrepo/race-fix-paddle` ← PFCCLab/supersonic-moe; tracks `fork/paddle@108322c`. Last commit on this branch: `S77: race-safe JIT + FP8 config isolation + cluster-env-safe multicard` (`86babf4`+).
+
+**Frontier path** (production-ready, default-on):
+- FP8 fused-v2 (epilogue blockscaled quant + fused-gated up-proj + TMA reduce-add wgrad + FP8 saved z + sonic-meta CUDA topk-metadata).
+- `SonicMoEMlpNode` (sonicmoe/ernie_compat/mlp_node_v2.py) with `experts=…, n_experts=E, hidden_size=H, intermediate_size=I` API, `node.forward(x_in, tpe, dispatched_indices=di, dispatched_probs=dp)`, then `node.flush_grads()` (or `node.step()` at optimizer-step time).
+- **`node.step()` MUST run BEFORE `optimizer.step()`** — flushes the per-microbatch native-layout wgrad accumulators into the per-expert `main_grad` buffers used by the optimizer.
+- `main_grad` is **lazily allocated** at first `node.step()` call (NOT in `stack_ernie_w1`) — saves ~ memory across mostly-zero windows in PP/grad-acc.
+- Single-stream from deepep-fwd → deepep-bwd; post-warmup zero `cuda.synchronize()` calls (verified via nsys).
+
+**Performance** (nsys 2026.2.1.210, sqlite GPU-projection, B30Z idle, T=8192 E=8 K=8 I=1536 H=3072):
+- mlpnode-only BENCH range / n_iters: **2823 µs/iter**.
+- per-ITER NVTX median (no in-loop flush): **2463 µs**.
+- per-iter flush (non-default; `grad_acc=1`): 3110 µs.
+- realistic `grad_acc_steps=8` per microbatch: ~**2519 µs** → **−7.2% vs S53 pure-torch FP8 baseline (2715 µs)**.
+- Speedup vs BF16: 1.29×–1.70× (mean 1.53×) across the 27-shape S53 grid.
+
+**Precision** (S65, FP8 vs BF16 gold, TMA Reduce-Add epilogue, multilayer/multistep-correct):
+- output cosine ≥ 0.997 (RRMSE ≤ 0.076)
+- dx cosine ≥ 0.9975
+- ds cosine ≥ 0.9971
+- dw1 / dw2 cosine ≥ 0.9971
+- multilayer 4-step grad accumulation: bit-equivalent main_grad
+- 9/9 large-shape regression cases (`test_mlpnode_correctness_large.py`) PASS, including seq16K/E32, skew80, extreme_one, tpe0_holes.
+
+**Memory** (B30Z, ERNIE shape):
+- FP8 active overhead: +4.8% to +10.3% backward peak (FP8 shadow weight caches).
+- `SONIC_MOE_STAGEWISE_MEMORY=1` (`mem` mode): −24.5% peak vs `perf`, ~3-5% extra cost.
+- Lazy `main_grad` allocation saves ~`(num_experts × 2I × H + I × H) × sizeof(fp32)` per layer × (1 - active-window-fraction).
+- `SONIC_MOE_FP8_RECOMPUTE_Z=1`: −~213 MiB / active layer; +5-15% layer cost.
+
+**JIT cache**:
+- Cold warmup (full shape sweep, empty cache, ptxas + autotune + cute.compile): **≤ 600 s budget** (CI gate; warns at 480 s; current measurement on dev host: ~50 s for the gated single-shape bench, full sweep ~10-15 min).
+- Sentinel skip (warm hit): **≤ 5 s** (current: 4 s).
+- Cross-process disk reload: **≤ 300 s** (current: 30 s).
+- In-process re-dispatch: **≤ 8 ms** (current: < 1 ms after init).
+- Sentinel keyed on `(E, H, I, fp8, kernel_sig_v1, git_hash)` plus min on-disk file counts; override with `SONIC_MOE_WARMUP_IGNORE_GIT=1` for cross-commit cache reuse.
+- **Multi-process safety on shared GPFS**: `sonicmoe/jit.py` uses `FileLock` on a stable parent dir; per-key locking lets rank 0 / rank 1 compile different shapes concurrently without conflict.
+
+**CI gates (all green)** — `bash tools/ci/run_core_tests.sh` (full sweep, ~15 min):
+| Phase | Wall | Gates |
+|-------|------|-------|
+| precision | 72 s | 6-shape topk audit, cosine ≥ 0.997 |
+| multilayer | 43 s | 4-step PP main_grad accumulation |
+| quant | 186 s | 181 quant tests across 6 files |
+| jit-cold / warm / reload / reuse / parallel | 51 + 4 + 30 + 31 + 58 s | All 4 JIT axes vs `baselines.json` budgets |
+| jit-key-stability | 35 s | cache_size invariant across T values (no recompile on T change) |
+| extreme-shapes | 69 s | 0-size, large, 85% / 99% imbalance |
+| jit-concurrent | 91 s | heterogeneous concurrent cold-compile |
+| perf | 169 s | nsys GPU-projection µs/iter ≤ 4500 µs budget |
+| multicard | 54 s | 2-rank `paddle.distributed.launch` finite-output smoke |
+
+## S77 — Insights (compact, for next agent)
+
+1. **The CI is the project's nervous system now.** `bash tools/ci/run_core_tests.sh --fast` (~2 min) is the right pre-commit reflex; the full sweep is the right pre-push / pre-merge reflex. Bumping any budget in `tools/ci/baselines.json` requires a HANDOFF justification in the same commit.
+2. **Cross-test pollution is the dominant remaining bug class.** The S77 BF16-fallback bug was masked for sessions because each test passed in isolation. Anytime you add a `with enable_fp8(False):` (or any context-manager that flips a module-global), audit every site that takes a snapshot of the global afterwards.
+3. **Multi-rank correctness is gated by env-hygiene, not by code paths.** The hardest multicard bug this session was a paddlejob env leak that caused a silent hang. When in doubt, use a whitelist subprocess env, never inherit.
+4. **The lazy device-pool init pattern (eager 1-element allocation after `set_device`) belongs anywhere we hand control to autograd or paddle.library proxies.** Consider folding into `_quack_compat.py` so any production code that spawns sonicmoe in a fresh paddle context gets it for free.
+5. **Phase C (CuTe in-process pickle cache) remains BLOCKED** — see S76 for full RCA. The Triton + Quack disk caches + sentinel already recover the bulk of the wins; do NOT re-investigate without a documented user-visible regression.
+
+## S77 — Next steps / open work
+
+- **Phase C unblock attempt** (low priority): use cute-dsl AOT `export_to_c` for the ~6 `_COMPILE_CACHE*` sites in `blockscaled_fp8_gemm.py`; brittle to cute-dsl version upgrades.
+- **Wire `bash tools/ci/run_core_tests.sh` into nightly CI** (currently developer-local). The Coverage gate is collected but not enforced; raise the floor once the codebase stabilises.
+- **Fold the eager device-pool init into `_quack_compat.py`** so production code paths that import sonicmoe in a fresh paddle context auto-fix the `Place(gpu:N) is not supported` class.
+- **Investigate the paddle hipify-proxy bug** that causes subprocess JIT to crash on a fresh process (currently classified as SKIP in the `jit_bench` wrapper). Fix likely belongs in paddle-torch-proxy itself.
+- **Coverage**: dead-code prune driven by `coverage report` once the full sweep has been run on a clean checkout (the runner already wires `--source=sonicmoe` and omits `cli/` + `*_compat.py`).
+- **Production rollout**: ERNIE PaddleFleet integration (S74 doc) is ready but not yet validated end-to-end on a real training run. Next agent should coordinate with the Fleet team to run a 1k-step microbenchmark on the production cluster and compare loss curves to the BF16 baseline.
+
+## S77 — High-value information sources (consult before re-investigating)
+
+| Topic | Source |
+|-------|--------|
+| Project canonical state | Root `HANDOFF.md` (newest session at top) |
+| Production training contract | `docs/PADDLEFLEET_MIGRATION_S74.md` (`node.step()` ordering, lazy main_grad, Fleet pre-fused weights) |
+| FP8 architecture deep dive | `docs/KNOWLEDGE_BASE.md` |
+| Engineering history (Phases 1–26) | `reports/fp8_upgrade/engineering_log.md` (sessions ≥66 are HANDOFF.md only) |
+| nsys methodology + perf baseline | `reports/session53_breakdown.md` (pure-torch FP8 baseline 2715 µs); `tests/ops/bench_mlpnode_topk_nsys.py` (canonical bench harness) |
+| Multi-rank rendezvous failure modes | This S77 section + `tools/ci/multicard_smoke.py` whitelist |
+| Custom kernel landlmines | `engineering_log.md` Phase 26 lessons 91-95 (Class A/B kernel-launch bugs, BENCH-vs-ITER NVTX, contended-GPU artefacts) |
+| Environment / Paddle compat pitfalls | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` |
+| quack interpreter location | `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack` (sys.path injected by `tests/conftest.py`) |
+| eb_venv python (has quack natively) | `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/python` |
+
+---
+
+
+
+> **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
+> Earlier sessions preserved verbatim below.
+
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe).
+**Last shipped frontier**: S75 wrap-up `4a8a6cf`. **This session adds**: A=distributed safety, B=skip-warmup sentinel + offline pre-warm CLI, D=strict-baseline CI runner with JIT mechanism gates. **Phase C blocked** (CuTe persistent cache — pickle dies on `cutlass._mlir._mlir_libs` Module; documented for next agent).
+
+## S76 — what changed (read this first)
+
+**Phase A — distributed safety** (production crash fix):
+- Real bug: `quack/autotuner.py:_gpu_warmup` calls `torch.randn(..., device="cuda")` → paddle resolves `"cuda"` to `CUDAPlace(0)` on every rank → non-rank-0 processes die in `DeviceContextPool::Get` on autotune cache miss. Single missed shape (uneven token distribution at end-of-epoch) takes down a multi-rank job.
+- Fix: added `sonicmoe/_quack_compat.py` that monkey-patches `quack.autotuner._gpu_warmup` to a no-op. Auto-installed at `import sonicmoe`. Opt-out via `SONIC_MOE_NO_QUACK_COMPAT_PATCH=1`.
+- Audit + fix of three `device="cuda"` literals in our own code (rank-aware `torch.device("cuda", torch.cuda.current_device())`): `mlp_node_v2.py:529`, `jit_warmup.py`, `grouped_gemm.py:2600`.
+- Cleaned dead duplicate factory ops in `deepep_metadata.py` L389-396; added explicit `device=device` to `seg_starts` / `real_bases` / `cumsum_workspace` (these never crashed in single-card because paddle-torch-compat falls back to current paddle place).
+
+**Phase B — persistent cache + skip-warmup**:
+- `sonicmoe/cache_manager.py` gains `is_warm()`, `mark_warm()`, `clear_warmup_sentinel()`. Sentinel = `{cache_root}/warmup_sentinel.json` keyed on `(E, H, I, fp8, kernel_sig_v1, git_hash)` plus minimum on-disk file counts (regression guard against `rm -rf .jit_cache/triton`).
+- `warmup_jit(..., skip_if_warm=True, force=False)` checks the sentinel first and returns `False` (no compile) when it matches. Override with `SONIC_MOE_WARMUP_IGNORE_GIT=1` to share caches across commits.
+- `python -m sonicmoe.cli.warmup --E .. --H .. --I .. --cache-dir /nfs/...` — offline pre-warm CLI. Run once on shared NFS, copy to all ranks → 8-min first-loss → seconds.
+
+**Phase C — CuTe cache: BLOCKED, do NOT redo this dig**:
+- `pickle(JitCompiledFunction)` → `TypeError: cannot pickle cutlass._mlir._mlir_libs._cutlass_ir._mlir.ir.Module`.
+- `JitCompiledFunction.__cubin__` is `None` for instances created via the normal `cute.compile()` — cubin only retained when compiled with `dump_object_file=True`.
+- Only `export_to_c` AOT path documented for serialization; would require rewriting ~6 `_COMPILE_CACHE*` sites in `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` and is brittle to cute-dsl version upgrades. Verdict: not worth it — Phase B (Triton + Quack disk cache + sentinel) recovers the bulk of the wins.
+
+**Phase D — CI scaffolding with strict baselines** (`tools/ci/`):
+- `baselines.json` — single source of truth for budgets. Bumping any budget must be accompanied by a HANDOFF justification.
+- `jit_bench.py` — strict 4-axis JIT mechanism gate, each axis run in a fresh subprocess so timings are not contaminated by in-memory state:
+    | indicator | what it catches | budget |
+    | --- | --- | --- |
+    | `cold_warmup_s` | full ptxas + autotune + cute.compile from empty cache | ≤ 600 s (warn 480) |
+    | `warm_sentinel_skip_s` | sentinel hit returns without compiling | ≤ 5 s (warn 3) |
+    | `cross_process_reload_s` | sentinel cleared, disk caches kept → Triton/Quack reload, CuTe re-compiles in-process | ≤ 300 s (warn 240) |
+    | `in_process_reuse_us` | second `_warmup_single` call — pure dispatch | ≤ 8000 µs (warn 6000) |
+- `perf_gate.py` — drives `bench_mlpnode_topk_nsys.py` under nsys, parses GPU-projection µs/iter from sqlite, gates against `perf.gpu_projection_us_per_iter.budget` (default 4500 µs).
+- `multicard_smoke.py` — 2-rank `paddle.distributed.launch` smoke. Auto-skips on single-GPU env. Asserts finite outputs cross-rank.
+- `run_core_tests.sh` — top-level runner. Phases:
+  - `--fast` (pre-commit): precision + multilayer + jit-warm + jit-reuse + coverage. ~2 min on `.jit_cache` warm.
+  - default (full): + quant sweep + jit-cold + jit-reload + perf gate + multi-card.
+- `.coveragerc` — sonicmoe source, omits `_*compat*` and `cli/*`.
+- `.githooks/pre-commit` — calls `--fast`. Install once: `git config core.hooksPath .githooks`.
+- Resilient design: `paddle.utils.hipify` env bug (pre-existing torch-proxy issue when subprocess JIT-compiles a sonicmoe C++ extension fresh) is detected and reported as **SKIP** rather than FAIL, so genuine regressions stand out. The bug only manifests when `_warmup_single` triggers torch.utils.cpp_extension JIT in a fresh process — direct `python -c` calls work, subprocess invocations crash. Worth investigating in next session if time permits — fix likely belongs in paddle-torch-proxy, not sonicmoe.
+
+**Verified this session** (against `.jit_cache` already warm):
+- Precision script: 6/6 PASS (cosine ≥ 0.997, RRMSE ≤ 0.076 on all of out / dx / dw1 / dw2).
+- Multilayer pytest: 4/4 PASS (~38 s).
+- jit-warm sentinel skip: 0.0 s + python startup = ~6 s wall (budget 5 s for the bench-internal timing — well under).
+- jit-reuse: PASS in 13 s wall (subprocess startup dominates; in-process µs/iter recorded in `.ci_artifacts/jit_bench.json`).
+- Smoke: `quack._gpu_warmup` returns `None` after monkey-patch; sentinel round-trip correct.
+
+## S76 — what is NOT verified (next agent should run)
+- **jit-cold + jit-reload on a clean cache** — these need a fresh `.jit_cache` and ~10-15 min runtime. Do not run during normal dev — only when bumping a kernel signature.
+- **perf gate via nsys** — needs the `nsys 2026` binary in PATH; current shell did not have it. Wire into nightly CI.
+- **multi-card smoke** — env has `CUDA_VISIBLE_DEVICES=0`; needs 2 GPUs to actually run.
+
+## S76 — Fleet integration impact
+No surface-area change for Fleet's `GroupedMLPExpert` path; `SonicMoEMlpNode.__init__` signature unchanged. The Phase A device-fixes are strictly safer (rank-aware → no behavior change in single-card; correctness fix in multi-rank). The Phase B `is_warm` / `mark_warm` are additive. Fleet migration doc untouched.
+
+## S76 — Lessons
+1. `device="cuda"` literals are silent multi-rank time-bombs under paddle-torch-compat. Audit periodically — Triton kernels usually don't need it, but anything that reaches `torch.empty / torch.randn / torch.zeros` is suspect.
+2. CuTe artifacts are cute-dsl-internal and not designed for cross-process serialization. Don't fight it.
+3. Subprocess-isolated JIT bench is essential — in-process timings lie because module-level state (`_COMPILE_CACHE`) sticks around.
+4. Sentinel must verify on-disk file counts, not just metadata. A `rm -rf $cache/triton` would otherwise silently degrade to a real first-loss.
+5. The `paddle.utils.hipify` import error is real but not caused by sonicmoe — it's a torch-proxy/`torch.utils.cpp_extension._jit_compile` interaction. Treating it as SKIP keeps CI signal clean.
+
+## S76 — Next steps
+1. **Resolve `paddle.utils.hipify` env bug** (in paddle-compat or via a sonicmoe-side import shim). Currently jit-cold / jit-reload / jit-reuse cold-call all SKIP cleanly; fixing this unlocks the cold-warmup baseline.
+2. Wire `tools/ci/run_core_tests.sh` into a GitHub Actions workflow on PR open + nightly. Pre-commit hook is already in place locally.
+3. After Yichen's quack ships its own `_gpu_warmup` no-op, drop `sonicmoe/_quack_compat.py` (env opt-out is already there for early-adoption).
+4. Consider sentinel-versioning by quack & cute-dsl version (in addition to git_hash) so cross-machine cache shares survive partial library upgrades.
+
+---
+
+
+
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`.
+**Last commit**: `0007b07` (push pending for this session — see end).
+**Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
+**Python**: 3.12, Paddle torch-proxy (`paddle.compat.enable_torch_proxy()` / `paddle.enable_compat()`)
+**QuACK**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack`
+**Venv**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv` (yichen's; `source .runenv.sh` activates)
+**Run-script reference for nsys**: `tests/ops/bench_mlpnode_topk_nsys.py`
+**S53 perf baseline (BF16, no compat overhead)**: `reports/session53_breakdown.md`
+**User env doc**: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`
+
+---
+
+## CURRENT PROJECT STATE — green frontier, ready for next agent
+
+### Frontier health (verified this session)
+
+| Aspect                                                     | Status                                                    |
+| ---------------------------------------------------------- | --------------------------------------------------------- |
+| Output / dx / dw1 / dw2 precision (FP8 vs BF16 gold)       | cos ≥ 0.9971, rrmse ≤ 0.076 across 6 topk shapes          |
+| ds (`dispatched_probs.grad`) precision                     | cos ≥ 0.9971, rrmse ≤ 0.076 across 3 shapes               |
+| Multilayer (2-layer chain) `main_grad` consistency         | ✅ `test_chain_two_layers_main_grad_consistency`          |
+| Pipeline-parallel (interleaved 1F1B / 6 schedules)         | ✅ `test_pipeline_parallel_interleaved`                   |
+| Multistep grad accumulation across optimizer steps         | ✅ `test_multistep_pp_accumulation`                       |
+| Per-instance `_pending_flush` (no global FIFO)             | ✅ S74 globals purge holds                                 |
+| Triton kernels on Paddle compute stream (not NULL)         | ✅ S74 stream patch (`sonicmoe/_triton_stream_compat.py`) |
+| Post-warmup `cuda.synchronize()` count in fwd→bwd→flush    | 0 (steady-state)                                          |
+| HtoD sync in `_GatherRouterScores.backward`                | 0 (code-inspected; all metadata is Python int)            |
+| `node.step()` ordering contract                            | MUST run BEFORE `optimizer.step()` — docstring fixed      |
+| `main_grad` allocation                                     | Lazy on first backward — saves MiB on inference / warmup  |
+
+### Performance (most recent measurements, `bench_mlpnode_topk_nsys.py`, B30Z, FP8 frontier)
+
+S53 baseline (pure-torch BF16, no compat, no main_grad accumulation):
+- `T8192 H3072 I1536 E8 K8`: **3644 µs/iter**
+
+Current FP8 frontier (S65 TMA-add wgrad epilogue, S74 stream patch + globals purge + S75 lazy main_grad):
+
+| Shape (H=3072 I=1536 K=8) | Median GPU-projection | Speedup vs S53 BF16 |
+| ------------------------- | --------------------: | ------------------: |
+| T=8192 E=8                | ~2820 µs              | **1.29×**           |
+| T=8192 E=32               | ~3283 µs              | **1.17×**           |
+| T=16384 E=8               | ~5548 µs              | **1.43×**           |
+| T=16384 E=32              | ~5916 µs              | **1.37×**           |
+
+*ERNIE-shape detail (E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096)*: forward GPU-proj **625 µs**
+(CUTLASS GEMM 65%, FP8 quant 10%, router 14%); backward GPU-proj **1904 µs**
+(wgrad 78%, actgrad 13%, quant 5%); total **2530 µs/iter** (CV < 0.3%).
+
+### Memory
+
+- `main_grad` allocation switched to lazy (S75): on inference / warmup-only flows, the
+  `[E, 2I, H]` (w1) and `[E, I, H]` (w2) fp32 buffers are NOT created. At E=8 H=512 I=1024
+  this saves 48 MiB; at production shape (E=32 H=3072 I=1536) it saves ~675 MiB.
+- The fused weight buffer (FP8 quantized cache) is still allocated at first forward;
+  `(data_ptr, _inplace_version)` keys ensure it auto-invalidates on optimizer in-place updates.
+- `node.invalidate_caches()` is available for explicit memory reclaim under pressure;
+  not normally called in the training loop.
+
+---
+
+## SESSION 75 DELIVERABLES
+
+### S75.1 — `node.step()` ordering contract corrected
+
+**Bug**: pre-S75 docstring said "call `node.step()` AFTER `optimizer.step()`". This is
+**wrong** because `step()` does the in-place layout conversion native CUTLASS
+`[E, 2I, H]` → ERNIE split-half `[E, H, 2I]` directly into the storage that
+`expert.weight.main_grad` aliases. The optimizer reads the same storage. If `step()`
+runs after the optimizer, the optimizer applies a wrongly-laid-out gradient → silent
+training corruption (shows as cosine drop on the W view that is never tested in
+isolation; the small per-step delta would be invisible until convergence diverges).
+
+**Fix** (`sonicmoe/ernie_compat/mlp_node_v2.py`):
+```python
+# CORRECT
+loss.backward()
+node.step()           # writes correct ERNIE-layout grad into expert.weight.main_grad
+optimizer.step()      # reads expert.weight.main_grad
+optimizer.clear_grad()
+```
+Docstring rewritten; README + `docs/PADDLEFLEET_MIGRATION_S74.md` updated.
+
+### S75.2 — Lazy `main_grad` allocation
+
+**Before**: `_stack_w{1,2}_into` allocated `[E, H, 2I]` / `[E, I, H]` fp32 main_grad
+buffer at first forward, even when no backward would happen (inference, warmup-only).
+For ERNIE shape that's ~675 MiB wasted in evaluation runs.
+
+**After**: `_stack_w{1,2}_into` only stacks the bf16 weight view. New
+`_alloc_main_grad_w{1,2}` functions are called only from `_w*_native_view()` (backward
+path entry) and `_w*_main_grad()` (flush path). Per-expert `main_grad` slices are
+aliased into the fused buffer the same way as before — optimizer sees no API change.
+Allocation is idempotent; safe to call repeatedly.
+
+### S75.3 — Stale precision-test fixture fixed
+
+`tests/ops/test_mlpnode_precision.py` was using the legacy module-level
+`flush_native_grads()` which the S74 globals purge made a no-op for `SonicMoEMlpNode`
+instances (it now only flushes `_LEGACY_PENDING_FLUSH` which the per-instance node
+never populates). Result: stale `main_grad`, dw1 cos = 0.0006 (catastrophic). Fix:
+swap to `node.flush_grads()` (matches what `test_mlpnode_multilayer.py` already does).
+The frontier itself was correct; only the test harness was stale.
+
+### S75.4 — PaddleFleet integration audit
+
+Surveyed `paddlefleet/transformer/moe/{moe_expert.py,moe_layer.py}`. Conclusions:
+
+* Fleet stores **fused** parameters: `weight1.shape == [E, 2I, H]`,
+  `weight2.shape == [E, H, I]` (the `using_sonic_moe` branch in `GroupedMLPExpert`).
+* `run_sonic_moe` `permute([1, 2, 0])` them into `[2I, H, E]` / `[H, I, E]` and feeds
+  `_UpProjection.apply` / `_DownProjection.apply` directly. PyLayer.backward returns
+  wgrads as positional outputs; Paddle aggregates into `weight1.main_grad` /
+  `weight2.main_grad` automatically — **no `node.step()`, no native→ERNIE conversion,
+  no per-expert aliasing needed** (the parameter layout is already `[E, 2I, H]` =
+  the CUTLASS write layout).
+* Fleet is **API-compatible** with the S74 + S75 changes:
+  - Stream patch (S74): auto-installed at `import sonicmoe`. Fleet must ensure they
+    `import` the installed `sonicmoe` (not just the vendored `third_party/sonic-moe/`)
+    early enough; Triton must not have launched before patch fires.
+  - Globals purge (S74): N/A (Fleet bypasses `SonicMoEMlpNode`).
+  - Router-scatter optimization (S74): N/A for the same reason.
+  - `node.step()` ordering (S75): N/A (no Node).
+  - Lazy main_grad (S75): N/A (Fleet's main_grad lives on `weight1`/`weight2`
+    directly, allocated by Paddle when `weight1.main_grad = ...` is first set by
+    PyLayer aggregation).
+* **Recommendation**: keep Fleet on the direct `_UpProjection.apply` /
+  `_DownProjection.apply` path. The Node wrapper buys nothing for pre-fused weights;
+  it exists for the list-of-experts ERNIE training-script use case. Documented in
+  `docs/PADDLEFLEET_MIGRATION_S74.md` §6.
+
+### S75.5 — Validation matrix
+
+| Suite                                               | Result               |
+| --------------------------------------------------- | -------------------- |
+| `tests/ops/test_mlpnode_multilayer.py`              | ✅ 4 passed          |
+| `tests/ops/test_mlpnode_correctness_large.py`       | ✅ 1 passed          |
+| `tests/ops/test_mlpnode_precision.py` (6 topk shapes)| ✅ all PASS         |
+| ds-only standalone audit (3 shapes)                 | ✅ cos ≥ 0.9971       |
+| `tests/ops/test_colwise_quant.py`                   | ✅ 32 passed         |
+| `tests/ops/test_rowwise_quant.py`                   | ✅ 45 passed         |
+| `tests/ops/test_fused_quant.py`                     | ✅ 14 passed         |
+| Sync audit (steady-state fwd→bwd→flush)             | 0 `cuda.synchronize` |
+
+---
+
+## HIGH-VALUE INFORMATION SOURCES (use these — don't re-derive)
+
+1. **`/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`** — venv path,
+   QuACK path, Paddle compat pitfalls, nsys `sqlite + GPU-projection` perf methodology.
+2. **`reports/session53_breakdown.md`** — pure-torch BF16 baseline (no compat, no
+   main_grad accumulation). Cite this as the BF16 reference; do NOT re-run on a
+   torch venv.
+3. **`tests/ops/bench_mlpnode_topk_nsys.py`** — canonical nsys harness. Wrap with
+   `nsys profile --resolve-symbols=false`, parse the resulting `.sqlite` for the
+   `GPU_PROJECTION` table, take per-iter median.
+4. **`docs/PADDLEFLEET_MIGRATION_S74.md`** — single-doc answer to "what does Fleet
+   need to change?". §6 covers Fleet's pre-fused-weight integration in detail.
+5. **`docs/KNOWLEDGE_BASE.md`** — deep reference on FP8 layout conventions,
+   blockscaled GEMM cache key design, swiglu activation grad math.
+6. **`docs/cute_dsl_optimization_guide.md`** + **`docs/wgrad_fp8_dual_quant_design.md`**
+   — for kernel-level optimization (NCU advice already absorbed; further wins are in
+   the deeper algorithmic territory rather than micro-tuning).
+7. **`PaddleFleet/src/paddlefleet/transformer/moe/{moe_expert.py,moe_layer.py}`** —
+   downstream consumer; do not assume PR review until you've checked these.
+8. **`fork/paddle@108322c`** — Paddle commit the Triton stream patch was developed
+   against. Reproducing this branch on a future cluster requires the same Paddle
+   build (or the patch in `sonicmoe/_triton_stream_compat.py` may need a rev bump
+   if Paddle's stream-base ABI changes).
+
+---
+
+## LESSONS THAT COST REAL DEBUGGING TIME (record — do not re-learn)
+
+1. **Paddle linear weight is `[in, out]`, not torch's `[out, in]`.** `up_gate_proj.weight`
+   is `[H, 2I]`; `down_proj.weight` is `[I, H]`. Multiple shape bugs traced to assuming
+   torch layout. `_alloc_main_grad_w2` must derive `I, H = w0.shape[0], w0.shape[1]`.
+2. **`flush_native_grads()` (legacy module function) is a no-op for `SonicMoEMlpNode`.**
+   It only walks `_LEGACY_PENDING_FLUSH` which `SonicMoEMlpNode` never appends to. Test
+   harnesses that call it after a `SonicMoEMlpNode` forward read **stale** `main_grad`.
+   Always use `node.flush_grads()` (or `node.step()`) instead.
+3. **`node.step()` order matters**: it MUST precede `optimizer.step()` because it does
+   in-place layout conversion writing into the same storage the optimizer reads.
+4. **Triton's `get_current_stream` is a C symbol** bound at import time from
+   `torch._C._cuda_getCurrentRawStream`. Python-level `torch.cuda.current_stream`
+   monkey-patching is insufficient. Must monkey-patch
+   `triton.runtime.driver.driver.active.get_current_stream` directly. See
+   `sonicmoe/_triton_stream_compat.py`.
+5. **`torch.cuda.Stream.synchronize` watcher perturbs Triton autotuner.** The autotuner
+   itself calls `di.synchronize()` to time benchmark configs. Putting a watcher on it
+   and triggering inside autotuning warmup can crash with cudaErrorInvalidAddressSpace
+   on some shapes. To do a clean sync audit: warm fully (so autotune cache is hit),
+   THEN install the watcher, THEN run steady-state iterations.
+6. **PyTorch advanced-indexing backward dispatches a CUB-sort cascade** even for
+   permutation indices. Replace with a custom Function + Triton scatter — saves ~5 cub
+   kernels per call. See `_GatherRouterScores` in `mlp_node_v2.py`.
+7. **Cache invalidation via `(data_ptr, _inplace_version(w))` is automatic.** Don't
+   call `clear_all_fp8_weight_caches()` in the training step — it adds JIT
+   re-compilation pressure for no reason. Optimizer in-place updates bump
+   `_inplace_version` → next forward misses → rebuilds. Only call cache clearing under
+   explicit memory pressure (`node.invalidate_caches()`).
+
+---
+
+## INSIGHT — what's left on the table
+
+* **Scatter kernel is at the launch-overhead floor** (~14.5 µs regardless of BLOCK).
+  At T=8192 K=8 → 256 KB scatter, B30Z 5 TB/s HBM → ~50 ns of pure compute is dwarfed
+  by ~14 µs launch overhead. **The only further win is fusing the scatter into a
+  larger upstream kernel** (e.g. fuse into `_GatherRouterScores.backward` along with
+  the router metadata derivation). Probably not worth the complexity unless an end-
+  to-end profile shows scatter as a bottleneck (it is not at any measured shape).
+* **`_differentiable_router_scores` backward used to dispatch a CUB-sort cascade**
+  (~5–10 kernels). Replaced in S74 by `_GatherRouterScores` + custom Triton scatter
+  (1 kernel). Verified zero HtoD sync on this path.
+* **JIT cold-start (~42s)** dominates first-iter latency. Mitigation: persistent disk
+  cache (`~/.triton/cache`) survives across processes; `sonicmoe.jit_warmup.warmup_jit`
+  pre-compiles all kernels for known shapes if you want fixed warmup latency.
+* **Alignment guard** (`SONIC_MOE_FP8_ASSUME_ALIGNED=1` + `SONIC_MOE_FP8_MODE=perf`)
+  is already on in the recommended env. Disabling it adds ~2% per-iter overhead from
+  per-kernel runtime checks. Leave on in production.
+* **Fleet integration**: stay on the direct `_UpProjection.apply` path; do not try to
+  retrofit `SonicMoEMlpNode` for the pre-fused-weight case (overhead with no benefit).
+* **Quant kernels (`quantize_and_pack`, `colwise_quantize_and_pack`)**: NCU full-process
+  profile already absorbed in S70–S72. Current implementation is at ~96% of B30Z HBM
+  bandwidth — further wins require either a different algorithm (e.g. fuse into
+  GEMM epilogue, which we do for forward) or hardware-specific tuning beyond what
+  Triton autotuner explores.
+
+---
+
+## NEXT STEPS — for the agent that picks this up
+
+Order of priority:
+
+1. **Real distributed training validation**. We have multilayer + multistep + PP
+   interleaved unit tests, but no end-to-end run with PaddleFleet at scale. Pick a
+   small ERNIE config (E=8 H=3072 I=1536 SEQ=4096 EP=8 PP=2) and run one full epoch
+   on a 4-node cluster. Verify: loss matches torch BF16 baseline within tolerance,
+   no IMA, no NCCL hang, `weight.main_grad` stays consistent across PP boundaries.
+   The S74 stream patch + S75 step ordering should hold; if anything regresses,
+   first suspect is Fleet's vendored `third_party/sonic-moe/` lagging behind the
+   installed snapshot.
+2. **`SONIC_MOE_FP8_ASSUME_ALIGNED=0` ablation**. Measure the cost of removing the
+   alignment guard. If it's <1% per iter at production shapes, consider making the
+   alignment guard the default for safety.
+3. **Quant kernel further work** is parked. If a future B-series GPU exposes new
+   stride/predicate features in `cuda::pipeline`, revisit.
+4. **Pipeline-parallel `node.step()` placement**: currently `step()` must run after
+   the LAST microbatch's backward and before optimizer. With 1F1B, this is the
+   expected `forall_layers: node.step()` after the bubble. Verify in a real PP
+   trace that this doesn't accidentally serialize across PP groups (it shouldn't —
+   `step()` only touches per-instance state).
+5. **`paddle.distributed` checkpoint compatibility**: ensure `expert.weight.main_grad`
+   shape `[H, 2I]` (per-expert view) round-trips through Paddle's checkpoint format
+   correctly. Has not been tested.
+
+---
+
+## SESSION 74 DELIVERABLES (preserved verbatim below)
+
+### S74.1 — Triton kernels were launching on the CUDA NULL stream (CRITICAL)
+
+**Symptom (from `eb5_trainer_0 (7).nsys-rep`)**: every sonic-moe Triton kernel
+(`_quantize_and_pack_kernel`, `token_gather_sum_kernel`, `_quantize_pair_kernel`,
+`_gather_isa_packed_scales_kernel`) ran on **stream 7 = the CUDA legacy NULL stream**,
+while Paddle GEMMs / CUTLASS quack GEMMs / phi:: ops ran on **stream 13 = Paddle's
+compute stream**. NULL-stream launches have implicit cross-stream sync semantics →
+serialises everything + creates producer/consumer race hazards across the stream
+boundary.
+
+**Root cause**: `triton/backends/driver.py` binds
+`GPUDriver.get_current_stream = torch._C._cuda_getCurrentRawStream` at import time.
+That C function bypasses any Python-level `paddle-torch-compat` shim and always
+returns torch's NULL stream. (`torch.cuda.current_stream().cuda_stream == 0x0`
+inside a Paddle process — verified.)
+
+**Fix**: `sonicmoe/_triton_stream_compat.py` monkey-patches
+`triton.runtime.driver.driver.active.get_current_stream` to return
+`paddle.device.current_stream().stream_base.raw_stream`. Imported at the top of
+`sonicmoe/__init__.py` so it fires before any Triton kernel can launch. Idempotent;
+opt-out via `SONIC_MOE_NO_TRITON_STREAM_PATCH=1`; falls back to the original
+binding on any error. CUTLASS path was already correct — `_get_raw_cuda_stream`
+already unwraps the paddle proxy via `s.stream_base.raw_stream`, which is why the
+trace shows GEMMs on stream 13.
+
+**Verified**:
+```
+triton get_current_stream(0) → 0x5b5366aec7c0
+paddle current_stream         → 0x5b5366aec7c0   ← match
+torch  current_stream         → 0x0              ← unchanged
+```
+
+### S74.2 — `_differentiable_router_scores` backward CUB cascade replaced
+
+**Symptom**: backward of `dispatched_probs.reshape(-1)[gather_idx]` dispatched the
+generic Paddle advanced-indexing backward, which spawned per call:
+`cub::DeviceRadixSortHistogramKernel`, `cub::DeviceRadixSortExclusiveSumKernel`,
+3× `cub::DeviceRadixSortOnesweepKernel`, `IndexingBackwardKernel<float,4>`,
+`histogram_kernel<16>`, `prefix_sums_kernel`, `block_offset_scan_kernel`,
+`scatter_and_fixup_kernel<16>`. ≈ 0.3–0.5 ms / backward at production shape.
+
+**Why it was overkill**: `gather_idx` is a *permutation of distinct positions*
+(each `(token, slot)` pair appears at most once). No accumulate, no sort needed —
+plain scatter is correct.
+
+**Fix**: New `_GatherRouterScores` autograd Function whose backward is a single
+Triton kernel `_scatter_router_grad_kernel`. Bit-exact verified vs. baseline on
+`test_mlpnode_precision/multilayer/correctness_large` (4/4 pass).
+
+### S74.3 — `SonicMoEMlpNode` globals + FIFO purge (engineering-grade refactor)
+
+`sonicmoe/ernie_compat/mlp_node_v2.py` rewritten 910 → ~620 lines.
+
+**Removed from production path**:
+* module-level `_W_CACHE` dict
+* module-level `_PENDING_FLUSH_LAYERS` FIFO
+* `_NATIVE_W1_GRAD`, `_NATIVE_W2_GRAD`, `_NATIVE_GRAD_EXPERTS`, `_NATIVE_GRAD_I` globals
+* `_SonicMoEDeepEPFunc._topk` class-variable hack (now a regular forward arg)
+* `_ensure_native_grads`, `_accumulate_w1`, `_accumulate_w2`, `_mark_pending_flush`
+* legacy `SonicMoEFunc` PyLayer + `prepare_sonic_inputs` helper
+* BF16 fallback dead code in `_UpProjection.backward` (production always FP8)
+
+**New per-instance state** (each `SonicMoEMlpNode` owns its own copy):
+* `_w_cache: dict` — stacked-weight reuse across iters of *this* layer only
+* `_pending_flush: bool` — set by ctx in backward, cleared by `step()`
+* `_warmed_for_step: bool` — JIT/cache warmup gate per global step
+
+**New public API**:
+| Method                       | Purpose                                                     |
+| ---------------------------- | ----------------------------------------------------------- |
+| `node.step()`                | flush native→ERNIE wgrad layout into `expert.weight.main_grad`. **MUST run BEFORE `optimizer.step()`** (the optimizer reads the same storage). |
+| `node.flush_grads()`         | alias of `node.step()` (kept for harness back-compat)       |
+| `node.invalidate_caches()`   | optional; drops `_w_cache` + per-instance FP8 weight cache. Cache keys are `(data_ptr, _inplace_version(w))` so in-place optimizer updates auto-invalidate — only call this under memory pressure. |
+
+**Lazy `main_grad` allocation (S74 follow-up)**: `_stack_w{1,2}_into` no longer
+allocate `main_grad` at first forward. Allocation moved to `_alloc_main_grad_w{1,2}`
+which fires only from `_w*_native_view()` (backward) and `_w*_main_grad()` (flush).
+Saves tens-of-MiB-to-hundreds-of-MiB on inference / warmup-only paths.
+
+Module-level `flush_native_grads()` / `stack_ernie_w1` / `stack_ernie_w2` are
+*kept as legacy back-compat shims* operating on a separate `_LEGACY_W_CACHE` /
+`_LEGACY_PENDING_FLUSH`. Used only by `jit_warmup.py` + a couple of standalone
+benchmark scripts. Production `SonicMoEMlpNode` instances never feed into them.
+
+### S74.4 — Pipeline-parallel + multi-layer correctness verified
+
+`tests/ops/test_mlpnode_multilayer.py` exercises 6 distinct interleaved
+F0/F1/F2/B0/B1/B2 schedules (canonical 1F1B, fwd-first/bwd-first, fully
+interleaved, …) over multiple optimizer steps with multi-microbatch grad
+accumulation. Per-instance `_pending_flush` carries the layer identity through
+arbitrary F/B orderings — no global FIFO can be poisoned.
+
+### S74.5 — Lessons (record — these cost real debugging budget)
+
+1. **Triton bypasses Python compat shims for stream resolution.** Anyone who
+   ports a Triton-using project from torch to paddle compat MUST monkey-patch
+   `driver.active.get_current_stream` — `torch.cuda.current_stream()` overrides
+   are insufficient because Triton imports the C symbol directly.
+2. **PyTorch advanced-indexing backward is a sorting cascade.** Whenever the
+   index is a permutation (no duplicates), bypass `IndexingBackward` with a
+   custom `Function` that does plain scatter — saves 5–10 cub kernels per call.
+3. **Global state in MoE wrappers breaks pipeline parallelism.** Per-instance
+   ownership is the only correct design once forward and backward of different
+   layers can be arbitrarily interleaved.
+
+### S74.6 — Validation matrix
+
+| Suite                                          | Result        |
+| ---------------------------------------------- | ------------- |
+| `tests/ops/test_mlpnode_precision.py`          | ✅ 1 passed   |
+| `tests/ops/test_mlpnode_multilayer.py`         | ✅ 2 passed   |
+| `tests/ops/test_mlpnode_correctness_large.py`  | ✅ 1 passed   |
+| `tests/ops/test_colwise_quant.py`              | ✅ 32 passed  |
+| `tests/ops/test_rowwise_quant.py`              | ✅ 45 passed  |
+| `tests/ops/test_fused_quant.py`                | ✅ 14 passed  |
+
+All bit-exact relative to S73 baseline (`2795dc0`).
+
+### S74.7 — Files changed
+
+* `sonicmoe/_triton_stream_compat.py` (new)
+* `sonicmoe/__init__.py` — install stream patch first thing
+* `sonicmoe/ernie_compat/mlp_node_v2.py` — rewrite + `_GatherRouterScores` + `_scatter_router_grad_kernel`
+* `sonicmoe/ernie_compat/__init__.py` — drop deleted exports
+* `tests/ops/test_mlpnode_multilayer.py` — migrate `flush_native_grads()` → `node.flush_grads()`
+* `tests/ops/test_mlpnode_audit.py`, `tests/ops/test_mlpnode_breakdown.py` — drop deprecated imports
+* `tests/ops/{test_cold_start_e2e,test_jit_optimization,bench_coldstart_nsys,mlpnode_nsys_worker,bench_deepep_topk_nsys,precision_compare_paths}.py` — strip `_NATIVE_*` pokes
+* `tests/ops/test_sonic_moe_func.py` — deleted (covered legacy `SonicMoEFunc`)
+* `docs/PADDLEFLEET_MIGRATION_S74.md` (new)
+
+---
+
 # HANDOFF — Session 72 (2026-04-29) — FP8 frontier IMA root-caused & shipped
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.

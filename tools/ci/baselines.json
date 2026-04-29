@@ -1,0 +1,43 @@
+{
+  "_doc": "Strict per-mechanism budgets enforced by tools/ci/run_core_tests.sh. Override via env (see jit_bench.py / perf_gate.py / run_core_tests.sh). Bump deliberately — every loosening must be justified in HANDOFF.",
+  "jit": {
+    "shape": {"E": 8, "H": 3072, "I": 1536, "fp8": true, "total_K": 4096},
+    "cold_warmup_s": {
+      "_what": "rm -rf cache; warmup_jit(force=True). End-to-end first-time compile + ptxas + autotune.",
+      "budget": 600,
+      "warn": 480
+    },
+    "warm_sentinel_skip_s": {
+      "_what": "Process restart with sentinel present; warmup_jit returns False without compiling.",
+      "budget": 5,
+      "warn": 3
+    },
+    "cross_process_reload_s": {
+      "_what": "Process restart with sentinel CLEARED but Triton+Quack disk caches PRESENT — must hit disk caches and avoid ptxas/autotune. CuTe still re-compiles in-process.",
+      "budget": 300,
+      "warn": 240
+    },
+    "in_process_reuse_us": {
+      "_what": "Same process, repeated fwd+bwd through SonicMoEMlpNode (full kernel work + paddle dispatch). Average over 5 iters after first cold-in-proc primes the in-memory CuTe cache.",
+      "budget_us": 20000,
+      "warn_us": 16000
+    },
+    "parallel_cold_s": {
+      "_what": "rm -rf cache; warmup_jit_parallel(workers=2) over 4 total_K shapes. Validates that multi-process cold compile shares disk cache safely and finishes within budget. Subprocess overhead added — budget intentionally larger than a single cold.",
+      "budget": 900,
+      "warn": 700
+    }
+  },
+  "coverage": {
+    "_what": "sonicmoe package coverage gate from `coverage report --fail-under`. Bumped only with HANDOFF justification.",
+    "target_pct": 50
+  },
+  "perf": {
+    "shape": "T8192-H3072-I1536-E8-K8",
+    "gpu_projection_us_per_iter": {
+      "_what": "nsys GPU-projection µs/iter, FP8 fwd+bwd, canonical Ernie shape. Baseline = Session 53 PyTorch native ~2715 µs; budget allows S70+ regressions.",
+      "budget": 4500,
+      "warn": 3500
+    }
+  }
+}

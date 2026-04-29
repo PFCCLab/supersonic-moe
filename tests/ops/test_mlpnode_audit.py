@@ -41,8 +41,6 @@ from sonicmoe.ernie_compat import (
     invalidate_weight_caches,
 )
 from sonicmoe.ernie_compat.mlp_node_v2 import (
-    _NATIVE_W1_GRAD,
-    _NATIVE_W2_GRAD,
     stack_ernie_w1,
     stack_ernie_w2,
 )

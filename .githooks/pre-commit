@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# sonic-moe pre-commit hook.
+# Runs the fast core regression suite (precision + multilayer) before
+# allowing a commit. Skip with `git commit --no-verify` in emergencies.
+#
+# Install once per clone:
+#   git config core.hooksPath .githooks
+set -e
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/tools/ci/run_core_tests.sh" --fast

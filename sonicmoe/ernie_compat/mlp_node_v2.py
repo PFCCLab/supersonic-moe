@@ -1,27 +1,34 @@
-"""SonicMoE ↔ ERNIE integration: MlpNode + PyLayer with fully manual fwd/bwd.
+"""SonicMoE ↔ ERNIE integration: ``SonicMoEMlpNode`` (FP8 production path).
 
-Contains:
-  - Weight cache & stacking: ``stack_ernie_w1``, ``stack_ernie_w2``,
-    ``invalidate_weight_caches``
-  - Native-layout grad accumulation: ``_accumulate_w1``, ``_accumulate_w2``,
-    ``flush_native_grads``
-  - ``SonicMoEFunc``: ERNIE-core style PyLayer (argsort-based, legacy test path)
-  - ``SonicMoEMlpNode``: drop-in MlpNode replacement using DeepEP topk
-    metadata (the production path)
+Drop-in replacement for ERNIE's ``MlpNode``:
 
-``SonicMoEMlpNode`` packages unzip + FP8 FFN + zip into a single callable,
-using the DeepEP topk metadata path to eliminate argsort overhead.
+    out = node(dispatched_hidden_states, tokens_per_expert,
+               dispatched_indices, dispatched_probs)
 
-Drop-in replacement for ERNIE's MlpNode:
-    ``forward(dispatched_hidden_states, tokens_per_expert,
-              dispatched_indices, dispatched_probs) → expert_output``
+Gradient contract (matches ``FusionMoePyLayer``):
+  * ``dx`` flows back through Paddle autograd (required by
+    ``FusedDispatch.backward`` for the reverse A2A).
+  * ``dw1 / dw2`` accumulate into per-expert ``main_grad`` buffers via
+    a per-instance native-layout view (no per-iter transpose, no globals).
+    They do NOT flow through autograd.
+  * ``ds`` flows back through Paddle autograd (router-score path).
 
-Gradient contract (matching ERNIE FusionMoePyLayer):
-  - dx flows back to the caller via Paddle autograd (required by
-    FusedDispatch.backward for the reverse A2A communication).
-  - dw1/dw2 are accumulated into per-expert ``main_grad`` buffers via
-    native-layout accumulators; they do NOT flow through autograd.
-  - ds (d/d(score)) flows back to the caller via autograd.
+Design rules (post S74 cleanup — see HANDOFF S74):
+  * **No module-level mutable state** in the production path. Each
+    ``SonicMoEMlpNode`` instance owns its own weight cache and pending-flush
+    flag; pipeline-parallel + multi-layer + interleaved fwd/bwd works out of
+    the box because nothing is shared across instances.
+  * **No FIFO queues**: deferred wgrad layout conversion is signalled via an
+    instance ``_pending_flush`` flag set by ``ctx`` in backward and consumed
+    by ``step()``.
+  * **No class-variable hacks**: ``topk`` is passed as a regular forward arg.
+  * **No deprecated shims**: legacy ``SonicMoEFunc`` (argsort PyLayer),
+    ``prepare_sonic_inputs`` (CPU-sync helper), and ``_NATIVE_*`` global
+    tombstones have been removed.
+  * **No BF16 fallback dead code**: the FP8 wgrad accumulator path always
+    returns ``dw1 = dw2 = None`` from ``_UpProjection.backward`` /
+    ``_DownProjection.backward`` because ``SonicMoEMlpNode`` always runs
+    inside ``enable_fp8(True)``. Backward asserts this contract.
 """
 
 from __future__ import annotations
@@ -43,412 +50,83 @@ from sonicmoe.functional import (
     _UpProjection,
     _refresh_fp8_config,
     clear_all_fp8_weight_caches,
-    general_routing_router_metadata,
 )
 from sonicmoe.functional.utils import enable_fp8
 from sonicmoe.quack_utils import precompute_weight_fp8_warmup
 
 
-# ── Weight layout cache ──────────────────────────────────────────────────────
-
-_W_CACHE: dict[tuple, torch.Tensor] = {}
-
-
-def _cache_key(*tensors: torch.Tensor) -> tuple:
-    def _ver(t):
-        v = getattr(t, '_inplace_version', None)
-        if v is not None:
-            return v() if callable(v) else v
-        return getattr(t, '_version', 0)
-    return tuple((t.data_ptr(), _ver(t)) for t in tensors)
-
-
-def invalidate_weight_caches() -> None:
-    """Call after optimizer step."""
-    _W_CACHE.clear()
-    clear_all_fp8_weight_caches()
-    invalidate_topk_cache()
-
-
-def stack_ernie_w1(experts: Sequence[Any], H: int, I: int) -> torch.Tensor:
-    """Per-expert ``[H, 2I]`` split-half → logical ``[2I, H, E]`` interleaved.
-
-    Physical layout ``[E, 2I, H]`` (contiguous), presented as ``[2I, H, E]``
-    via ``.permute(1, 2, 0)`` — matching the stride order QuACK GEMM expects.
-
-    Side effect: lazily allocates a single fp32 ``main_grad`` buffer of shape
-    ``[E, H, 2I]`` (split-half, matching per-expert ``weight.shape``) and
-    aliases each ``expert.up_gate_proj.weight.main_grad`` to a strided slice of
-    it. Per-iter ``_accumulate_w1`` then reduces wgrad into this single buffer
-    with two fused cast+add kernels (gate+up) instead of an 8-expert Python loop.
-    """
-    key = ("w1",) + _cache_key(*(e.up_gate_proj.weight for e in experts))
-    if key in _W_CACHE:
-        return _W_CACHE[key]
-    E = len(experts)
-    stacked = torch.stack([e.up_gate_proj.weight for e in experts])  # [E, H, 2I]
-    gate, up = stacked[:, :, :I], stacked[:, :, I:]
-    physical = torch.stack([gate, up], dim=3) \
-                    .reshape(E, H, 2 * I) \
-                    .permute(0, 2, 1).contiguous()  # [E, 2I, H]
-    w1 = physical.permute(1, 2, 0)  # logical [2I, H, E]
-    w1.stop_gradient = False
-    _W_CACHE[key] = w1
-
-    # Stacked fp32 main_grad: [E, H, 2I] split-half (cols 0..I-1=gate, I..2I-1=up).
-    # Each per-expert weight.main_grad is a strided [H, 2I] view into this buffer,
-    # so the optimizer sees the same ERNIE-style per-expert main_grad without copy.
-    mg = paddle.zeros([E, H, 2 * I], dtype="float32")
-    _W_CACHE[("w1_mg",) + key[1:]] = mg
-    for e_idx, exp in enumerate(experts):
-        exp.up_gate_proj.weight.main_grad = mg[e_idx]
-    return w1
-
-
-def stack_ernie_w2(experts: Sequence[Any]) -> torch.Tensor:
-    """Per-expert ``[I, H]`` → logical ``[H, I, E]``.
-
-    Physical ``[E, H, I]`` (contiguous) via ``.permute(1, 2, 0)``.
-
-    Side effect: aliases each ``expert.down_proj.weight.main_grad`` to a strided
-    slice of a single shared ``[E, I, H]`` fp32 buffer (see ``stack_ernie_w1``).
-    """
-    key = ("w2",) + _cache_key(*(e.down_proj.weight for e in experts))
-    if key in _W_CACHE:
-        return _W_CACHE[key]
-    physical = torch.stack([e.down_proj.weight for e in experts]) \
-                    .permute(0, 2, 1).contiguous()  # [E, H, I]
-    w2 = physical.permute(1, 2, 0)  # logical [H, I, E]
-    w2.stop_gradient = False
-    _W_CACHE[key] = w2
-
-    E = len(experts)
-    I = w2.shape[1]
-    H = w2.shape[0]
-    mg = paddle.zeros([E, I, H], dtype="float32")
-    _W_CACHE[("w2_mg",) + key[1:]] = mg
-    for e_idx, exp in enumerate(experts):
-        exp.down_proj.weight.main_grad = mg[e_idx]
-    return w2
-
-
-def _w1_mg_stacked(experts: Sequence[Any]) -> torch.Tensor:
-    return _W_CACHE[("w1_mg",) + _cache_key(*(e.up_gate_proj.weight for e in experts))]
-
-
-def _w2_mg_stacked(experts: Sequence[Any]) -> torch.Tensor:
-    return _W_CACHE[("w2_mg",) + _cache_key(*(e.down_proj.weight for e in experts))]
-
-
-# ── Input format conversion ──────────────────────────────────────────────────
-
-def prepare_sonic_inputs(
-    dispatched_indices: torch.Tensor,
-    dispatched_probs: torch.Tensor,
-    x: torch.Tensor,
-    n_experts: int,
-    block: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """ERNIE ``[T, K]`` → SonicMoE flat sorted format.
-
-    Returns ``(x_padded, token_indices, expert_indices, router_scores, T_orig)``.
-    """
-    T = x.shape[0]
-    tok_ids = torch.arange(T, dtype=torch.int32, device=x.device) \
-                   .unsqueeze(1).expand_as(dispatched_indices)
-    valid = dispatched_indices >= 0
-    tok_flat = tok_ids[valid]
-    exp_flat = dispatched_indices[valid].int()
-    scr_flat = dispatched_probs[valid].float()
-
-    exp_counts = torch.bincount(exp_flat.long(), minlength=n_experts).int()
-    pad_counts = (block - exp_counts % block) % block
-    max_pad = int(pad_counts.max().item())
-
-    if max_pad == 0:
-        return x, tok_flat, exp_flat, scr_flat, T
-
-    row_ids = torch.arange(max_pad, dtype=torch.int32, device=x.device) \
-                   .unsqueeze(1).expand(max_pad, n_experts)
-    exp_ids = torch.arange(n_experts, dtype=torch.int32, device=x.device) \
-                   .unsqueeze(0).expand(max_pad, n_experts)
-    active = row_ids < pad_counts.unsqueeze(0)
-
-    token_indices = torch.cat([tok_flat, (T + row_ids[active]).int()])
-    expert_indices = torch.cat([exp_flat, exp_ids[active].int()])
-    router_scores = torch.cat([scr_flat,
-                               torch.zeros(active.sum(), dtype=torch.float32,
-                                           device=x.device)])
-    x_padded = torch.cat([x, torch.zeros(max_pad, x.shape[1],
-                                         dtype=x.dtype, device=x.device)])
-    return x_padded, token_indices, expert_indices, router_scores, T
-
-
-# ── Weight-grad → main_grad ─────────────────────────────────────────────────
-
-# ── Native-layout accumulators (zero-transpose path, per-layer) ──────────────
-# We accumulate dw1/dw2 in SonicMoE's native physical layout
-# (W1: [E, 2I, H], W2: [E, H, I]) and defer the layout conversion to ERNIE's
-# per-expert layout (W1: [E, H, 2I] split-half, W2: [E, I, H]) until
-# ``flush_native_grads()`` is called at optimizer-step time. This eliminates
-# the per-iter TilingSwapDim/contiguous kernels from the profiled path.
-#
-# Critically, the buffer is the *same storage* as the per-expert
-# ``weight.main_grad`` allocated by ``stack_ernie_w{1,2}`` (a single
-# contiguous fp32 tensor sliced into per-expert views). We just re-interpret
-# that storage as the native shape during accumulation, then transpose it
-# back into the ERNIE shape in-place at flush time. Benefits:
-#   1. Per-layer binding "for free" — main_grad is already per-weight, so
-#      models with multiple MoE layers each get their own buffer (the old
-#      single-global ``_NATIVE_W1_GRAD`` silently lost grads when a second
-#      layer's backward overwrote the global).
-#   2. Zero extra permanent allocation (saves E*H*2I*4 + E*I*H*4 fp32 bytes
-#      per layer — ~288 MB for the production E=8/H=3072/I=1536 shape).
-#
-# Layer registry: each backward that touched native layout records its
-# ``experts`` list here; ``flush_native_grads`` iterates and converts every
-# pending layer. List (not set) to preserve order; identity comparison
-# because ``experts`` is typically a Paddle LayerList that isn't hashable.
-#
-# Caveat for callers: between accumulation and ``flush_native_grads()``,
-# ``param.main_grad`` contains *native-layout* data (scrambled relative to
-# ERNIE's expected [H, 2I] / [I, H] view). Always call ``node.step()`` (or
-# ``flush_native_grads()`` directly) before reading or optimizing main_grad.
-
-_PENDING_FLUSH_LAYERS: list = []  # list of `experts` lists awaiting flush
-
-# ── Deprecated compatibility shims ────────────────────────────────────────────
-# The native-layout buffer used to be a single global tensor; it's now backed
-# by per-expert main_grad storage (see _w1_native_view / _w2_native_view).
-# These aliases remain so tests/benchmarks that "reset" the globals to None
-# (a no-op cleanup) don't break. Nothing in the live path reads them.
-_NATIVE_W1_GRAD: torch.Tensor | None = None
-_NATIVE_W2_GRAD: torch.Tensor | None = None
-_NATIVE_GRAD_EXPERTS: list | None = None
-_NATIVE_GRAD_I: int = 0
-
-
-def _ensure_native_grads(*_args, **_kwargs) -> None:
-    """Deprecated no-op: native buffers now live in per-expert main_grad."""
-    return
-
-
-def _w1_native_view(experts) -> torch.Tensor:
-    """View per-expert main_grad storage as native [E, 2I, H] contiguous fp32."""
-    mg = _w1_mg_stacked(experts)  # [E, H, 2I] contig fp32 (aliases per-expert main_grad)
-    E, H, two_I = mg.shape
-    return mg.view(E, two_I, H)
-
-
-def _w2_native_view(experts) -> torch.Tensor:
-    """View per-expert main_grad storage as native [E, H, I] contiguous fp32."""
-    mg = _w2_mg_stacked(experts)  # [E, I, H] contig fp32
-    E, I, H = mg.shape
-    return mg.view(E, H, I)
-
-
-def _mark_pending_flush(experts) -> None:
-    for e in _PENDING_FLUSH_LAYERS:
-        if e is experts:
-            return
-    _PENDING_FLUSH_LAYERS.append(experts)
-
-
-def _accumulate_w1(dw1: torch.Tensor, experts: list, I: int) -> None:
-    """BF16-fallback accumulator: dw1 [2I, H, E] → native [E, 2I, H] storage.
-
-    Only used when the FP8 wgrad path returns a non-None dw1 (i.e., the
-    BF16 fallback). Cost: 1 TilingSwapDim + 1 MultiPrecisionAdd.
-    """
-    native = _w1_native_view(experts)
-    native.add_(dw1.permute(2, 0, 1).contiguous())
-    _mark_pending_flush(experts)
-
-
-def _accumulate_w2(dw2: torch.Tensor, experts: list) -> None:
-    """BF16-fallback accumulator: dw2 [H, I, E] → native [E, H, I] storage."""
-    native = _w2_native_view(experts)
-    native.add_(dw2.permute(2, 0, 1).contiguous())
-    _mark_pending_flush(experts)
-
-
-def flush_native_grads() -> None:
-    """Convert every pending layer's native-layout main_grad → ERNIE layout in-place.
-
-    Call this at optimizer-step time (typically via ``node.step()``).
-    For each pending layer:
-      W1: storage [E, 2I, H] interleaved (gate0,up0,gate1,up1,...)
-          → ERNIE [E, H, 2I] split-half (gates then ups)
-      W2: storage [E, H, I] → ERNIE [E, I, H]
-    Conversion is in-place via a single contiguous() scratch (one alloc per
-    flush, freed after copy_), then the pending list is cleared.
-    """
-    global _PENDING_FLUSH_LAYERS
-    if not _PENDING_FLUSH_LAYERS:
-        return
-
-    pending, _PENDING_FLUSH_LAYERS = _PENDING_FLUSH_LAYERS, []
-    for experts in pending:
-        # ── W1 ──────────────────────────────────────────────────────────────
-        mg1 = _w1_mg_stacked(experts)  # alias view [E, H, 2I]; storage holds [E, 2I, H] data
-        E, H, two_I = mg1.shape
-        I = two_I // 2
-        native = mg1.view(E, two_I, H)  # correct view of the native data
-        # native [E, 2I, H] is interleaved: 2I groups as (I, 2) → split-half [E, H, 2, I]
-        rhs = native.view(E, I, 2, H).permute(0, 3, 2, 1).contiguous()
-        mg1.view(E, H, 2, I).copy_(rhs)
-
-        # ── W2 ──────────────────────────────────────────────────────────────
-        mg2 = _w2_mg_stacked(experts)  # alias view [E, I, H]; storage holds [E, H, I] data
-        E2, I2, H2 = mg2.shape
-        native2 = mg2.view(E2, H2, I2)
-        rhs2 = native2.permute(0, 2, 1).contiguous()  # [E, I, H]
-        mg2.copy_(rhs2)
-
-
-# ── The legacy PyLayer (argsort-based) ────────────────────────────────────────
+# ── PyLayer ctx stub ──────────────────────────────────────────────────────────
 
 class _FakeCtx:
-    """Minimal ctx stub for calling _UpProjection / _DownProjection static methods.
+    """Minimal ctx stub for invoking ``_UpProjection`` / ``_DownProjection``
+    static-method ``forward`` / ``backward`` directly.
 
-    Supports ``save_for_backward``, ``saved_tensor``, ``mark_non_differentiable``,
-    ``set_materialize_grads``, and arbitrary attribute access (for ctx.T, ctx._fp8_cfg, etc.).
+    Supports ``save_for_backward`` / ``saved_tensor`` /
+    ``mark_non_differentiable`` / ``set_materialize_grads`` plus arbitrary
+    attribute access (the projection helpers stash ``ctx.T``, ``ctx._fp8_cfg``,
+    ``ctx._wgrad_w{1,2}_accumulator`` etc).
     """
+
     def save_for_backward(self, *args): self._saved = args
     def saved_tensor(self): return self._saved
     def mark_non_differentiable(self, *args): pass
     def set_materialize_grads(self, value): pass
 
 
-class SonicMoEFunc(paddle.autograd.PyLayer):
-    """ERNIE-core style PyLayer with fully manual forward/backward.
+# ── Differentiable router-scores reconstruction ──────────────────────────────
 
-    Calls ``_UpProjection.forward`` / ``_DownProjection.forward`` directly
-    (as plain functions via FakeCtx), saves all state manually, and calls
-    their ``.backward`` counterparts in our own backward — no inner autograd.
+@triton.jit
+def _scatter_router_grad_kernel(
+    GRAD_ptr,    # [TK] grad_output, contiguous
+    IDX_ptr,     # [TK] int64 gather indices into [N_total]
+    OUT_ptr,     # [N_total] zero-init output
+    TK,
+    BLOCK: tl.constexpr,
+):
+    """Plain scatter (no accumulate): out[idx[i]] = grad[i].
+
+    Safe because ``score_src_idx`` is a permutation of distinct positions in
+    ``[N_recv * topk]`` (each (token, slot) appears at most once). Eliminates
+    the cub::DeviceRadixSort + index_put_with_accumulate cascade triggered by
+    PyTorch's generic advanced-indexing backward.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < TK
+    v = tl.load(GRAD_ptr + offs, mask=mask, other=0.0)
+    idx = tl.load(IDX_ptr + offs, mask=mask, other=0)
+    tl.store(OUT_ptr + idx, v, mask=mask)
+
+
+class _GatherRouterScores(torch.autograd.Function):
+    """Custom-grad replacement for ``flat_probs[gather_idx]``.
+
+    Forward is the same simple gather (a single Paddle indexing kernel).
+    Backward uses a one-shot Triton scatter (no sort, no histogram) instead
+    of the generic ``IndexingBackward`` path, which on Paddle dispatches a
+    full cub::DeviceRadixSort + scatter + reduction cascade per call.
     """
 
     @staticmethod
-    def forward(
-        ctx,
-        hidden_states: torch.Tensor,       # [T_padded, H] bf16  (grad)
-        router_scores: torch.Tensor,        # [TK] float32        (grad)
-        token_indices: torch.Tensor,        # [TK] int32          (no grad)
-        expert_indices: torch.Tensor,       # [TK] int32          (no grad)
-        w1: torch.Tensor,                   # [2I, H, E] bf16     (no grad — wgrad via main_grad)
-        w2: torch.Tensor,                   # [H, I, E] bf16      (no grad — wgrad via main_grad)
-        experts: Sequence[Any] = None,
-        n_experts: int = 0,
-        T_orig: int = 0,
-        activation_type: ActivationType = ActivationType.SWIGLU,
-        stream_id: int = 0,
-    ) -> torch.Tensor:
-        _refresh_fp8_config()
-        T = hidden_states.shape[0]
-        E = n_experts
-
-        # ── Routing metadata ─────────────────────────────────────────────
-        (
-            expert_frequency,
-            expert_frequency_offset,
-            x_gather_idx,
-            s_scatter_idx,
-            s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset,
-        ) = general_routing_router_metadata(
-            router_scores, token_indices, expert_indices, T, E,
-        )
-        TK = s_scatter_idx.shape[0]
-
-        # ── UpProjection forward (via FakeCtx) ───────────────────────────
-        up_ctx = _FakeCtx()
-        with enable_fp8(True):
-            y1, z = _UpProjection.forward(
-                up_ctx,
-                hidden_states, w1, None,        # x, w1, b1
-                expert_frequency_offset, TK, None, stream_id,
-                x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-                True,                           # is_varlen_K
-                activation_type,
-                False,                          # is_inference_mode_enabled
-                False,                          # use_low_precision_postact_buffer
-            )
-
-        # ── DownProjection forward (via FakeCtx) ─────────────────────────
-        down_ctx = _FakeCtx()
-        with enable_fp8(True):
-            out = _DownProjection.forward(
-                down_ctx,
-                y1, z, w2, None,                # y1, z, w2, b2
-                router_scores, expert_indices, expert_frequency_offset,
-                T, None, stream_id,
-                x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-                True,                           # is_varlen_K
-                activation_type,
-                None,                           # fp8_protocol
-            )
-
-        # ── Save everything for backward ─────────────────────────────────
-        # Outer PyLayer's save_for_backward only takes tensors and detaches
-        # them, so we store the ctx objects as Python attributes instead.
-        ctx._up_ctx = up_ctx
-        ctx._down_ctx = down_ctx
-        ctx._experts = experts
-        ctx._I = w1.shape[0] // 2
-        ctx._T_orig = T_orig
-        return out[:T_orig]
+    def forward(ctx, flat_probs: torch.Tensor, gather_idx: torch.Tensor, n_total: int):
+        ctx.save_for_backward(gather_idx)
+        ctx.n_total = int(n_total)
+        ctx.tk = int(gather_idx.shape[0])
+        return flat_probs[gather_idx]
 
     @staticmethod
-    def backward(ctx, output_grad: torch.Tensor):
-        up_ctx = ctx._up_ctx
-        down_ctx = ctx._down_ctx
-        T_orig = ctx._T_orig
-        T_padded = up_ctx.T if hasattr(up_ctx, 'T') else output_grad.shape[0]
+    def backward(ctx, grad_out: torch.Tensor):
+        (gather_idx,) = ctx.saved_tensor()
+        d = torch.zeros(ctx.n_total, dtype=grad_out.dtype, device=grad_out.device)
+        TK = ctx.tk
+        if TK > 0:
+            BLOCK = 256
+            grid = (triton.cdiv(TK, BLOCK),)
+            _scatter_router_grad_kernel[grid](
+                grad_out.contiguous(), gather_idx, d, TK, BLOCK=BLOCK,
+            )
+        return d, None, None
 
-        # Pad output_grad back to T_padded if needed
-        if T_padded > T_orig:
-            output_grad = torch.cat([
-                output_grad,
-                torch.zeros(T_padded - T_orig, output_grad.shape[1],
-                            dtype=output_grad.dtype, device=output_grad.device),
-            ])
-
-        # ── DownProjection backward ──────────────────────────────────────
-        # Returns: (dy1=None, dz, dw2, db2?, ds, None_selected_experts,
-        #           None_efo, None x N metadata)
-        down_grads = _DownProjection.backward(down_ctx, output_grad)
-        # dz is at index 1, dw2 at index 2
-        dz = down_grads[1]    # [TK, 2I] bf16
-        dw2 = down_grads[2]   # [H, I, E] w2_dtype
-
-        # ds: at index 3 (b2=None → no db2) or 4 (b2 present → db2 at 3)
-        ds_idx = 4 if getattr(down_ctx, '_has_b2', False) else 3
-        ds = down_grads[ds_idx]
-
-        # ── UpProjection backward ────────────────────────────────────────
-        # Input to backward: (dy1=None, dz)
-        up_grads = _UpProjection.backward(up_ctx, None, dz)
-        # Returns: (dx, dw1, db1?, None x N metadata)
-        dx_full = up_grads[0]   # [T_padded, H] bf16
-        dw1 = up_grads[1]       # [2I, H, E] w1_dtype
-
-        # ── Weight grads → per-expert main_grad ──────────────────────────
-        if dw1 is not None:
-            _accumulate_w1(dw1, ctx._experts, ctx._I)
-        if dw2 is not None:
-            _accumulate_w2(dw2, ctx._experts)
-
-        # ── Return grads for tensor inputs ───────────────────────────────
-        # Tensor inputs: hidden_states, router_scores, token_indices,
-        #                expert_indices, w1, w2
-        dx = dx_full[:T_orig] if dx_full is not None else None
-
-        return dx, ds, None, None, None, None
-
-
-# ── Differentiable router-scores reconstruction ──────────────────────────────
 
 @triton.jit
 def _build_score_src_idx_kernel(
@@ -458,9 +136,9 @@ def _build_score_src_idx_kernel(
     WORK_ptr,     # [N_recv * TOPK] int32 — scratch (same size as INDICES)
     TOPK: tl.constexpr,
 ):
-    """Build score_src_idx: per-token ascending sort of expert IDs.
+    """Build ``score_src_idx``: per-token ascending sort of expert IDs.
 
-    Pure scalar ops — compatible with Triton 3.5.0 + SM103a (no tl.min).
+    Pure scalar ops — compatible with Triton 3.5.0 + SM103a (no ``tl.min``).
     """
     t = tl.program_id(0)
     start = tl.load(NAEPT_ptr + t)
@@ -470,12 +148,10 @@ def _build_score_src_idx_kernel(
         return
 
     base = t * TOPK
-    # Copy to scratch; replace invalid (-1) with 0x7FFF
     for k in tl.static_range(TOPK):
         e = tl.load(INDICES_ptr + base + k)
         tl.store(WORK_ptr + base + k, tl.where(e >= 0, e, 0x7FFF))
 
-    # Selection sort: for each output position, find argmin in scratch
     for j in range(TOPK):
         if j < n_valid:
             best_e: tl.int32 = 0x7FFF + 1
@@ -498,25 +174,21 @@ def _differentiable_router_scores(
     E: int,                            # number of experts
     score_src_idx: torch.Tensor | None = None,  # [TK] int32 from CUDA kernel
 ) -> torch.Tensor:
-    """Reconstruct router_scores from dispatched_probs with autograd connection.
-
-    The CUDA metadata kernel produces topk_scores as a non-differentiable data
-    copy.  This function builds the same [TK_padded] tensor using differentiable
-    fancy-indexing into dispatched_probs, so that ds gradients flow back through
-    Paddle autograd to the caller's gate / dispatched_probs tensor.
+    """Reconstruct router_scores from ``dispatched_probs`` with an autograd
+    connection so that ``ds`` flows back to the caller's gate.
 
     Within each token, entries are ordered by ascending expert ID, matching the
-    CUDA kernel's rank-based ordering in ``scatter_and_fixup_kernel``.
+    CUDA metadata kernel's rank-based ordering in ``scatter_and_fixup_kernel``.
 
-    Zero CPU-GPU synchronization.
-
-    Fast path: when ``score_src_idx`` is provided (CUDA metadata path) it is
-    used directly — bit-exact with the standalone Triton _build_score_src_idx
-    kernel and saves a separate launch.  Falls back to the Triton kernel only
-    when CUDA path is unavailable (Python metadata fallback).
+    Zero CPU-GPU synchronization. Fast path uses ``score_src_idx`` produced as
+    a side-output of ``scatter_and_fixup_kernel``; the Triton kernel is the
+    fallback for the Python metadata path.
     """
     N_recv, topk = dispatched_indices.shape
     device = dispatched_indices.device
+    if hasattr(device, "type") and not isinstance(device, str):
+        idx = getattr(device, "index", None) or 0
+        device = f"cuda:{int(idx)}"
 
     if dispatched_indices.stride(1) != 1:
         raise ValueError("dispatched_indices must be contiguous in last dim")
@@ -528,29 +200,26 @@ def _differentiable_router_scores(
         raise ValueError(f"naept: expected shape ({N_recv+1},), got {naept.shape}")
 
     if TK == 0:
-        return torch.zeros(TK_padded, dtype=dispatched_probs.dtype, device=device)
+        return dispatched_probs.new_zeros(TK_padded)
 
     if score_src_idx is not None:
-        # Provided by scatter_and_fixup_kernel — int32, already in token-major
-        # + ascending-expert order matching the metadata path.
         if score_src_idx.shape[0] != TK:
             raise ValueError(
                 f"score_src_idx: expected shape ({TK},), got {score_src_idx.shape}"
             )
         gather_idx = score_src_idx.to(torch.int64)
     else:
-        # Build score_src_idx: [TK] int64 flat indices into dispatched_probs.reshape(-1)
-        # Uses Triton kernel — no boolean indexing, no dynamic shapes, no D2H sync.
         built = torch.empty(TK, dtype=torch.int64, device=device)
-        work = torch.empty_like(dispatched_indices)  # scratch buffer
+        work = torch.empty_like(dispatched_indices)
         _build_score_src_idx_kernel[(N_recv,)](
             dispatched_indices, naept, built, work,
             TOPK=triton.next_power_of_2(topk),
         )
         gather_idx = built
 
-    # Differentiable gather from dispatched_probs
-    gathered = dispatched_probs.reshape(-1)[gather_idx]  # [TK]
+    gathered = _GatherRouterScores.apply(
+        dispatched_probs.reshape(-1), gather_idx, dispatched_probs.numel()
+    )  # [TK]
 
     if TK_padded > TK:
         padding = torch.zeros(
@@ -560,38 +229,212 @@ def _differentiable_router_scores(
     return gathered
 
 
-# ── SonicMoEMlpNode (production path using DeepEP metadata) ──────────────────
+# ── Module-level back-compat helpers (legacy tests / jit_warmup only) ────────
+# The production ``SonicMoEMlpNode`` does NOT touch any state below.
+# These shims exist solely so the legacy non-instance API used by a few
+# benchmarks and by ``jit_warmup`` keeps working with no behavioural change.
+# Each call is keyed by ``(data_ptr, _inplace_version)`` of the input weights,
+# so multiple expert lists do not collide; the only "global"-flavoured leak is
+# the cache dict, which is content-addressed and explicitly invalidated by
+# ``invalidate_weight_caches()``.
+
+_LEGACY_W_CACHE: dict[tuple, torch.Tensor] = {}
+_LEGACY_PENDING_FLUSH: list = []
+
+
+def _cache_key(*tensors: torch.Tensor) -> tuple:
+    def _ver(t):
+        v = getattr(t, '_inplace_version', None)
+        if v is not None:
+            return v() if callable(v) else v
+        return getattr(t, '_version', 0)
+    return tuple((t.data_ptr(), _ver(t)) for t in tensors)
+
+
+def invalidate_weight_caches() -> None:
+    """Drop legacy stack/main_grad cache + FP8 weight quant cache + topk cache.
+
+    Production users should call ``SonicMoEMlpNode.step()`` instead, which
+    invalidates only that instance's caches. This function is retained for
+    legacy benchmarks and the JIT warmup harness.
+    """
+    _LEGACY_W_CACHE.clear()
+    clear_all_fp8_weight_caches()
+    invalidate_topk_cache()
+
+
+def _stack_w1_into(
+    cache: dict, experts: Sequence[Any], H: int, I: int,
+) -> torch.Tensor:
+    """Build (or fetch) the ``[2I, H, E]`` logical view of stacked W1.
+
+    *No main_grad allocation* — call :func:`_alloc_main_grad_w1` lazily from
+    the backward path (or :meth:`SonicMoEMlpNode.step`) so memory is only
+    paid when gradients are actually accumulated.
+    """
+    key = ("w1",) + _cache_key(*(e.up_gate_proj.weight for e in experts))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    E = len(experts)
+    stacked = torch.stack([e.up_gate_proj.weight for e in experts])  # [E, H, 2I]
+    gate, up = stacked[:, :, :I], stacked[:, :, I:]
+    physical = (
+        torch.stack([gate, up], dim=3)
+            .reshape(E, H, 2 * I)
+            .permute(0, 2, 1)
+            .contiguous()
+    )  # [E, 2I, H]
+    w1 = physical.permute(1, 2, 0)  # logical [2I, H, E]
+    w1.stop_gradient = False
+    cache[key] = w1
+    return w1
+
+
+def _stack_w2_into(
+    cache: dict, experts: Sequence[Any],
+) -> torch.Tensor:
+    """Build (or fetch) the ``[H, I, E]`` logical view of stacked W2.
+
+    *No main_grad allocation* — see :func:`_stack_w1_into`.
+    """
+    key = ("w2",) + _cache_key(*(e.down_proj.weight for e in experts))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    physical = (
+        torch.stack([e.down_proj.weight for e in experts])
+            .permute(0, 2, 1)
+            .contiguous()
+    )  # [E, H, I]
+    w2 = physical.permute(1, 2, 0)  # logical [H, I, E]
+    w2.stop_gradient = False
+    cache[key] = w2
+    return w2
+
+
+def _alloc_main_grad_w1(
+    cache: dict, experts: Sequence[Any], H: int, I: int,
+) -> torch.Tensor:
+    """Lazily allocate the ``[E, H, 2I]`` fp32 ``main_grad`` accumulator for
+    W1 and alias each expert's ``up_gate_proj.weight.main_grad`` to its slice.
+
+    Triggered on the first backward (via ``_w1_native_view``) or the first
+    call to :meth:`SonicMoEMlpNode.step`. Idempotent within a step; cleared
+    by :meth:`SonicMoEMlpNode.invalidate_caches`.
+    """
+    key = ("w1_mg",) + _cache_key(*(e.up_gate_proj.weight for e in experts))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    E = len(experts)
+    mg = paddle.zeros([E, H, 2 * I], dtype="float32")
+    cache[key] = mg
+    for e_idx, exp in enumerate(experts):
+        exp.up_gate_proj.weight.main_grad = mg[e_idx]
+    return mg
+
+
+def _alloc_main_grad_w2(
+    cache: dict, experts: Sequence[Any],
+) -> torch.Tensor:
+    """Lazily allocate the ``[E, I, H]`` fp32 ``main_grad`` accumulator for W2."""
+    key = ("w2_mg",) + _cache_key(*(e.down_proj.weight for e in experts))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    w0 = experts[0].down_proj.weight
+    # down_proj.weight shape is [I, H] (Paddle linear: [in, out])
+    I, H = int(w0.shape[0]), int(w0.shape[1])
+    E = len(experts)
+    mg = paddle.zeros([E, I, H], dtype="float32")
+    cache[key] = mg
+    for e_idx, exp in enumerate(experts):
+        exp.down_proj.weight.main_grad = mg[e_idx]
+    return mg
+
+
+def stack_ernie_w1(experts: Sequence[Any], H: int, I: int) -> torch.Tensor:
+    """Legacy shim — prefer ``SonicMoEMlpNode``. Returns the ``[2I, H, E]``
+    logical view of stacked W1 (cached process-wide for back-compat).
+    No main_grad is allocated by this call."""
+    return _stack_w1_into(_LEGACY_W_CACHE, experts, H, I)
+
+
+def stack_ernie_w2(experts: Sequence[Any]) -> torch.Tensor:
+    """Legacy shim — prefer ``SonicMoEMlpNode``."""
+    return _stack_w2_into(_LEGACY_W_CACHE, experts)
+
+
+def _flush_native_grads_for(mg1: torch.Tensor, mg2: torch.Tensor) -> None:
+    """Convert native-layout ``main_grad`` storage in-place to ERNIE layout.
+
+    * W1 storage is ``[E, 2I, H]`` (gate0, up0, gate1, up1, ...) interleaved;
+      ERNIE expects ``[E, H, 2I]`` split-half (all gates, then all ups).
+    * W2 storage is ``[E, H, I]``; ERNIE expects ``[E, I, H]``.
+
+    Single ``contiguous()`` scratch per weight; freed after ``copy_``.
+    """
+    E, H, two_I = mg1.shape
+    I = two_I // 2
+    native1 = mg1.view(E, two_I, H)
+    rhs1 = native1.view(E, I, 2, H).permute(0, 3, 2, 1).contiguous()
+    mg1.view(E, H, 2, I).copy_(rhs1)
+
+    E2, I2, H2 = mg2.shape
+    native2 = mg2.view(E2, H2, I2)
+    rhs2 = native2.permute(0, 2, 1).contiguous()
+    mg2.copy_(rhs2)
+
+
+def flush_native_grads() -> None:
+    """Legacy shim — flush every (mg1, mg2) pair queued by the legacy stacker.
+
+    Production code should call ``SonicMoEMlpNode.step()`` instead.
+    """
+    pending, _LEGACY_PENDING_FLUSH[:] = list(_LEGACY_PENDING_FLUSH), []
+    for mg1, mg2 in pending:
+        _flush_native_grads_for(mg1, mg2)
+
+
+# ── SonicMoEMlpNode (production path) ────────────────────────────────────────
 
 class SonicMoEMlpNode:
     """Drop-in replacement for ERNIE's MlpNode (topk DeepEP dispatch path).
 
-    Packages unzip + FP8 FFN + zip into a single callable.
-    Uses DeepEP's topk dispatch metadata for zero-sync metadata conversion.
+    Packages unzip + FP8 FFN + zip into a single callable.  Uses DeepEP's
+    topk dispatch metadata for zero-sync metadata conversion.
+
+    All caches are **per-instance** — pipeline parallelism, multi-layer
+    models, and interleaved forward / backward across layers are supported
+    without any cross-layer state.
 
     Gradient contract:
-      - dx flows back through Paddle autograd to the caller (no detach).
-      - dw1/dw2 accumulate into per-expert main_grad via native-layout buffers.
-      - ds (d/d(score)) flows back through Paddle autograd.
+      * ``dx`` flows back through Paddle autograd (no detach).
+      * ``dw1`` / ``dw2`` accumulate into per-expert ``main_grad`` via a
+        native-layout view of a per-instance fp32 buffer; layout is
+        converted in-place to ERNIE format on ``step()``.
+      * ``ds`` flows back through Paddle autograd.
 
-    Performance optimizations (zero migration overhead):
-      - Route-level padding: x is passed directly (no padding, no cat, no copy).
-      - Native-layout grad accumulation (1 add_ kernel per weight, no transpose).
+    Performance properties:
+      * Route-level padding (no x-padding cat / copy).
+      * Native-layout grad accumulation (1 add_ kernel per weight, no
+        per-iter transpose).
+      * Fused single-pass FP8 prequantize on first microbatch of each step.
 
     Parameters
     ----------
-    experts : list
-        Per-expert modules, each with ``up_gate_proj.weight [H, 2I]``
-        and ``down_proj.weight [I, H]``.
-    n_experts : int
+    experts
+        Per-expert modules, each with ``up_gate_proj.weight [H, 2I]`` and
+        ``down_proj.weight [I, H]``.
+    n_experts
         Number of local experts (E).
-    hidden_size : int
-        Model hidden dimension (H).
-    intermediate_size : int
-        FFN intermediate dimension (I). ``up_gate_proj`` has 2*I columns.
-    activation_type : ActivationType
+    hidden_size, intermediate_size
+        Model dims.  ``up_gate_proj`` has 2*I columns.
+    activation_type
         Activation function (default SWIGLU).
-    stream_id : int
-        CUDA stream index for FP8 ops (default 0).
+    stream_id
+        CUDA stream index for FP8 ops.
     """
 
     def __init__(
@@ -609,13 +452,65 @@ class SonicMoEMlpNode:
         self._I = intermediate_size
         self._activation_type = activation_type
         self._stream_id = stream_id
-        self._warmed_for_step = False
+
+        # Per-instance state — no module-level globals.
+        self._w_cache: dict[tuple, torch.Tensor] = {}
+        self._pending_flush: bool = False
+        self._warmed_for_step: bool = False
+
+    # ── Weight layout helpers (instance-scoped) ─────────────────────────────
+
+    def _stacked_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        w1 = _stack_w1_into(self._w_cache, self._experts, self._H, self._I)
+        w2 = _stack_w2_into(self._w_cache, self._experts)
+        return w1, w2
+
+    def _w1_main_grad(self) -> torch.Tensor:
+        """Lazy: returns the ``[E, H, 2I]`` fp32 buffer aliased to every
+        ``expert.up_gate_proj.weight.main_grad``.  Allocated on first call."""
+        return _alloc_main_grad_w1(self._w_cache, self._experts, self._H, self._I)
+
+    def _w2_main_grad(self) -> torch.Tensor:
+        """Lazy: returns the ``[E, I, H]`` fp32 buffer aliased to every
+        ``expert.down_proj.weight.main_grad``.  Allocated on first call."""
+        return _alloc_main_grad_w2(self._w_cache, self._experts)
+
+    def _w1_native_view(self) -> torch.Tensor:
+        """Storage of ``_w1_main_grad`` reinterpreted as ``[E, 2I, H]`` —
+        the native CUTLASS wgrad layout."""
+        mg = self._w1_main_grad()
+        E, H, two_I = mg.shape
+        return mg.view(E, two_I, H)
+
+    def _w2_native_view(self) -> torch.Tensor:
+        """Storage of ``_w2_main_grad`` reinterpreted as ``[E, H, I]``."""
+        mg = self._w2_main_grad()
+        E, I, H = mg.shape
+        return mg.view(E, H, I)
+
+    def _flush_native_grads(self) -> None:
+        if not self._pending_flush:
+            return
+        _flush_native_grads_for(self._w1_main_grad(), self._w2_main_grad())
+        self._pending_flush = False
+
+    def flush_grads(self) -> None:
+        """Public alias for the deferred wgrad layout flush.
+
+        Use this in gradient-accumulation harnesses that need to read
+        ``main_grad`` between micro-iterations without invalidating the
+        weight cache (which ``step()`` does as part of its post-optimizer
+        contract).
+        """
+        self._flush_native_grads()
+
+    # ── Public API ──────────────────────────────────────────────────────────
 
     def prequantize_weights(self) -> None:
-        """Fused single-pass FP8 prequantize for w1/w2 (all 4 layouts).
+        """Fused single-pass FP8 prequantize for w1/w2 (all four layouts).
 
         Reads each BF16 weight ONCE and writes both transposed FP8 layouts +
-        ISA-packed scales in a single Triton kernel per weight.  ~3x faster
+        ISA-packed scales in a single Triton kernel per weight — ~3x faster
         than letting the four ``precompute_weight_fp8_*`` helpers fire lazily
         inside the first microbatch's forward.
 
@@ -625,20 +520,16 @@ class SonicMoEMlpNode:
         """
         if self._warmed_for_step:
             return
-        w1 = stack_ernie_w1(self._experts, self._H, self._I)  # [2I, H, E]
-        w2 = stack_ernie_w2(self._experts)                    # [H, I, E]
+        w1, w2 = self._stacked_weights()
         precompute_weight_fp8_warmup(w1, w2)
         self._warmed_for_step = True
 
     def warmup(self, total_K_list: list[int] | None = None, max_workers: int = 0):
-        """Pre-compile all JIT kernels. Call once after model construction.
-
-        After compile_key dynamic-dim fix, a single warmup covers all seqlens.
-        """
+        """Pre-compile all JIT kernels.  Call once after model construction."""
         from sonicmoe.jit_warmup import warmup_jit
         warmup_jit(
             self._E, self._H, self._I,
-            device="cuda",
+            device=f"cuda:{torch.cuda.current_device()}",
             fp8=True,
             total_K_list=total_K_list,
             max_workers=max_workers,
@@ -660,7 +551,7 @@ class SonicMoEMlpNode:
         tokens_per_expert : list[int] or Tensor [E]
             Per-expert token counts from DeepEP ``buffer.dispatch()``.
         dispatched_indices : Tensor [N_recv, topk] int32
-            Local expert indices from DeepEP dispatch. -1 = masked.
+            Local expert indices from DeepEP dispatch. ``-1`` = masked.
         dispatched_probs : Tensor [N_recv, topk] float32
             Routing probabilities from DeepEP dispatch.
 
@@ -670,7 +561,6 @@ class SonicMoEMlpNode:
             Expert output, same token ordering as input.
         """
         x = dispatched_hidden_states
-        T = x.shape[0]
         E = self._E
         H = self._H
         I = self._I
@@ -703,49 +593,30 @@ class SonicMoEMlpNode:
 
         # Build router_scores differentiably from dispatched_probs so that
         # ds gradients flow back to the caller (e.g. DeepEP's gate).
-        # deepep_topk_to_sonic_metadata produces a non-differentiable copy;
-        # we reconstruct the same values using autograd-tracked indexing.
-        # When the CUDA metadata kernel is available, score_src_idx is
-        # produced as a free side-output of scatter_and_fixup_kernel and we
-        # skip the standalone Triton _build_score_src_idx_kernel entirely
-        # (saves ~252 µs/iter at user shape).
         router_scores = _differentiable_router_scores(
             dispatched_probs, dispatched_indices,
             num_activated_expert_per_token_offset,
             TK_padded - total_pad_rows, TK_padded, E,
             score_src_idx=score_src_idx,
         )
-        # T_down = N_recv for the topk path: _router_forward outputs [N_recv, H]
+        # T_down = N_recv for the topk path.
         T_down = N_recv
+        topk = dispatched_indices.shape[1]
 
-        # 2. NO x-padding needed — route-level padding handles alignment.
-        #    Padding rows in x_gather_idx point to row 0 with score=0.
-
-        # 3. Stack weights (cached) + fused FP8 prequantize on first microbatch.
+        # Stack weights (per-instance cache) + fused FP8 prequantize on first
+        # microbatch of the step.
         self.prequantize_weights()
-        w1 = stack_ernie_w1(self._experts, H, I)
-        w2 = stack_ernie_w2(self._experts)
+        w1, w2 = self._stacked_weights()
 
-        # 4. Prepare tensor inputs for PyLayer.
-        #    x passes through WITHOUT detach — dx must flow back to the caller
-        #    so that FusedDispatch.backward can do the reverse A2A with it.
-        #    router_scores is differentiably derived from dispatched_probs,
-        #    so ds gradients propagate back to the gate automatically.
+        # Tensor-input flags for autograd.
         x.stop_gradient = False
-        # router_scores is a non-leaf tensor (computed from dispatched_probs),
-        # Paddle autograd tracks it automatically; explicit flag is defensive.
         router_scores.stop_gradient = False
-
-        # Non-differentiable inputs (integer metadata + stacked weights whose
-        # grads go through main_grad, not autograd)
         x_gather_idx.stop_gradient = True
         s_scatter_idx.stop_gradient = True
         w1.stop_gradient = True
         w2.stop_gradient = True
 
-        # 5. Run _SonicMoEDeepEPFunc (FP8 fwd + manual bwd with main_grad)
-        _SonicMoEDeepEPFunc._topk = dispatched_indices.shape[1]
-        output = _SonicMoEDeepEPFunc.apply(
+        return _SonicMoEDeepEPFunc.apply(
             x,
             router_scores,
             expert_frequency_offset,
@@ -754,27 +625,49 @@ class SonicMoEMlpNode:
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
             w1, w2,
-            self._experts,
-            E, N_recv, T_down, TK_padded,
+            self,                       # node — backward routes wgrad here
+            E, N_recv, T_down, TK_padded, topk,
             self._activation_type,
             self._stream_id,
         )
 
-        return output
+    def step(self) -> None:
+        """Commit deferred wgrads into per-expert ``main_grad``.
 
-    def step(self):
-        """Call after optimizer.step(). Flushes wgrad and invalidates all caches.
+        **Call BEFORE** ``optimizer.step()`` — the optimizer reads
+        ``weight.main_grad`` and that buffer is only in the correct
+        ERNIE-native layout *after* this flush.
 
-        Training loop contract:
+        Training-loop contract::
+
             for microbatch in microbatches:
                 out = node(x, tpe, indices, probs)
                 out.backward(grad)
-            optimizer.step()
-            node.step()         # ← here
-            optimizer.zero_grad()
+            node.step()                 # ← flush wgrads (this method)
+            optimizer.step()            #   reads weight.main_grad
+            optimizer.zero_grad()       #   zeros main_grad in place
+
+        Cache invalidation is *not* needed here: ``_w_cache`` and the FP8
+        weight cache are keyed by ``(data_ptr, _inplace_version)``, which
+        bumps automatically when the optimizer updates the weights, so the
+        next forward naturally misses and rebuilds.  Use
+        :meth:`invalidate_caches` if you need eager release for memory
+        pressure (e.g. parameter swap-out).
         """
-        flush_native_grads()
-        invalidate_weight_caches()
+        self._flush_native_grads()
+        self._warmed_for_step = False
+
+    def invalidate_caches(self) -> None:
+        """Eagerly drop this instance's stacked-weight / main_grad cache and
+        the process-wide FP8 weight quant + topk caches.  Optional — only
+        useful for memory pressure or when weight tensors are swapped out.
+
+        Note: the ``main_grad`` buffer is dropped here, so it will be
+        re-allocated (and zeroed) on the next backward.
+        """
+        self._w_cache.clear()
+        clear_all_fp8_weight_caches()
+        invalidate_topk_cache()
         self._warmed_for_step = False
 
     def __call__(
@@ -792,42 +685,48 @@ class SonicMoEMlpNode:
 
 # ── Internal PyLayer (topk DeepEP metadata, production path) ─────────────────
 
-
 class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
-    """PyLayer for the topk DeepEP dispatch path (production path).
+    """PyLayer for the topk DeepEP dispatch path (production).
 
-    Uses route-level padding (frontier design): x is NOT padded. Padding rows
-    gather from row 0 with score=0, contributing nothing to output or grads.
+    Uses route-level padding (frontier design): ``x`` is NOT padded.  Padding
+    rows gather from row 0 with score=0, contributing nothing to output or
+    grads.
 
-    T_down = N_recv: _DownProjection outputs [N_recv, H] directly, no slicing.
+    ``T_down = N_recv``: ``_DownProjection`` outputs ``[N_recv, H]`` directly.
+
+    The owning ``SonicMoEMlpNode`` is passed in as a non-tensor positional
+    argument and stashed on ``ctx`` so that ``backward`` can route wgrads into
+    its per-instance native-layout view and signal the deferred flush.
     """
 
     @staticmethod
     def forward(
         ctx,
-        hidden_states: torch.Tensor,       # [T, H] bf16  (grad)
-        router_scores: torch.Tensor,        # [TK_padded] float32
-        expert_frequency_offset: torch.Tensor,  # [E+1] int32
-        x_gather_idx: torch.Tensor,         # [TK_padded] int32
-        s_scatter_idx: torch.Tensor,        # [TK_padded] int32
-        s_reverse_scatter_idx: torch.Tensor, # [TK] int32
+        hidden_states: torch.Tensor,            # [T, H] bf16  (grad)
+        router_scores: torch.Tensor,             # [TK_padded] float32
+        expert_frequency_offset: torch.Tensor,   # [E+1] int32
+        x_gather_idx: torch.Tensor,              # [TK_padded] int32
+        s_scatter_idx: torch.Tensor,             # [TK_padded] int32
+        s_reverse_scatter_idx: torch.Tensor,     # [TK] int32
         num_activated_expert_per_token_offset: torch.Tensor,  # [N_recv+1]
-        w1: torch.Tensor,                   # [2I, H, E] bf16
-        w2: torch.Tensor,                   # [H, I, E] bf16
-        experts: Sequence[Any] = None,
+        w1: torch.Tensor,                        # [2I, H, E] bf16
+        w2: torch.Tensor,                        # [H, I, E] bf16
+        node: "SonicMoEMlpNode",
         n_experts: int = 0,
         N_recv: int = 0,
         T_down: int = 0,
         TK_padded: int = 0,
+        topk: int = 1,
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
     ) -> torch.Tensor:
-        _refresh_fp8_config()
-        topk = getattr(_SonicMoEDeepEPFunc, '_topk', n_experts)
-
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
         with enable_fp8(True):
+            # Refresh FP8 config inside the enable_fp8(True) block so the
+            # snapshot sees ``_IS_FP8_ACTIVE=True`` regardless of the global
+            # state any prior caller / test may have left behind.
+            _refresh_fp8_config()
             y1, z = _UpProjection.forward(
                 up_ctx,
                 hidden_states, w1, None,        # x, w1, b1
@@ -841,7 +740,6 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
             )
 
         # ── DownProjection forward (via FakeCtx) ─────────────────────────
-        # Topk path: T_down = N_recv, output is [N_recv, H] directly.
         down_ctx = _FakeCtx()
         with enable_fp8(True):
             out = _DownProjection.forward(
@@ -856,10 +754,9 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
                 None,                           # fp8_protocol
             )
 
-        # ── Save everything for backward ─────────────────────────────────
         ctx._up_ctx = up_ctx
         ctx._down_ctx = down_ctx
-        ctx._experts = experts
+        ctx._node = node
         ctx._I = w1.shape[0] // 2
 
         return out
@@ -868,43 +765,46 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
     def backward(ctx, output_grad: torch.Tensor):
         up_ctx = ctx._up_ctx
         down_ctx = ctx._down_ctx
+        node: SonicMoEMlpNode = ctx._node
+
+        # Native-layout views into per-instance main_grad storage.  Caller
+        # MUST run ``node.step()`` before reading main_grad — see class
+        # docstring for the contract.
+        w1_native = node._w1_native_view()  # [E, 2I, H] fp32
+        w2_native = node._w2_native_view()  # [E, H, I] fp32
+        node._pending_flush = True
 
         # ── DownProjection backward ──────────────────────────────────────
-        I = ctx._I
-        # Native-layout views into per-expert main_grad storage (per-layer,
-        # zero extra alloc). Caller MUST flush_native_grads() before reading
-        # main_grad — see module-level comment.
-        w1_native = _w1_native_view(ctx._experts)  # [E, 2I, H] fp32
-        w2_native = _w2_native_view(ctx._experts)  # [E, H, I] fp32
-        _mark_pending_flush(ctx._experts)
-
         down_ctx._wgrad_w2_accumulator = w2_native
         down_grads = _DownProjection.backward(down_ctx, output_grad)
         dz = down_grads[1]
         dw2 = down_grads[2]
 
-        # ds: deterministic index based on _has_b2 (b2 is always None in this path,
-        # so ds is always at index 3.  Previous code used a fragile float32 heuristic.)
+        # ds is at index 4 if b2 is present, 3 otherwise.  b2 is always None
+        # in this path, so ds is always at index 3 — but keep the guard for
+        # safety in case the projection signature evolves.
         ds_idx = 4 if getattr(down_ctx, '_has_b2', False) else 3
         ds = down_grads[ds_idx]
 
         # ── UpProjection backward ────────────────────────────────────────
         up_ctx._wgrad_w1_accumulator = w1_native
         up_grads = _UpProjection.backward(up_ctx, None, dz)
-        dx = up_grads[0]   # [T_orig, H] — matches x input shape
+        dx = up_grads[0]
         dw1 = up_grads[1]
 
-        # ── Weight grads → per-expert main_grad ──────────────────────────
-        # FP8 path: CUTLASS accumulates directly into the native-layout view
-        # of main_grad via the _wgrad_accumulator, returning dw1=dw2=None.
-        # If non-None, we're on the BF16 fallback — accumulate with per-iter
-        # transpose into the same native view.
-        if dw1 is not None:
-            _accumulate_w1(dw1, ctx._experts, ctx._I)
-        if dw2 is not None:
-            _accumulate_w2(dw2, ctx._experts)
+        # FP8 wgrad accumulator path MUST write into the native view directly
+        # and return None — ``SonicMoEMlpNode`` always runs in
+        # ``enable_fp8(True)``, so the BF16 fallback (which would return
+        # non-None tensors) is unreachable.
+        assert dw1 is None, (
+            "Unexpected non-None dw1 in SonicMoEMlpNode backward — the FP8 "
+            "wgrad accumulator must write into _w1_native_view directly. "
+            "If this fires, the BF16 fallback was hit unexpectedly."
+        )
+        assert dw2 is None, (
+            "Unexpected non-None dw2 in SonicMoEMlpNode backward — see dw1."
+        )
 
-        # ── Return grads for tensor inputs ───────────────────────────────
         # Tensor inputs: hidden_states, router_scores, efo, x_gather, s_scatter,
         #                s_reverse_scatter, naept_offset, w1, w2
         return dx, ds, None, None, None, None, None, None, None

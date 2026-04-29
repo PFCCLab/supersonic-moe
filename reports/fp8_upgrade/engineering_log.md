@@ -540,5 +540,13 @@ Lessons:
 
 ---
 
-> **Canonical handoff: root `HANDOFF.md` (Session 66)**
+## Phase 27: Sessions 67–75 — recorded only in root `HANDOFF.md`
+
+Phases 27+ (S67 IMA bisect, S70 ncu-driven quant opt, S71 globals purge planning,
+S72 quant NCU sweep + race-fix, S73 stream patch + scatter, S74 lazy main_grad +
+step ordering, S75 Fleet integration audit + frontier validation) are NOT
+duplicated here. See the root `HANDOFF.md` — newest session at the top, prior
+sessions preserved verbatim below it.
+
+> **Canonical handoff: root `HANDOFF.md`** (latest session at top).
 

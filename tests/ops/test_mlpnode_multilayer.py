@@ -79,6 +79,12 @@ def _zero_main_grads(experts):
                 w.main_grad.zero_()
 
 
+def _flush_all(*nodes):
+    """Flush every node's pending native-grad layout (post-S74 per-instance API)."""
+    for n in nodes:
+        n.flush_grads()
+
+
 def _snapshot_main_grads(experts):
     """Snapshot main_grad fp32 tensors AS torch tensors (post-flush layout)."""
     out = []
@@ -116,14 +122,14 @@ def _run_layer_once(experts, x, indices, probs, tpe, grad_out):
         out_w = node.forward(x.clone().detach(), tpe,
                              dispatched_indices=indices, dispatched_probs=probs)
         out_w.backward(grad_out.clone())
-    flush_native_grads()
+    node.flush_grads()
     _zero_main_grads(experts)
 
     x_in = x.clone().detach()
     x_in.stop_gradient = False
     out = node.forward(x_in, tpe, dispatched_indices=indices, dispatched_probs=probs)
     out.backward(grad_out.clone())
-    flush_native_grads()
+    node.flush_grads()
     return _snapshot_main_grads(experts)
 
 
@@ -138,7 +144,7 @@ def _run_layer_in_chain(experts, x, indices, probs, tpe, grad_out):
         out_w = node.forward(x.clone().detach(), tpe,
                              dispatched_indices=indices, dispatched_probs=probs)
         out_w.backward(grad_out.clone())
-    flush_native_grads()
+    node.flush_grads()
     _zero_main_grads(experts)
 
     x_in = x.clone().detach()
@@ -198,7 +204,7 @@ def test_two_layer_main_grad_matches_independent():
         out_w1 = node1.forward(x1.clone().detach(), tpe1,
                                dispatched_indices=indices1, dispatched_probs=probs1)
         out_w1.backward(grad_out1.clone())
-    flush_native_grads()
+    _flush_all(node0, node1)
     _zero_main_grads(experts0)
     _zero_main_grads(experts1)
 
@@ -209,17 +215,15 @@ def test_two_layer_main_grad_matches_independent():
     out0.backward(grad_out0.clone())
     out1.backward(grad_out1.clone())
 
-    # Critical: BEFORE flush, both layers' main_grad should be in native layout
-    # and should be queued in _PENDING_FLUSH_LAYERS.
-    pending = _mlp_module._PENDING_FLUSH_LAYERS
-    assert len(pending) == 2, (
-        f"Expected 2 layers pending flush, got {len(pending)} — multi-layer "
-        f"registry is broken (regression of the global-shadowing bug)."
-    )
-    assert any(p is node0._experts for p in pending), "node0._experts missing from flush registry"
-    assert any(p is node1._experts for p in pending), "node1._experts missing from flush registry"
+    # Critical: BEFORE flush, both nodes must be flagged as pending — the
+    # per-instance flush flag is the post-S74 replacement for the
+    # ``_PENDING_FLUSH_LAYERS`` global FIFO.
+    assert node0._pending_flush, "node0 pending flush flag not set after backward"
+    assert node1._pending_flush, "node1 pending flush flag not set after backward"
 
-    flush_native_grads()
+    node0.flush_grads()
+    node1.flush_grads()
+    assert not node0._pending_flush and not node1._pending_flush
     got0 = _snapshot_main_grads(experts0)
     got1 = _snapshot_main_grads(experts1)
 
@@ -270,7 +274,7 @@ def test_chain_two_layers_main_grad_consistency():
         h0 = node0.forward(x_w, tpe0, dispatched_indices=indices0, dispatched_probs=probs0)
         h1 = node1.forward(h0, tpe1, dispatched_indices=indices1, dispatched_probs=probs1)
         h1.backward(grad_out_final.clone())
-    flush_native_grads()
+    _flush_all(node0, node1)
     _zero_main_grads(experts0)
     _zero_main_grads(experts1)
 
@@ -279,12 +283,12 @@ def test_chain_two_layers_main_grad_consistency():
     h1 = node1.forward(h0, tpe1, dispatched_indices=indices1, dispatched_probs=probs1)
     h1.backward(grad_out_final.clone())
 
-    pending = _mlp_module._PENDING_FLUSH_LAYERS
-    assert len(pending) == 2, (
-        f"Chained backward should register both layers; got {len(pending)} pending."
+    assert node0._pending_flush and node1._pending_flush, (
+        "Chained backward should flag both nodes for pending flush."
     )
 
-    flush_native_grads()
+    node0.flush_grads()
+    node1.flush_grads()
 
     # Sanity: both layers' main_grads must be NON-zero (the bug would zero
     # one layer's grads silently).
@@ -349,7 +353,7 @@ def _run_interleaved(layers, schedule):
         out_w = nodes[li].forward(L["x"].clone().detach(), L["tpe"],
                                   dispatched_indices=L["indices"], dispatched_probs=L["probs"])
         out_w.backward(L["grad_out"].clone())
-    flush_native_grads()
+    _flush_all(*nodes)
     for L in layers:
         _zero_main_grads(L["experts"])
 
@@ -368,7 +372,7 @@ def _run_interleaved(layers, schedule):
             out.backward(L["grad_out"].clone())
 
     assert not pending_outs, f"unmatched forwards: {sorted(pending_outs)}"
-    flush_native_grads()
+    _flush_all(*nodes)
     return [_snapshot_main_grads(L["experts"]) for L in layers]
 
 
@@ -476,7 +480,7 @@ def test_multistep_pp_accumulation():
         out_w = nodes[li].forward(L["x"].clone().detach(), L["tpe"],
                                   dispatched_indices=L["indices"], dispatched_probs=L["probs"])
         out_w.backward(micro_grad_outs[0][0][li].clone())
-    flush_native_grads()
+    _flush_all(*nodes)
     for L in layers_run:
         _zero_main_grads(L["experts"])
 
@@ -505,7 +509,7 @@ def test_multistep_pp_accumulation():
                     pending[li] = out
                 else:
                     pending.pop(li).backward(micro_grad_outs[s][m][li].clone())
-        flush_native_grads()  # ONE flush per step (after all micro-batches).
+        _flush_all(*nodes)  # ONE flush per step (after all micro-batches).
 
         # Verify this step's main_grad equals sum over micros of single-layer refs.
         for li in range(N_LAYERS):

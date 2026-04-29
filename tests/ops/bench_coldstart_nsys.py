@@ -41,10 +41,6 @@ functional._ALIGNMENT_ASSUMED = True
 functional.clear_all_fp8_weight_caches()
 clear_all_fp8_weight_caches()
 invalidate_weight_caches()
-_m._NATIVE_W1_GRAD = None
-_m._NATIVE_W2_GRAD = None
-_m._NATIVE_GRAD_EXPERTS = None
-
 # Clear compile caches if available
 try:
     from sonicmoe.cache_manager import InstrumentedCompileCache
@@ -91,8 +87,6 @@ tpe = paddle.bincount(di.reshape([-1]).cast("int64"), minlength=E).tolist()
 
 # ── Warmup (outside profiler, includes JIT compilation) ──
 invalidate_weight_caches(); clear_all_fp8_weight_caches()
-_m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None; _m._NATIVE_GRAD_EXPERTS = None
-
 print(f"Warmup {WARMUP} fwd+bwd iters (includes JIT compilation)...")
 for _ in range(WARMUP):
     xw = paddle.randn_like(x); xw.stop_gradient = False

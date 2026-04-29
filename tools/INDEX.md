@@ -14,6 +14,7 @@
 | Path | Summary | Notes |
 | --- | --- | --- |
 | `__pycache__/` | Volatile / generated subtree. | Python bytecode cache; disposable. |
+| `ci/` | CI runners and gates (`run_core_tests.sh`, `perf_gate.py`, `multicard_smoke.py`). | S76 |
 
 ## Files
 | File | Summary | Notes |

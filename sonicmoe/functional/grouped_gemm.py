@@ -2596,8 +2596,13 @@ class HopperWgmma_MoE_kernel:
             total_ctas = cutlass.utils.HardwareInfo().get_device_multiprocessor_count()
         if self.pingpong:
             total_ctas *= 2
-        # 128 bytes per tensormap
-        tensormaps_torch = torch.empty(total_ctas, 128 // 8, dtype=torch.int64, device="cuda")
+        # 128 bytes per tensormap. Honour the input tensor's device so the
+        # allocation stays on the rank's GPU under multi-rank / multi-machine
+        # setups (under paddle-torch-compat the bare ``"cuda"`` string can
+        # resolve to ``CUDAPlace(0)`` on non-rank-0 processes and trip the
+        # ``DeviceContextPool::Get`` lookup).
+        tensormaps_torch = torch.empty(total_ctas, 128 // 8, dtype=torch.int64,
+                                       device=torch.device("cuda", torch.cuda.current_device()))
         tensormaps_tensor = from_dlpack(tensormaps_torch, assumed_align=128).mark_compact_shape_dynamic(
             mode=0, stride_order=(0, 1)
         )

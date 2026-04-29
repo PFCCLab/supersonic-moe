@@ -248,7 +248,7 @@ def _fp8_topk(experts, x, dispatched_indices, dispatched_probs, tpe, grad_out, E
                              dispatched_indices=dispatched_indices,
                              dispatched_probs=dispatched_probs)
         out_w.backward(grad_out.clone())
-    flush_native_grads()        # flush warmup residuals from native buffer first
+    node.flush_grads()          # flush warmup residuals from native buffer first
     _zero_main_grads(experts)   # then zero main_grad (including what was just flushed)
 
     x_in = x.clone().detach()
@@ -257,7 +257,7 @@ def _fp8_topk(experts, x, dispatched_indices, dispatched_probs, tpe, grad_out, E
                        dispatched_indices=dispatched_indices,
                        dispatched_probs=dispatched_probs)
     out.backward(grad_out.clone())
-    flush_native_grads()
+    node.flush_grads()
 
     dx = torch.from_dlpack(x_in.grad.detach()).to(device=x.device, dtype=x.dtype) if x_in.grad is not None else None
 

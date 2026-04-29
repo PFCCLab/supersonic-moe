@@ -116,8 +116,6 @@ def run():
     print("\n--- Path B ---")
     clear_all_fp8_weight_caches()
     invalidate_weight_caches()
-    _m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None; _m._NATIVE_GRAD_EXPERTS = None
-
     def make_experts(w1_list, w2_list):
         exps = []
         for i in range(E):
@@ -139,7 +137,6 @@ def run():
         _ = node(x_b, tpe, di, dp)
 
     # real pass
-    _m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None; _m._NATIVE_GRAD_EXPERTS = None
     invalidate_weight_caches()
     experts_b = make_experts(w1_per_e, w2_per_e)
     node_b = SonicMoEMlpNode(experts=experts_b, n_experts=E, hidden_size=H,

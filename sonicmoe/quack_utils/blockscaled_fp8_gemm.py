@@ -2750,22 +2750,26 @@ def blockscaled_fp8_gemm_grouped(
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(weight_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions (a.size(0) =
+    # total_K varies with seqlen / batch; packed_a_scales.size(0) follows).
+    # Including them would trigger a CuTe recompile every iteration of
+    # production training. Mirror the L2165 ``vk`` pattern: only static
+    # dims (dtypes, tile/cluster shapes, num_experts, hidden / intermediate,
+    # expert_capacity, major orders, config flags).
     compile_key = (
+        "grouped",
         tensor_infos["A"].dtype,
         tensor_infos["B"].dtype,
         tensor_infos["D"].dtype,
         tile_shape_mn,
         cluster_shape_mnk,
-        tuple(tensor_infos["A"].tensor.shape),
-        tuple(tensor_infos["A"].tensor.stride()),
-        tuple(tensor_infos["B"].tensor.shape),
-        tuple(tensor_infos["B"].tensor.stride()),
-        tuple(tensor_infos["D"].tensor.shape),
-        tuple(tensor_infos["D"].tensor.stride()),
-        tuple(packed_a_scales.shape),
-        tuple(weight_scales.shape),
+        int(num_experts),
+        int(expert_capacity),
+        int(w2.size(0)),  # hidden (N)
+        int(a.size(1)),   # intermediate (K)
         tensor_infos["A"].major,
         tensor_infos["B"].major,
+        tensor_infos["D"].major,
         config.pingpong,
         True,
         _SF_VEC_SIZE,

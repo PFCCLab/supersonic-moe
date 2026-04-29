@@ -190,6 +190,12 @@ class InstrumentedCompileCache:
     def __repr__(self):
         return f"InstrumentedCompileCache({self.name!r}, entries={len(self._mem)})"
 
+    def __len__(self) -> int:
+        return len(self._mem)
+
+    def __iter__(self):
+        return iter(self._mem)
+
 
 def cache_stats() -> dict:
     """Return disk cache statistics."""
@@ -206,6 +212,122 @@ def cache_stats() -> dict:
     return stats
 
 
+# ── Skip-if-warm sentinel ─────────────────────────────────────────────────────
+#
+# Triton's TRITON_CACHE_DIR and Quack's QUACK_CACHE_DIR are both file-backed
+# disk caches that are safely shared across processes / nodes via NFS. A
+# successful warmup leaves them populated with N kernel.cubin / N
+# {fn_name}.autotune.json files. We record the (E, H, I, fp8, git_hash,
+# kernel_signature_version) tuple on which the warmup ran in a sentinel JSON
+# file. On subsequent process starts, ``is_warm()`` checks the sentinel
+# matches and that the on-disk file counts have not regressed; if so,
+# ``warmup_jit`` can be skipped entirely.
+#
+# CuTe's in-memory ``_COMPILE_CACHE`` is NOT covered (cute.compile artifacts
+# are not picklable; see Phase C investigation in S76 HANDOFF). For CuTe the
+# warmup still has to run once per process — but Triton autotune-cache and
+# Quack autotune-cache hits eliminate the bulk of the autotune time.
+
+_KERNEL_SIG_VERSION = "v1"
+
+
+def _warmup_sentinel_path(root: Path | None = None) -> Path:
+    if root is None:
+        root = get_cache_root()
+    return root / "warmup_sentinel.json"
+
+
+def _git_hash_or_none() -> str | None:
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def warmup_signature(E: int, H: int, I: int, fp8: bool) -> dict:
+    """Stable identity of a warmup invocation."""
+    return {
+        "E": E, "H": H, "I": I, "fp8": fp8,
+        "kernel_sig": _KERNEL_SIG_VERSION,
+        "git_hash": _git_hash_or_none(),
+    }
+
+
+def is_warm(E: int, H: int, I: int, fp8: bool = True,
+            *, min_triton_files: int = 1, min_quack_files: int = 0) -> bool:
+    """True iff a previous ``warmup_jit`` for this signature is still on disk.
+
+    Consults the sentinel JSON written at the cache root and verifies that
+    the Triton disk cache is non-empty (regression guard against sentinel
+    surviving a manual ``rm -rf .jit_cache/triton``). When this returns
+    True, ``warmup_jit`` may be skipped — the running process will still
+    need to populate its own in-memory CuTe cache on first call, but that
+    incurs no autotune / ptxas cost (everything reloads from disk).
+
+    NOTE: ``min_quack_files`` defaults to 0 because the CuTe (Quack)
+    persistent disk cache is currently BLOCKED upstream (see S76 handoff).
+    Once it is restored, raise the default to 1 for tighter regression
+    guarding.
+    """
+    root = get_cache_root()
+    sentinel = _warmup_sentinel_path(root)
+    if not sentinel.exists():
+        return False
+    try:
+        rec = json.loads(sentinel.read_text())
+    except Exception:
+        return False
+    sig = warmup_signature(E, H, I, fp8)
+    # git_hash is informational; mismatch is OK if user opts in.
+    must_match = ("E", "H", "I", "fp8", "kernel_sig")
+    if any(rec.get(k) != sig[k] for k in must_match):
+        return False
+    if rec.get("git_hash") != sig["git_hash"] and not os.environ.get(
+        "SONIC_MOE_WARMUP_IGNORE_GIT", "0"
+    ) == "1":
+        return False
+    stats = cache_stats()
+    triton_n = stats.get("triton", {}).get("file_count", 0)
+    quack_n = stats.get("quack", {}).get("file_count", 0)
+    if triton_n < min_triton_files or quack_n < min_quack_files:
+        return False
+    return True
+
+
+def mark_warm(E: int, H: int, I: int, fp8: bool = True) -> Path:
+    """Write the sentinel after a successful ``warmup_jit`` run.
+
+    Atomic rename so concurrent parallel-warmup writers cannot leave a
+    partially-written sentinel that would fail JSON decode in ``is_warm``.
+    """
+    root = get_cache_root()
+    sentinel = _warmup_sentinel_path(root)
+    sig = warmup_signature(E, H, I, fp8)
+    stats = cache_stats()
+    sig["cache_stats"] = stats
+    sig["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    payload = json.dumps(sig, indent=2)
+    tmp = sentinel.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(payload)
+    os.replace(tmp, sentinel)
+    if _is_verbose():
+        _log.info(f"[JIT] Warmup sentinel: {sentinel}")
+    return sentinel
+
+
+def clear_warmup_sentinel() -> None:
+    """Force the next ``warmup_jit`` to run from scratch."""
+    sentinel = _warmup_sentinel_path()
+    if sentinel.exists():
+        sentinel.unlink()
+
+
 def clear_all_caches():
     """Clear all JIT caches (disk only — in-memory caches are per-process)."""
     import shutil
@@ -216,5 +338,6 @@ def clear_all_caches():
         if p.exists():
             shutil.rmtree(p)
             p.mkdir(parents=True, exist_ok=True)
+    clear_warmup_sentinel()
     if _is_verbose():
         _log.info(f"[JIT] Cleared all caches under {root}")

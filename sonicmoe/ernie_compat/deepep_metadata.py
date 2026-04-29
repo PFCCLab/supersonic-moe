@@ -25,6 +25,7 @@ For the **topk** path (``deepep_topk_to_sonic_metadata``):
 from __future__ import annotations
 
 import math
+import os
 from typing import Sequence
 
 import torch
@@ -296,6 +297,25 @@ def deepep_topk_to_sonic_metadata(
 # ── CUDA topk implementation ─────────────────────────────────────────────────
 
 
+def _normalize_device(device):
+    """Normalize torch.device / paddle Place / str → 'cuda:N' string.
+
+    Under paddle.compat torch-proxy, `torch.empty_like(..., device=...)`
+    routes through paddle which only accepts strings or `core.Place`.
+    Pre-normalizing here keeps callers (mlp_node_v2 passing `x.device`)
+    proxy-agnostic.
+    """
+    if device is None or isinstance(device, str):
+        return device
+    idx = getattr(device, "index", None)
+    if idx is None:
+        try:
+            idx = device.gpu_device_id()
+        except Exception:
+            idx = 0
+    return f"cuda:{int(idx) if idx is not None else 0}"
+
+
 def _copy_tpe_h2d_async(tpe_list, device):
     """Async pinned-memory H2D copy for tokens_per_expert.
 
@@ -304,6 +324,7 @@ def _copy_tpe_h2d_async(tpe_list, device):
     Pinned tensors are queued and recycled once their copy event completes.
     Falls back to the legacy sync path if cuda.bindings is unavailable.
     """
+    device = _normalize_device(device)
     if not _HAS_CUDA_ART:
         return torch.tensor(tpe_list, dtype=torch.int32, device=device)
 
@@ -359,6 +380,25 @@ def _deepep_topk_to_sonic_metadata_cuda(
     """
     N_recv = dispatched_indices.shape[0]
     topk = dispatched_indices.shape[1]
+    device = _normalize_device(device)
+
+    # Optional contract check (debug only — sm-level scan, ~5µs):
+    # dispatched_indices[i, :] must contain UNIQUE expert IDs. Real DeepEP
+    # dispatch enforces this; duplicates would collapse two slots onto one
+    # token-major position in s_reverse_scatter_idx and orphan padded slots,
+    # eventually causing IMA in router_forward / wgrad gather. Enable via
+    # SONIC_MOE_VALIDATE_DISPATCH=1 (off by default for production perf).
+    if os.environ.get("SONIC_MOE_VALIDATE_DISPATCH") == "1" and N_recv > 0 and topk > 1:
+        sorted_idx, _ = dispatched_indices.sort(dim=-1)
+        # Adjacent-equal among non-negative (-1 = masked is allowed multi-occurrence).
+        dup_mask = (sorted_idx[:, 1:] == sorted_idx[:, :-1]) & (sorted_idx[:, 1:] >= 0)
+        if dup_mask.any():
+            bad_row = int(dup_mask.any(dim=-1).nonzero()[0].item())
+            raise ValueError(
+                f"dispatched_indices contract violation: row {bad_row} has "
+                f"duplicate expert IDs {dispatched_indices[bad_row].tolist()}. "
+                "Each token's topk slots must be unique experts."
+            )
 
     # Compute TK and TK_padded on host (need tokens_per_expert list)
     if isinstance(tokens_per_expert, torch.Tensor):
@@ -386,14 +426,12 @@ def _deepep_topk_to_sonic_metadata_cuda(
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
         return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
 
-    expert_offsets = torch.empty([E + 1], dtype=torch.int32)
-    seg_starts = torch.empty([E], dtype=torch.int32)
-    real_bases = torch.empty([E], dtype=torch.int32)
-    x_gather_idx = torch.zeros([TK_padded], dtype=torch.int32)
-    s_scatter_idx = torch.empty([TK_padded], dtype=torch.int32)
-    s_reverse_scatter_idx = torch.empty([TK], dtype=torch.int32)
-    topk_scores = torch.zeros([TK_padded], dtype=torch.float32)
-    naept = torch.empty([N_recv + 1], dtype=torch.int32)
+    # NOTE: ``seg_starts`` / ``real_bases`` and the kernel scratch buffers are
+    # allocated below alongside the device-typed outputs. An earlier draft
+    # also pre-allocated ``expert_offsets`` etc. here without ``device=`` —
+    # those duplicates were dead code immediately overwritten by the block
+    # below, and under raw torch they would have been CPU tensors silently
+    # smuggled into the CUDA launcher. Removed S76.
 
     # ── Output tensors (saved on autograd ctx) — MUST be per-call ────────────
     # Bug 2026-04: when two MoE layers' forwards run before any backward (true
@@ -403,6 +441,8 @@ def _deepep_topk_to_sonic_metadata_cuda(
     # extra alloc cost is ~5–10 µs total via the torch caching allocator,
     # negligible vs. the GEMM cost; correctness is non-negotiable.
     expert_offsets = torch.empty(E + 1, dtype=torch.int32, device=device)
+    seg_starts = torch.empty(E, dtype=torch.int32, device=device)
+    real_bases = torch.empty(E, dtype=torch.int32, device=device)
     x_gather_idx = torch.zeros(TK_padded, dtype=torch.int32, device=device)
     s_scatter_idx = torch.empty(TK_padded, dtype=torch.int32, device=device)
     s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
@@ -421,7 +461,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
     # launcher to write `2*num_blocks` ints past the buffer end -> silent
     # cudaErrorIllegalAddress in downstream consumers when the OOB region
     # happens to sit on top of a live allocation. Keep this size exact.
-    cumsum_workspace = torch.empty([2 * num_blocks * (E + 1)], dtype=torch.int32)
+    cumsum_workspace = torch.empty([2 * num_blocks * (E + 1)], dtype=torch.int32, device=device)
 
     _stream_obj = torch.cuda.current_stream(device)
     stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream

@@ -201,8 +201,7 @@ def main():
     t_w = time.perf_counter()
     for _ in range(2):
         xw = paddle.randn([1024, H], dtype="bfloat16"); xw.stop_gradient = False
-        _m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None
-        _m._NATIVE_GRAD_EXPERTS = None; invalidate_weight_caches()
+        invalidate_weight_caches()
         with enable_fp8(True):
             _refresh_fp8_config()
             ow = node(xw, tpe_w, di_w, dp_w)
@@ -230,10 +229,6 @@ def main():
         grad_out = paddle.randn([N, H], dtype="bfloat16") * 0.01
 
         # Zero native grad buffers + main_grad for isolated per-shape comparison
-        if _m._NATIVE_W1_GRAD is not None:
-            _m._NATIVE_W1_GRAD.zero_()
-        if _m._NATIVE_W2_GRAD is not None:
-            _m._NATIVE_W2_GRAD.zero_()
         for e in experts:
             if hasattr(e.up_gate_proj.weight, 'main_grad') and e.up_gate_proj.weight.main_grad is not None:
                 e.up_gate_proj.weight.main_grad.zero_()
@@ -242,8 +237,7 @@ def main():
 
         # Only invalidate on first shape; steady-state reuses cache
         if first_shape:
-            _m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None
-            _m._NATIVE_GRAD_EXPERTS = None; invalidate_weight_caches()
+            invalidate_weight_caches()
             first_shape = False
 
         t_iter = time.perf_counter()

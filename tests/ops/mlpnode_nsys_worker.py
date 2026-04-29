@@ -65,8 +65,6 @@ tpe = paddle.bincount(di.reshape([-1]).cast("int64"), minlength=E).tolist()
 
 # ── Warmup (forward-only, outside profiler) ──────────────────────────────
 invalidate_weight_caches(); clear_all_fp8_weight_caches()
-_m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None; _m._NATIVE_GRAD_EXPERTS = None
-
 print(f"Warmup {WARMUP} forward-only iters...", flush=True)
 for _ in range(WARMUP):
     xw = paddle.randn_like(x); xw.stop_gradient = False
@@ -86,9 +84,7 @@ print(f"Profiling {ITERS} fwd+bwd iters...", flush=True)
 
 for it in range(ITERS):
     xt = paddle.randn_like(x); xt.stop_gradient = False
-    _m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None
-    _m._NATIVE_GRAD_EXPERTS = None; invalidate_weight_caches()
-
+    invalidate_weight_caches()
     with enable_fp8(True):
         _refresh_fp8_config()
         ot = node(xt, tpe, di, dp)

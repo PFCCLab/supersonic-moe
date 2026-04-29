@@ -238,3 +238,6 @@ reports/jit_opt_validation.json
 reports/mlpnode_bench.json
 reports/frontier_perf_sweep_smoke.md
 docs/KNOWLEDGE_BASE.md
+.ci_artifacts/
+.jit_cache_ci/
+log/

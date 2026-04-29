@@ -551,8 +551,6 @@ tpe = paddle.bincount(di.reshape([-1]).cast("int64"), minlength=E).tolist()
 
 # Warmup
 invalidate_weight_caches(); clear_all_fp8_weight_caches()
-_m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None; _m._NATIVE_GRAD_EXPERTS = None
-
 for _ in range({warmup}):
     xw = paddle.randn_like(x); xw.stop_gradient = False
     with enable_fp8(True):
@@ -569,8 +567,7 @@ mem_pre = paddle.device.cuda.memory_allocated() / MiB
 torch.cuda.cudart().cudaProfilerStart()
 for _ in range({iters}):
     xt = paddle.randn_like(x); xt.stop_gradient = False
-    _m._NATIVE_W1_GRAD = None; _m._NATIVE_W2_GRAD = None
-    _m._NATIVE_GRAD_EXPERTS = None; invalidate_weight_caches()
+    invalidate_weight_caches()
     with enable_fp8(True):
         _refresh_fp8_config()
         ot = node(xt, tpe, di, dp)
