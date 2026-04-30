@@ -348,3 +348,205 @@ the direct `_UpProjection.apply` / `_DownProjection.apply` path:
   parameter layout already matches the CUTLASS write layout (`[E, 2I, H]` /
   `[E, H, I]`).
 
+
+---
+
+## 7. S77/S78 addendum — distributed-launch hardening & JIT cache contract
+
+> Applies on top of §1–§6. Required reading for any PaddleFleet bump that
+> consumes the `myrepo/race-fix-paddle` snapshot (post-S77, commit ≥ `7660ade`).
+
+### 7.1 paddlejob env: **whitelist**, never denylist
+
+`paddle.distributed.launch` reads cluster bootstrap variables out of the
+calling process env (`PADDLE_TRAINERS`, `DISTRIBUTED_TRAINER_ENDPOINTS`,
+`POD_*`, `EKS_POD_*`, `NCCL_BOOTSTRAP_UID_SOCK_FAMILY`,
+`NCCL_SOCKET_IFNAME`, `MASTER_ADDR/PORT`, …). On a paddlejob worker these
+are *always* set, and `launch` interprets them as "you are joining a
+multi-node rendezvous", silently hanging when no peer ever shows up.
+
+PaddleFleet harnesses that spawn `python -m paddle.distributed.launch` from
+within an existing paddlejob slot **must construct the child env from a
+whitelist**, not by `os.environ.copy()` minus a denylist. The reference
+whitelist used by sonic-moe CI (`tools/ci/multicard_smoke.py`):
+
+```python
+ENV_WHITELIST_PREFIX = (
+    "PATH", "LD_", "HOME", "USER", "LANG", "LC_", "TERM", "TMPDIR",
+    "PWD", "SHELL",
+    "PYTHON",                # PYTHONPATH / PYTHONUNBUFFERED / …
+    "VIRTUAL_ENV", "CONDA_",
+    "CUDA_", "NVIDIA_",      # CUDA_HOME / CUDA_VISIBLE_DEVICES / …
+    "TRITON_",               # TRITON_PTXAS_PATH / TRITON_CACHE_DIR
+    "SONIC_MOE_", "USE_QUACK_GEMM",
+    "FLAGS_",                # paddle FLAGS_*
+    "NCCL_", "GLOG_", "OMP_",
+)
+ENV_DROP_EXACT = ("NCCL_SOCKET_IFNAME", "NCCL_BOOTSTRAP_UID_SOCK_FAMILY")
+```
+
+Symptom of regressing this: `paddle.distributed.launch` prints rendezvous
+endpoints with the *paddlejob* trainer IP list and never returns. Add a
+30-second wall-clock timer around the launch call to fail fast if bumped.
+
+### 7.2 Lazy device-context-pool init (root-cause of S77 production hang)
+
+The original production crash that triggered S77 was:
+
+```
+ExternalError: ... Place(gpu:1) is not supported by Executor.
+  at paddle/phi/backends/context_pool.cc:81
+  in quack/autotuner.py(67) _gpu_warmup → paddle.tensor.random.gaussian
+  during GradNodePyLayer SonicMoEDeepEPFunc.backward
+```
+
+Root cause: `paddle 3.4`'s `DeviceContextPool` only registers the place
+named by `FLAGS_selected_gpus`. Async paths (autograd backward, the
+`paddle.library` proxy that quack uses for its custom-op shims, JIT warmup
+inside `quack.autotuner._gpu_warmup`) hit the pool with the device
+inferred from the current torch-compat thread-local stream, *not* from
+`current_device()`.
+
+**Fix contract** that PaddleFleet entry-points must honour:
+
+1. Read `FLAGS_selected_gpus` (or `CUDA_VISIBLE_DEVICES[local_rank]`) and
+   call `paddle.device.set_device(f"gpu:{N}")` immediately after worker
+   start.
+2. Eagerly allocate a 1-element tensor right after the `set_device`:
+   ```python
+   import paddle
+   paddle.device.set_device(f"gpu:{N}")
+   _ = paddle.empty([1])           # <- forces DeviceContextPool entry
+   ```
+3. Only then `import sonicmoe`, instantiate `SonicMoEMlpNode`, or call
+   any quack op.
+
+Reference implementation: `tools/ci/multicard_smoke.py:WORKER_BODY`. We
+plan to fold this into `sonicmoe._quack_compat` so callers don't have to
+remember; until then PaddleFleet must do it explicitly.
+
+### 7.3 `_FP8Config` snapshot timing
+
+`SonicMoEMlpNode.forward` constructs `_FP8Config()` lazily; the constructor
+calls `is_fp8_active()` once and snapshots the result. If the node is built
+*outside* a `with enable_fp8(True):` block and called *inside* one, the
+snapshot is stale and the node silently runs BF16.
+
+```python
+# WRONG — config snapshot before fp8 context activates
+node = SonicMoEMlpNode(...)
+with enable_fp8(True):
+    out = node(...)        # runs BF16
+
+# RIGHT — refresh inside the context
+with enable_fp8(True):
+    node = SonicMoEMlpNode(...)
+    out = node(...)
+# Or call node._refresh_fp8_config() inside the with-block.
+```
+
+`mlp_node_v2.py:722-728` performs the refresh internally on the first
+forward inside an `enable_fp8(True)` block, but PaddleFleet harnesses that
+hold a long-lived node across enable/disable transitions must call
+`node._refresh_fp8_config()` themselves.
+
+### 7.4 Multi-process JIT cache on shared GPFS
+
+In production every GPU is a separate process, *and* the JIT cache lives on
+shared GPFS. Three facts the cache layer enforces (do not bypass):
+
+* Cache key includes Triton/CuTe source hash + shape signature
+  (`H`, `I`, `E`, `total_K`, dtype) **but not** `T`/`seqlen`. T-axis
+  variation must not retrigger compilation. Verified by
+  `tests/ops/test_jit_key_stability.py`.
+* Disk writes go through `fcntl.flock` on a per-key `.lock` file in the
+  cache dir. Cold compile budget covers `flock` contention up to
+  ~32 ranks on a single GPFS volume; for larger pods stage a per-node
+  cache dir via `SONIC_MOE_CACHE_DIR=/dev/shm/sonic_moe_cache_$LOCAL_RANK`
+  and seed it from GPFS once per node.
+* **Triton autotune *results* are now disk-cached too** (S78). Without
+  this, `token_gather_sum_kernel` alone re-ran a 21 000-launch sweep on
+  every cold process (~30 s wall). `sonicmoe._triton_autotune_persist`
+  flips `TRITON_CACHE_AUTOTUNING=1` at `import sonicmoe` time so every
+  sonic-moe (and quack) `@triton.autotune` kernel persists its best-config
+  selection to `$TRITON_CACHE_DIR/<sha>/<kernel>.autotune.json`. Verified
+  saving on this host: cold→warm wall **236.9 s → 173.7 s (−63 s/process,
+  −27 %)** with bench µs/iter unchanged. Multi-process safe (Triton uses
+  atomic-rename writes). Opt-out: `SONIC_MOE_NO_TRITON_AUTOTUNE_CACHE=1`.
+
+PaddleFleet harness expectations:
+
+| Env / call                          | Required value / behaviour |
+| ----------------------------------- | -------------------------- |
+| `SONIC_MOE_CACHE_DIR`               | shared GPFS dir reachable by every rank; created by rank 0 ahead of `import sonicmoe` |
+| Cold-warmup budget per rank         | ≤ 600 s (ptxas + autotune); see `tools/ci/baselines.json::jit.cold_warmup_s` |
+| Warm sentinel skip                  | ≤ 5 s; rank N must observe rank 0's `warmup_sentinel.json` after barrier |
+| Cross-process reload                | ≤ 300 s (disk-cache hit, no ptxas) |
+| In-process dispatch                 | ≤ 8 ms median fwd+bwd (`jit.in_process_reuse_us`) |
+
+If the harness deletes the cache dir between runs, expect the full 600 s
+cold path on the next launch; bake `warmup_jit_parallel(workers=N)` into
+the harness boot or accept the regression.
+
+### 7.5 `quack` import path (production-only landmine)
+
+`/usr/local/bin/python` does **not** have `quack` site-packaged. The
+project relies on injecting
+`/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack`
+into `sys.path` before any sonic-moe import.
+
+PaddleFleet harnesses that subprocess into `/usr/local/bin/python`
+(perf gates, multicard launchers, JIT bench) must propagate either:
+
+* `PYTHONPATH=…/sonicmoe_for_ernie/quack:$PYTHONPATH` in the child env, **or**
+* run the child via `eb_venv/bin/python` (already has quack installed):
+  `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/python`.
+
+Reference: `tools/ci/jit_bench.py::_run_subprocess` and
+`tests/conftest.py` both inject the path.
+
+### 7.6 Coverage-collection contract (S78)
+
+The CI script `tools/ci/run_core_tests.sh` runs every phase under
+`coverage run --source=sonicmoe` (NOT `--append` — incompatible with
+`.coveragerc::parallel = True`, see S78) and gates on
+`baselines.json::coverage.target_pct` (currently 28 %, set to current
+actuals). For PaddleFleet:
+
+* **No source change** required — coverage is process-scoped, won't leak
+  into Fleet's harness.
+* The CI uses parallel-mode coverage (`.coveragerc::parallel = True`) so
+  per-xdist-worker `.coverage.*` files are merged via `coverage combine`.
+* Bumping the target requires editing `baselines.json` *and* explaining
+  the new floor in HANDOFF — no silent loosening.
+
+### 7.7 Removed/moved symbols since S74
+
+| Old (S74)                                            | New (S77/S78) |
+| ---------------------------------------------------- | -------------- |
+| `sonicmoe.ernie_compat.mlp_node_v2._W_CACHE`         | per-instance `node._w_cache` (already in S74 docs; reaffirmed) |
+| `sonicmoe.warmup.warmup_jit(force=True)`             | unchanged, but now backed by file-locked GPFS-safe writer |
+| ad-hoc per-test cache dirs                           | unified `SONIC_MOE_CACHE_DIR`, default `<repo>/.jit_cache` |
+| (none)                                               | new `tests/ops/test_jit_key_stability.py` — verifies T-axis non-keying |
+| (none)                                               | new `tests/ops/test_jit_concurrent_heterogeneous.py` — verifies cross-rank heterogeneous shape compile under one cache dir |
+| (none)                                               | new `tests/ops/test_mlpnode_extreme_shapes.py` — 0-size + extreme-imbalance |
+| `tools/ci/multicard_smoke.py`                        | env-whitelist + eager device-pool + `FLAGS_selected_gpus` pin + `TRITON_PTXAS_PATH` |
+
+---
+
+## 8. Validation snapshot accompanying this doc
+
+Captured on B30Z, paddlejob shared GPFS host, post-S77 commit `7660ade`:
+
+| Suite                                      | Result               |
+| ------------------------------------------ | -------------------- |
+| `bash tools/ci/run_core_tests.sh`          | ✅ 13/13 PASS, 0 SKIP |
+| Per-iter perf (FP8, T=8192 H=3072 I=1536 E=8 K=8) | 2519 µs/microbatch (grad_acc=8); GPU-projection 2823 µs/iter mlpnode-only |
+| Speedup vs. BF16                           | 1.29×–1.70× (mean 1.53×) |
+| Precision (cosine)                         | ≥ 0.997 on `out`, `dx`, `ds`, `dw1`, `dw2` |
+| Memory (FP8)                               | +4.8 % – +10.3 % over BF16; mem-mode −24.5 % |
+
+The accompanying nsys timeline at the canonical Ernie shape lives at
+`reports/ernie_shape_nsys_s78/trace.nsys-rep` (+ `trace.sqlite`); open in
+Nsight Systems 2026.2 or use `tools/parse_nsys_per_iter.py` to dump
+per-iter GPU-projection.

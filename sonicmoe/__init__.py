@@ -5,6 +5,13 @@
 import paddle
 import inspect
 
+# ── Persistent Triton autotune cache ──────────────────────────────────────────
+# MUST run before any sonicmoe submodule (or upstream quack) executes its
+# `@triton.autotune` decorators, because Autotuner.__init__ snapshots the
+# `cache_results` flag at decoration time. Without this, every cold process
+# re-runs ~30 s of autotune sweep for token_gather_sum_kernel alone.
+from sonicmoe import _triton_autotune_persist as _triton_autotune_persist  # noqa: F401
+
 # ── Triton ↔ Paddle stream compat ────────────────────────────────────────────
 # Must run before any Triton kernel is launched. Triton binds
 # ``get_current_stream`` to torch._C internals at import time, so without this

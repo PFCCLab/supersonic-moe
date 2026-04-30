@@ -80,7 +80,7 @@ skip() { echo "${YEL}[${1}] SKIP — ${2}${RST}"; SKIP_ROWS+=("${1}: ${2}"); }
 
 run_pytest() {
   if [[ "$DO_COVERAGE" == "1" ]] && command -v coverage >/dev/null 2>&1; then
-    coverage run --append --source=sonicmoe -m pytest "$@" 2>&1 | tail -200
+    coverage run --source=sonicmoe -m pytest "$@" 2>&1 | tail -200
   else
     python -m pytest "$@" 2>&1 | tail -200
   fi
@@ -102,7 +102,7 @@ run_pytest_parallel() {
   fi
   if [[ "$DO_COVERAGE" == "1" ]] && command -v coverage >/dev/null 2>&1; then
     COVERAGE_PROCESS_START="$ROOT/.coveragerc" \
-      coverage run --append --source=sonicmoe -m pytest \
+      coverage run --source=sonicmoe -m pytest \
         -n "$n" --dist=loadfile "$@" 2>&1 | tail -200
   else
     python -m pytest -n "$n" --dist=loadfile "$@" 2>&1 | tail -200
@@ -111,7 +111,7 @@ run_pytest_parallel() {
 
 run_script() {
   if [[ "$DO_COVERAGE" == "1" ]] && command -v coverage >/dev/null 2>&1; then
-    coverage run --append --source=sonicmoe "$@" 2>&1 | tail -200
+    coverage run --source=sonicmoe "$@" 2>&1 | tail -200
   else
     python "$@" 2>&1 | tail -200
   fi
@@ -130,6 +130,9 @@ fi
 
 # ── 1. Precision ─────────────────────────────────────────────────────────────
 phase precision run_script tests/ops/test_mlpnode_precision.py
+
+# ── 1b. Import smoke (cheap; lifts coverage of optional kernels) ─────────────
+phase import-smoke run_pytest_parallel tests/ops/test_import_smoke.py -q
 
 # ── 2. Multilayer / PP / multistep ───────────────────────────────────────────
 phase multilayer run_pytest_parallel tests/ops/test_mlpnode_multilayer.py -x -q

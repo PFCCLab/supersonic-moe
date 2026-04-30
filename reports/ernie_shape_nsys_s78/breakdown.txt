@@ -1,0 +1,24 @@
+BENCH wall: 61651.1 µs over 12 iters → 5137.6 µs/iter (CPU wall)
+GPU-projection (min..max span): 5106.4 µs/iter
+GPU busy time (sum durations): 2740.1 µs/iter
+
+kernel                                                                         n     tot_us    us/iter      %
+--------------------------------------------------------------------------------------------------------------
+kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__Til    48    14589.8    1215.81  44.4%
+kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmGatedSm    12     5397.1     449.76  16.4%
+kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmDGatedF    12     4792.1     399.34  14.6%
+_colwise_quantize_and_pack_kernel                                             36     2567.3     213.94   7.8%
+_dual_varlen_quantize_kernel                                                  12     1828.7     152.39   5.6%
+token_gather_sum_kernel                                                       24     1775.0     147.91   5.4%
+_quantize_and_pack_kernel                                                     36      970.5      80.88   3.0%
+VectorizedBroadcastKernel                                                     12      231.8      19.31   0.7%
+index_elementwise_with_tensor_kernel                                          36      198.6      16.55   0.6%
+_gather_isa_packed_scales_kernel                                              24      190.0      15.83   0.6%
+VectorizedElementwiseKernel                                                   72      127.7      10.65   0.4%
+scatter_and_fixup_kernel                                                      12       75.7       6.31   0.2%
+VecReduceKernel                                                               12       41.8       3.48   0.1%
+histogram_kernel                                                              12       37.4       3.12   0.1%
+prefix_sums_kernel                                                            12       35.5       2.96   0.1%
+block_offset_scan_kernel                                                      12       22.5       1.87   0.1%
+--------------------------------------------------------------------------------------------------------------
+TOTAL                                                                               32881.3    2740.11
