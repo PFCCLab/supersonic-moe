@@ -1,145 +1,325 @@
-# HANDOFF — Sonic-MoE FP8 Frontier (2026-05-06)
+# HANDOFF — SonicMoE FP8 Frontier (clean state, 2026-05-06)
 
-> **Branch**: `race-fix-paddle` (on `myrepo` = PFCCLab/supersonic-moe)
-> **Frontier status**: GREEN — determinism + stress tests PASS, no regressions.
+> **Branch**: `race-fix-paddle`
+>
+> **Repository**: PFCCLab/supersonic-moe
+>
+> **Frontier status**: GREEN for the documented FP8 frontier path. Precision, determinism, stress, and integration contracts are understood; no known blocker in the default path.
+>
+> **Authoritative handoff**: this root `HANDOFF.md`. Historical notes in `reports/fp8_upgrade/engineering_log.md` are useful chronology only and contain superseded intermediate claims.
 
-## 项目概述
+---
 
-Sonic-MoE 是一个 Mixture-of-Experts 前向/反向计算库，运行在 NVIDIA Blackwell (B30Z, SM100, 148 SMs, 8 TB/s HBM3e)。核心路径使用 FP8 (E4M3) blockscaled 量化 + CUTLASS/CuTe DSL 自定义 GEMM kernels (QuACK)。
+## 1. Project state in one paragraph
 
-## 当前性能指标 (Ernie 生产 shape: T=8192, E=8, K=8, H=3072, I=1536)
+SonicMoE is a Blackwell/Hopper Mixture-of-Experts expert-MLP engine. The active production path on Blackwell uses DeepEP topk metadata, route-level padding, blockscaled FP8 E4M3 + UE8M0 scales, CuTe/CUTLASS/QuACK GEMMs, zero-materialization `A_idx` gather, fused gated up-projection (`GEMM + SwiGLU + z FP8 epilogue quant`), FP8 down-projection, FP8-C-load `GemmDGated` backward, iso32 dz dual quant, and TMA reduce-add wgrad directly into ERNIE/Paddle `main_grad`. The Paddle integration entrypoint is `sonicmoe.ernie_compat.SonicMoEMlpNode`; `node.step()` must run before `optimizer.step()` to flush native CUTLASS wgrad layout into ERNIE layout.
 
-| 指标 | 数值 | 来源 |
-|------|:---:|------|
-| **FP8 frontier busy time** | 2660 µs/iter | nsys GPU-projection (S81 fresh data) |
-| **MFU (vs 4500 TFLOPS FP8 peak)** | 46.5% | `reports/fresh_benchmark_ws1/` |
-| **MFU peak (H6144-I2048 shape)** | 51.5% | 同上 |
-| **Determinism** | Bit-exact across runs | `tests/fp8_frontier_determinism_test.py` |
-| **Precision (vs BF16 gold)** | cos ≥ 0.997, RRMSE < 7.6% | `tests/ops/test_mlpnode_precision.py` |
-| **FP8 vs QuACK-BF16 speedup** | 1.11× (both use FP8 TC GEMMs) | 注意：QuACK BF16 并非真 BF16 TC |
-| **FP8 vs cuBLAS BF16 speedup** | ~1.37× (S53 historical数据) | README.md |
-| **Cold-start JIT** | ~46s (E=8 Ernie shape) | `tests/ops/test_cold_start_e2e.py` |
+---
 
-## Kernel 时间分解 (nsys, Ernie shape, per-iter)
+## 2. Current performance, memory, and precision
 
-```
-1185 µs  44.1%  QuACK wgrad GEMMs (4 calls: w1/w2 forward wgrad × 2)
- 441 µs  16.4%  GemmGatedSm100ZeroMatBlockscaledQuant (fwd gated+quant)
- 400 µs  14.9%  GemmDGatedFP8CLoadSm100ZeroMat (bwd actgrad)
- 242 µs   9.0%  _colwise_quantize_and_pack (already num_warps=1)
- 148 µs   5.5%  token_gather_sum_kernel (combine/scatter)
- 103 µs   3.8%  _dual_varlen_iso32_quantize (already num_warps=1)
-  83 µs   3.1%  _quantize_and_pack (rowwise quant, bandwidth-bound)
-  37 µs   1.4%  Other (VectorizedBroadcast, index_elementwise)
+### 2.1 Latest single-GPU training performance
+
+Hardware/method: B30Z Blackwell (`sm_103`, 148 SMs, HBM3e), nsys GPU-projection over BENCH NVTX range, `USE_QUACK_GEMM=1`, `SONIC_MOE_FP8_MODE=perf`, `SONIC_MOE_FP8_WGRAD=1`.
+
+| Shape | FP8 busy | MFU vs 4500 TFLOPS | TFLOPS | Source |
+|---|---:|---:|---:|---|
+| `T=1024,H=3072,I=1536,E=8,K=8` | 566.0 µs | 27.32% | 1229 | `reports/fresh_benchmark_ws1/` |
+| `T=2048,H=3072,I=1536,E=8,K=8` | 870.1 µs | 35.54% | 1599 | same |
+| `T=4096,H=3072,I=1536,E=8,K=8` | 1459.1 µs | 42.39% | 1907 | same |
+| **`T=8192,H=3072,I=1536,E=8,K=8`** | **2659.8 µs** | **46.51%** | **2093** | same; canonical Ernie shape |
+| `T=16384,H=3072,I=1536,E=8,K=8` | 5224.9 µs | 47.35% | 2131 | same |
+| `T=8192,H=3072,I=1536,E=16,K=8` | 2800.7 µs | 44.17% | 1987 | same |
+| `T=8192,H=3072,I=1536,E=32,K=8` | 3187.5 µs | 38.81% | 1746 | same |
+| `T=8192,H=4096,I=4096,E=8,K=8` | 8521.7 µs | **51.61%** | 2322 | measured MFU peak |
+
+Baseline caveat:
+
+- **FP8 vs current QuACK BF16**: Ernie shape is `2659.8 µs` vs `2942.5 µs` = **1.11x**. This is the fair in-repo current comparison.
+- **FP8 vs historical S53 cuBLAS/PyTorch BF16**: Ernie shape was `3644 µs` vs `2659.8 µs` = **~1.37x**. Do not mix this with QuACK BF16.
+- **Small batches**: FP8 is slower at `T=1024/2048` because quant/scale/metadata overhead is not amortized. Crossover is around `T=3000-4000`.
+
+### 2.2 Kernel breakdown at Ernie shape
+
+Latest nsys GPU-projection per iter:
+
+```text
+1185 µs  44.1%  QuACK wgrad GEMMs (4 calls)
+ 441 µs  16.4%  GemmGatedSm100ZeroMatBlockscaledQuant (fwd up + SwiGLU + z quant)
+ 400 µs  14.9%  GemmDGatedFP8CLoadSm100ZeroMat (bwd actgrad + dSwiGLU)
+ 242 µs   9.0%  _colwise_quantize_and_pack (num_warps=1)
+ 148 µs   5.5%  token_gather_sum_kernel / token reduce-combine
+ 103 µs   3.8%  _dual_varlen_iso32_quantize (num_warps=1)
+  83 µs   3.1%  _quantize_and_pack
+  37 µs   1.4%  other broadcast/index kernels
 ─────────────────
-2639 µs  100%   Total
+~2639-2660 µs total
 ```
 
-## 关键技术事实
+NCU headline for the 6 GEMMs (`reports/ernie_shape_ncu_s78b/`):
 
-### 1. GemmDGated epilogue 融合不可行 (NCU 验证)
-- `GemmDGatedFP8CLoadSm100ZeroMat`: 168 regs/thread × 384 threads = 64512/65536 regs (98.4%)
-- Block Limit Registers = 1 (零寄存器余量)
-- **任何** epilogue 循环 (amax reduction, fp8 cast) 都会导致寄存器溢出 → segfault
-- `compute-sanitizer` 会 mask 该 crash（重编译用不同 flags，不可作为诊断工具）
-- 详见 `reports/ernie_shape_ncu_s78b/`
+| Role | Tensor pipe | DRAM | L2 hit | regs/thread | Readout |
+|---|---:|---:|---:|---:|---|
+| fwd1 `GemmGated(fp8 swiglu epi)` | 64% | 10.5% | 88.8% | 168 | epilogue/register bound |
+| fwd2 `GemmDefault` | 70% | 19.5% | 77.6% | 54 | mostly healthy |
+| dgrad1 `GemmDGated(fp8 C-load)` | 42% | 22.5% | 61.3% | 168 | worst per-FLOP kernel; C-load/epilogue/register cliff |
+| dgrad2 `GemmDefault` | 81% | 25.9% | 68.6% | 56 | near optimum |
+| wgrad1 `GemmDefault` | 84% | 24.8% | 74.0% | 56 | near peak |
+| wgrad2 `GemmDefault + main_grad add` | 81% | 15.7% | 78.7% | 54 | TMA add is essentially free |
 
-### 2. Quant kernels 已完成单 warp 优化
-- `_dual_varlen_iso32_quantize`: num_warps=1, 74% BW efficiency (near-optimal)
-- `_colwise_quantize_and_pack`: num_warps=1, 2.3× speedup (NCU verified)
-- `_quantize_and_pack`: BLOCK_ROWS=64 num_warps=4 — 单 warp 对该 kernel **无提升** (已验证, bandwidth-bound at 32 regs)
+### 2.3 Memory state
 
-### 3. "BF16 baseline" 使用的是 FP8 Tensor Core
-- `USE_QUACK_GEMM=1` 时，所有 GEMM 内部仍量化为 FP8 使用 FP8 TC 计算
-- `SONIC_MOE_FP8_MODE=""` 只禁用 activation caching (z/y1 的 FP8 保存)
-- 无法在此代码库中获得真正的 BF16 TC baseline (legacy path 已删除)
-- 真 BF16 TC 对比需使用 `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/official` (但该 env 当前 broken)
+The current FP8 perf path is speed-oriented and keeps FP8 weight caches hot.
 
-### 4. iso32 dual-quant 是 precision-free lunch
-- 一个 amax 管 32×32 子块；FP8 bytes 行/列消费者共享
-- vs 1×32: downstream GEMM RRMSE ratio = 1.000× (bit-identical precision)
-- 省 192 MiB FP8 write + 半 amax 计算 → 实测 -61 µs/iter
+| Item | Current understanding |
+|---|---|
+| FP8 weight caches | Multiple physical layouts are cached for fwd/down/dgated/actgrad/wgrad. Cache keys include `data_ptr + inplace_version + shape/stride`; optimizer in-place updates naturally invalidate. |
+| `z` activation | Saved as `z_fp8 + UE8M0 scales`, avoiding a persistent `z_bf16(TK,2I)` activation. Ernie `z_bf16` would be ~384 MiB; FP8 data is ~192 MiB plus scales. |
+| `y1` | `y1_fp8 + scales` is passed across `_UpProjection` → `_DownProjection` via `_PREQUANTIZED_SCALES["fwd"]`; the BF16 logical object exists for autograd/flow but hot path consumes FP8. |
+| backward peak | Dominated by `dz`, `y1s`, colwise/rowwise quant products, `dx_expanded`, and wgrad accumulators. Previous report gives ~1.3 GiB/layer activation peak at Ernie shape; exact peak depends on cache retention and stagewise-memory mode. |
+| `SONIC_MOE_STAGEWISE_MEMORY=1` | Memory-saving mode; expect ~1.0-1.5 GiB peak savings at Ernie-like shape with ~3-5% cost. |
+| `SONIC_MOE_FP8_RECOMPUTE_Z=1` | Saves roughly one active `z_fp8` lifetime but costs extra up-proj recompute. Default remains off for perf. |
 
-## 文件结构 (关键路径)
+Memory claims older than Session 65 are often apples-to-oranges: some measured no FP8 wgrad, some included per-iter `node.step()` flush, some used old QuACK overhead. Treat them as historical unless reproduced with `bench_mlpnode_topk_nsys.py` / current benches.
 
+### 2.4 Precision and determinism
+
+Precision vs BF16 gold:
+
+| Tensor | Current result |
+|---|---|
+| output | cos ~0.9979 |
+| dx | cos ~0.9975 |
+| ds/router score grad | cos ~0.9971-0.9973 |
+| dw1 | cos ~0.9975 |
+| dw2 | cos ~0.9971-0.9972 |
+| RRMSE | < 7.6% in covered precision suite |
+
+Determinism:
+
+- `tests/fp8_frontier_determinism_test.py` is a hard gate and proves bit-exact repeated fwd/bwd on the frontier path.
+- This matters because TMA reduce-add, async TMA, and global FP8 caches could otherwise introduce bit-level drift.
+
+Numerical caveats:
+
+- iso32 dz dual quant is validated on real Ernie-like `dz` captures with downstream GEMM RRMSE ratio `1.000x`, but it is **not** a mathematical identity. Monitor `log2(block_amax / row_amax)` and zero ratio if using new distributions; fallback to 1x32 dual quant for high-risk distributions.
+- TMA reduce-add is not a precision improvement. It keeps fp32 `main_grad` but changes the accumulation implementation from epilogue C-load to TMA store-side ADD. It does not do Kahan/pairwise accumulation.
+- FP8 small values near zero can show large relative error; judge by cosine/RRMSE/absolute error and training loss, not max relative error alone.
+
+---
+
+## 3. Important implementation contracts
+
+### 3.1 Training loop contract
+
+```python
+for step in range(num_steps):
+    for mb in microbatches:
+        out = node(dispatched_hidden_states, tokens_per_expert,
+                   dispatched_indices, dispatched_probs)
+        out.backward(grad)
+    node.step()          # must run BEFORE optimizer.step()
+    optimizer.step()
+    optimizer.clear_grad()
 ```
-sonicmoe/functional/__init__.py     — 主 forward/backward autograd 逻辑
-sonicmoe/functional/utils.py        — is_fp8_active(), enable_fp8() context manager
-sonicmoe/quack_utils/gemm_dgated.py — 反向 actgrad GEMM (CUTLASS epilogue)
-sonicmoe/quack_utils/gemm_gated.py  — 正向 fused gated GEMM (含 BlockscaledQuant 成功模板)
-sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py — SM100 具体类注册
-sonicmoe/quack_utils/blockscaled_fp8_gemm.py   — 所有 Triton quant kernels
-sonicmoe/quack_utils/fused_quant_kernels.py    — 高层 quant API (dual_colwise etc.)
-sonicmoe/ernie_compat/              — Ernie 集成层 (MlpNode, metadata, weight layout)
-tests/fp8_frontier_determinism_test.py  — CI hard-fail: bit-exact 确定性
-tests/fp8_frontier_stress_test.py       — CI: 多 shape/routing 压力测试
-tests/run_regression.sh                 — CI 入口
-.runenv.sh                              — 必须 source 的环境设置
+
+`node.step()` flushes native CUTLASS accumulators:
+
+```text
+w1 native [E,2I,H] -> ERNIE [E,H,2I]
+w2 native [E,H,I]  -> ERNIE [E,I,H]
 ```
 
-## CI 运行方式
+### 3.2 Routing/metadata contract
+
+- Production uses `deepep_topk_to_sonic_metadata()`.
+- `dispatched_indices` is `[N_recv, topk] int32`; each row must contain distinct local expert ids where valid. `-1` means masked.
+- Route-level padding pads each expert segment to 128 rows. Padding rows gather `x[0]` but use score 0, so they contribute no output or gradient.
+- `x_gather_idx` lives in expert-sorted TK space and points into original token rows. This is the zero-materialization key.
+
+### 3.3 JIT/cache contract
+
+- Always `source .runenv.sh` on this host; it fixes Python/quack/ptxas/Paddle compat environment.
+- CuTe compile keys must contain only static model dimensions (`H/I/E/dtype/tile`) and never `TK`, `total_M`, capacity, or ISA-packed scale sizes.
+- Runtime fast-path caches may include exact shape but must have high-watermark eviction.
+- Multi-process GPFS JIT is protected by `FileLock` and direct `.so` import fallback; heterogeneous cold starts are covered by `tests/ops/test_jit_concurrent_heterogeneous.py`.
+
+---
+
+## 4. High-value information sources
+
+Read these before changing the frontier:
+
+| Priority | Source | Why it matters |
+|---:|---|---|
+| 1 | `reports/sonic_moe_fp8_frontier_newcomer_guide.md` | Standalone training guide: basics, dataflow, symbols, roofline, precision, expert Q&A |
+| 2 | `reports/fresh_benchmark_ws1/README.md` + `sweep.json` + `mfu_model.json` | Latest 22-point performance sweep and fitted MFU model |
+| 3 | `reports/ernie_shape_ncu_s78b/README.md` | NCU full report and bottleneck reasoning for 6 GEMMs |
+| 4 | `reports/sonic_moe_comprehensive_analysis.md` | Broad analysis report and newcomer summary |
+| 5 | `sonicmoe/functional/__init__.py` | `_UpProjection` / `_DownProjection` orchestration and FP8 state transfer |
+| 6 | `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | zero-materialization SM100 specialization |
+| 7 | `sonicmoe/quack_utils/gemm_gated.py` | fused gated GEMM + epilogue blockscaled quant |
+| 8 | `sonicmoe/quack_utils/gemm_dgated.py` | FP8 C-load dGated backward |
+| 9 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | quant kernels, iso32, TMA reduce-add, FP8 GEMM wrappers |
+| 10 | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` | machine, proxy, ncu lock reset, profiling methodology |
+
+Historical but non-authoritative:
+
+- `reports/fp8_upgrade/engineering_log.md`: chronological lessons only. It now has a current-state correction block at the top.
+- `reports/fp8_upgrade/HANDOFF.md`: stale historical reference.
+
+---
+
+## 5. Most valuable formulas and mental models
+
+### 5.1 MFU
+
+```text
+F = 18 * TK * H * I
+MFU = F / (busy_seconds * peak_FLOPs_per_second)
+
+Ernie:
+  TK = 8192 * 8 = 65536
+  F = 18 * 65536 * 3072 * 1536 = 5.566e12 FLOPs
+  ideal @4500 TFLOPS = 1237 µs
+  measured = 2659.8 µs
+  MFU = 46.51%
+```
+
+### 5.2 Empirical performance model
+
+Fitted from multiple fresh sweep points, not one point:
+
+```text
+busy_us =
+  18*TK*H*I / (4500e6 * eta_max)
+  + a_quant * TK * max(H,2I) * 1e-9
+  + a_expert * E * TK * 1e-6
+  + c_fixed
+
+eta_max = 0.541569
+a_quant = 50.0
+a_expert = 328.939
+c_fixed = 201.047 µs
+R^2 = 0.99896
+```
+
+Interpretation:
+
+- `eta_max` is effective GEMM family efficiency, including shape/varlen/epilogue effects.
+- `a_quant` is an empirical data-scale term, not the literal time of quant kernels.
+- `a_expert` captures fragmentation and per-expert overhead as E increases.
+- Refit if any fusion/fission/communication overlap changes the system.
+
+### 5.3 iso32 precision risk
+
+```text
+extra_bits_lost = log2(block_amax_32x32 / row_amax_1x32)
+```
+
+If p95 exceeds ~1.5 bits or max exceeds ~2.5 bits, consider fallback to 1x32 dual quant for that tensor/expert/step. Thresholds need training calibration; this is a guardrail, not a theorem.
+
+### 5.4 Fusion vs fission
+
+Fuse when:
+
+```text
+saved_HBM + saved_launch + saved_allocator/cache
+  >
+extra_register_cost + lost_occupancy + lost_parallelism + extra_control
+```
+
+Fission when:
+
+```text
+occupancy/tensor_pipe gain + reduced spill + better tile shape
+  >
+extra HBM store/load + extra launch/grid sync + lost locality
+```
+
+Current application: `GemmDGatedFP8CLoadSm100ZeroMat` is a fission candidate because it has 168 regs/thread and only ~42% tensor-pipe utilization; direct epilogue fusion of dz quant is not the right next step.
+
+---
+
+## 6. Lessons learned / pitfalls
+
+1. **Do not claim “FP8 is 2x faster.”** Current fair in-repo speedup at Ernie shape is 1.11x vs QuACK BF16; historical 1.37x is vs an older cuBLAS/PyTorch BF16 baseline.
+2. **Do not try to directly add dz quant loops to GemmDGated epilogue.** NCU shows 168 regs/thread × 384 threads = 64512/65536 regs, leaving effectively no register headroom.
+3. **compute-sanitizer can mask register-limit crashes.** Use it for memory safety, not as proof that a high-register kernel is production-safe.
+4. **TMA reduce-add is performance, not higher precision.** It avoids C-load/register pressure; determinism must still be tested.
+5. **iso32 is measured-scope safe, not universally exact.** Guard with amax-ratio/zero-ratio monitoring when changing distributions.
+6. **compile_key must stay static.** Dynamic token dimensions in compile keys cause recompile storms.
+7. **Paddle proxy differs from PyTorch.** `torch.equal`, stream handles, dtype strings, `_inplace_version`, storage offsets, and bf16 conversions all need compatibility handling.
+8. **nsys and ncu answer different questions.** End-to-end busy/MFU uses nsys GPU-projection; kernel resource bottlenecks use ncu SoL/register/L2/DRAM. Do not compare their durations directly unless clock/replay policy matches.
+9. **`node.step()` order is non-negotiable.** It must precede `optimizer.step()`.
+10. **Use whitelisted env for paddlejob launch.** Denylist cleanup is unsafe; cluster env vars can silently force multi-node rendezvous.
+
+---
+
+## 7. Next plan
+
+### P0 — dgrad1 structural optimization
+
+Target: `GemmDGatedFP8CLoadSm100ZeroMat`.
+
+Facts:
+
+- 168 regs/thread, near register cliff.
+- Tensor pipe ~42%, L2 hit ~61%.
+- Direct dz quant epilogue fusion is not viable in current shape.
+
+Promising directions:
+
+1. shorten live ranges in FP8 C-load + dSwiGLU epilogue;
+2. split `ds` reduction out if it materially contributes to register pressure;
+3. fission main GEMM and dSwiGLU/quant/reduce if occupancy gain exceeds HBM/grid-sync cost;
+4. test C-load/L2 locality scheduling without changing numerical semantics.
+
+### P1 — Training-side persistent pipeline research
+
+Inference communication+expert-compute megakernels do not directly transfer to training because training has activation lifetimes, wgrad, router score grad, `main_grad` layout, and deterministic accumulation. A realistic future path is a stage-wise persistent pipeline, not a single full-layer fwd+bwd megakernel.
+
+### P2 — Monitoring and safeguards
+
+- Add optional runtime audits for iso32 `log2(block_amax/row_amax)` and zero ratio.
+- Keep frontier determinism hard-gated.
+- Add tests around `node.step()` ordering / repeated accumulation / cache invalidation.
+
+### P3 — Documentation and onboarding
+
+- Keep `reports/sonic_moe_fp8_frontier_newcomer_guide.md` as the newcomer source.
+- Keep README’s quick facts aligned with this handoff.
+- Treat `engineering_log.md` as history only.
+
+---
+
+## 8. Validation commands for the next agent
 
 ```bash
 source .runenv.sh
-# 快速验证 (hard-fail on non-determinism)
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/fp8_frontier_determinism_test.py -v
 
-# 压力测试 (17 tests, ~2 min)
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/fp8_frontier_stress_test.py -v
+# Hard determinism gate
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 \
+  python -m pytest tests/fp8_frontier_determinism_test.py -v
 
-# 完整回归 (~15 min)
+# Stress / routing robustness
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 \
+  python -m pytest tests/fp8_frontier_stress_test.py -v
+
+# Full regression when changing kernels or metadata
 bash tests/run_regression.sh
 ```
 
-## 已知问题 / 预存 failures
+For profiling:
 
-1. `fp8_protocol_test.py` — 部分 test 因 paddle proxy `stream_base` API gap 失败 (非 FP8 代码问题)
-2. `moe_blackwell_test.py` — 环境兼容性问题 (非 frontier 问题)
-3. `test_fused_quant.py::test_correctness` — 与 iso32 变更后的预期输出不同 (算法正确, byte-pattern 不同)
-
-## 教训 & Pitfalls (给下一个 agent)
-
-1. **168 regs = 绝对天花板**: 不要尝试在 GemmDGated epilogue 加任何循环/归约逻辑
-2. **CuTe DSL 标量 fp8 cast 不支持**: 必须用 `r4.load().to(Float8E4M3FN)` 向量 pattern
-3. **Triton iso32 kernel 已达 74% BW 效率**: 替换为 CuTe DSL 最多节省 25µs, ROI 极低
-4. **ncu 异常退出会锁频**: 见 env.md 详细说明, 用 `ncu --clock-control=reset` 修复
-5. **Paddle proxy 陷阱**: `torch.equal()` 返回 element-wise tensor; `.to(dtype=)` 必须带 `device=`; `Stream.stream_base` 需 unscoped proxy
-
-## 下一步规划 (优先级排序)
-
-### P0: Float8E4M3FN D 输出路径 (HIGH EV, MEDIUM EFFORT)
-- `GemmSm100.is_valid_dtypes(Float8E4M3FN D)` 返回 True — FP8 D 在 SM100 上技术可行
-- 需要: override `assert d_dtype.width == 32`, D shape 从 `(TK,I)` f32 → `(TK,2I)` fp8
-- 潜在收益: 消除 768 MiB bf16 dz HBM 往返 → ~200 µs saving → +3 pp MFU
-- 关键未知: TMA store atom 是否支持 8-bit elements
-
-### P1: Pipeline scheduling 优化 (MEDIUM EV, LOW EFFORT)
-- 利用 dgated GEMM D 写与后续 quant kernel 读之间的 L2 locality
-- 不改 kernel, 只调 buffer size / launch 顺序
-
-### P2: Coverage 提升 (LOW EV, ONGOING)
-- 当前 31%, 目标 50%
-- 重点文件: `blockscaled_fp8_gemm.py`, `grouped_gemm.py`, `swiglu_triton.py`
-
-## 高价值信息源
-
-1. **`reports/fresh_benchmark_ws1/`** — 22 点性能 sweep (11 shapes × 2 modes) + MFU model (R²=0.999)
-2. **`reports/ernie_shape_ncu_s78b/`** — NCU full profile of all 6 Ernie GEMMs
-3. **`tools/mfu_model.py`** — MFU 理论模型 (η=0.54, a_quant=50, a_expert=329, c=201)
-4. **`reports/sparsity_audit_ws2.md`** — DeepEP 稀疏性分析 (K<topk 情况已正确处理)
-5. **`reports/score_weighting_analysis_ws3.md`** — Score 加权位置分析 (current = optimal)
-6. **`/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`** — 集群环境 + ncu 锁频修复
-7. **`.runenv.sh`** — 永远先 source 这个
-
-## MFU 理论模型
-
+```bash
+nsys profile --trace=cuda,nvtx --sample=none --backtrace=none \
+  --resolve-symbols=false --export=sqlite --output=OUTPUT \
+  python tests/ops/bench_mlpnode_topk_nsys.py --T 8192 --E 8 --I 1536 --topk 8
 ```
-busy = 18·TK·H·I/(peak×η) + a_q·TK·max(H,2I)·1e-9 + a_e·E·TK·1e-6 + c
 
-参数 (curve_fit, R²=0.999):
-  η_max = 0.5416  (GEMM shape efficiency)
-  a_quant = 50    (quant bandwidth coefficient)
-  a_expert = 329  (per-expert routing overhead)
-  c_fixed = 201   (fixed per-iter overhead, µs)
-  peak = 4500 TFLOPS (B30Z FP8 boost)
+If ncu exits abnormally and locks clocks, run:
+
+```bash
+ncu --clock-control=reset
 ```

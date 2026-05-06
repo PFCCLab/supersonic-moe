@@ -19,11 +19,13 @@
 | File | Summary | Notes |
 | --- | --- | --- |
 | `__init__.py` | Package marker and re-export surface. | — |
-| `blockscaled_fp8_gemm.py` | Hot-path Triton FP8 quantization, packing, and cache utilities. Includes `precompute_weight_fp8_warmup(w1, w2)` — a fused single-pass Triton pair-quantize kernel that emits all 4 transposed FP8 layouts + ISA-packed scales for w1/w2 in one HBM read per weight (~3.2x faster than the legacy 4-call sequence; bit-exact). | — |
+| `_validate.py` | Low-overhead input validation helpers for GPU kernel wrappers. | — |
+| `blockscaled_fp8_gemm.py` | Hot-path Triton FP8 quantization, packing, and cache utilities. | — |
 | `cute_blockscaled_quant.py` | CuTe DSL colwise blockscaled FP8 quantize — v5 with gather + ISA packing. | — |
 | `cute_dual_quant.py` | CuTe DSL dual blockscaled FP8 quantize — [32][33] padded smem design. | — |
 | `epi_blockscaled_quant.py` | Python module for epi blockscaled quant. | — |
 | `fp8_quack_patch.py` | Python module for fp8 quack patch. | — |
+| `fused_quant_kernels.py` | API-level fusion: dual_quantize_varlen(dz) + colwise_quantize_and_pack(dout, gather). | — |
 | `gemm_dgated.py` | Python module for gemm dgated. | — |
 | `gemm_dgated_fp8c_design.py` | Python module for gemm dgated fp8c design. | — |
 | `gemm_gated.py` | Python module for gemm gated. | — |

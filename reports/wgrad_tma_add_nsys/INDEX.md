@@ -1,6 +1,6 @@
-# Directory Index: `/benchmarks/`
+# Directory Index: `/reports/wgrad_tma_add_nsys/`
 
-> One-off and repeatable benchmark entrypoints for FP8, BF16, and routing experiments.
+> Directory for wgrad tma add nsys.
 > Regenerate with `python tools/generate_directory_indexes.py` from the repository root.
 
 ## Maintenance rules
@@ -10,15 +10,11 @@
 - If a change crosses directory boundaries, update this `INDEX.md` and the nearest affected ancestor `INDEX.md` files together.
 - Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
 
-## Volatile / generated child directories
-| Path | Summary | Notes |
-| --- | --- | --- |
-| `nsys_clean/` | Volatile / generated subtree. | Raw nsys capture artifacts (`.sqlite`, `.nsys-rep`); high churn and not useful for durable indexing. |
-
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `bench_triton_moe.py` | Benchmark entrypoint for bench triton moe. | — |
-| `e2e_fp8_vs_bf16.py` | End-to-end FP8 vs BF16 benchmark for SonicMoE. | — |
-| `moe-cute.py` | Benchmark entrypoint for moe cute. | — |
-| `moe-token-rounding.py` | Benchmark entrypoint for moe token rounding. | — |
+| `nsys_wgrad_baseline_E32.nsys-rep` | nsys report artifact for nsys wgrad baseline e32. | untracked in git |
+| `nsys_wgrad_baseline_E8.nsys-rep` | nsys report artifact for nsys wgrad baseline e8. | untracked in git |
+| `nsys_wgrad_tma_add_E32.nsys-rep` | nsys report artifact for nsys wgrad tma add e32. | untracked in git |
+| `nsys_wgrad_tma_add_E8.nsys-rep` | nsys report artifact for nsys wgrad tma add e8. | untracked in git |
+| `RESULTS.json` | JSON artifact with top-level keys: `description`, `date`, `method`, `flags`. | — |

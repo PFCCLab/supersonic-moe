@@ -10,38 +10,41 @@
 - If a change crosses directory boundaries, update this `INDEX.md` and the nearest affected ancestor `INDEX.md` files together.
 - Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
 
+## Stable child directories
+| Path | Summary | Notes |
+| --- | --- | --- |
+| `ci/` | Directory for ci. | — |
+
 ## Volatile / generated child directories
 | Path | Summary | Notes |
 | --- | --- | --- |
 | `__pycache__/` | Volatile / generated subtree. | Python bytecode cache; disposable. |
-| `ci/` | CI runners and gates (`run_core_tests.sh`, `perf_gate.py`, `multicard_smoke.py`). | S76 |
 
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
 | `_inline_audit.py` | Inline audit: monkey-patch backward to print tensor inventory at dgated completion. | — |
-| `audit_dz_iso32_quality.py` | S80 — pure-pytorch iso32 vs 1×32 quant fidelity audit on captured dz tensors; computes downstream dx/dw1 GEMM RRMSE ratio (the binding gate). | S80 |
+| `audit_dz_iso32_quality.py` | Phase 0.2: Audit iso32 vs 1×32 dz quantization on REAL gradient tensors. | — |
+| `bench_sweep_fresh.py` | Fresh benchmark sweep: FP8 frontier + BF16 baseline (8-GPU parallel). | — |
 | `cluster_idle_launch.py` | Developer utility for cluster idle launch. | — |
-| `dump_real_dz.py` | S80 — captures real dz `(TK, 2I)` bf16 tensors from `SonicMoEMlpNode` bwd via gemm_dgated_kernel monkey-patch; saves `.npy` for proxy-free torch consumption. | S80 |
+| `cross_framework_bench.py` | Cross-Framework MoE Benchmark — 4-way: Paddle BF16 / Paddle FP8 / SonicMoE BF16 / SonicMoE FP8. | — |
+| `dump_real_dz.py` | Dump real dz tensors from the SonicMoE bwd dGated path for iso32 audit. | — |
 | `fp8_frontier_breakdown.py` | FP8 Frontier rigorous breakdown: memory, precision, performance. | — |
-| `generate_directory_indexes.py` | Generate human- and agent-friendly INDEX.md files for stable directories. | untracked in git |
+| `generate_directory_indexes.py` | Generate human- and agent-friendly INDEX.md files for stable directories. | — |
 | `introspect.py` | Main profiling harness for nsys, precision, grid, and memory experiments. | — |
+| `mfu_model.py` | MFU theory model: fit a parametric model to real benchmark data. | — |
+| `mfu_sweep_s79.py` | S79 MFU sweep — drive bench_mlpnode_topk_nsys for many shapes, compute MFU. | — |
 | `ncu_profile_colwise.py` | NCU profiling script specifically for colwise_quantize_and_pack. | — |
 | `ncu_profile_kernels.py` | ncu profiling for individual FP8 kernels. | — |
-| `ncu_profile_quant.py` | NCU profiling script for CuTe DSL vs Triton blockscaled FP8 quant kernels. | — |
-| `ncu_profile_wgrad_quant.py` | NCU profiling script for wgrad colwise/fused-transpose quant kernels. | — |
-| `nsys_benchmark.py` | nsys-compatible benchmark: BF16 vs FP8 with NVTX markers. | — |
-| `parse_nsys_per_iter.py` | Generic nsys-sqlite GPU-projection per-iter parser; reads NVTX-bracketed ranges from a `.sqlite` and reports per-iter wall + per-kernel breakdown. | Session 67 |
-| `nsys_session42_v2.sh` | Shell helper for nsys session42 v2. | — |
-| `precision_audit.py` | Quick end-to-end precision audit: FP8 vs BF16 per-tensor comparison. | — |
+| `nsys_pad_compare.py` | 4-way nsys timeline: bf16_raw, bf16_rounding, fp8_rounding, fp8_padding. | — |
+| `paddle_compat_bench.py` | Paddle Compat Benchmark — SonicMoE under Paddle enable_compat(). | — |
+| `paddle_compat_parallel.py` | 27-Shape Grid Paddle Compat Benchmark — 8-GPU parallel. | — |
+| `paddle_compat_smoke.sh` | Shell helper: ═══════════════════════════════════════════════════════════════════════════════. | — |
+| `parse_nsys_per_iter.py` | Parse nsys sqlite, compute per-iter GPU-projection µs for each BENCH range. | — |
 | `rigorous_benchmark_s42.py` | Rigorous benchmark: 3 modes × 3 seeds × 3 repeats, subprocess-isolated. | — |
 | `rigorous_profiler.py` | Rigorous GPU-projection kernel profiling + fine-grained memory lifecycle. | — |
 | `run_blackwell_test_shards.py` | Developer utility for run blackwell test shards. | — |
-| `run_frontier_perf_sweep.py` | Multi-shape multi-GPU FP8 frontier perf sweep driver (subprocess-per-shape, sqlite GPU-projection extraction). | Session 66 |
+| `run_frontier_perf_sweep.py` | Sweep nsys profiles for SonicMoE FP8 frontier MlpNode (Paddle compat path). | — |
 | `run_regression.sh` | Shell helper for run regression. | — |
 | `scoreboard.py` | SonicMoE Buffer Scoreboard — Operator-buffer dependency & phase-state analysis. | — |
-| `session42_benchmark.py` | Session 42 Complete Benchmark: Performance + Memory + Precision. | — |
-| `session45_bench.py` | Subprocess-isolated BF16/FP8 benchmark with CUDA events. | — |
-| `verify_memory_optimization.py` | Verify memory optimization: compare FP8 vs BF16 peak memory. | — |
-| `warp-control-plane.sh` | Shell helper for warp control plane. | — |
 | `wgrad_fp8_benchmark.py` | FP8 wgrad full-replacement benchmark. | — |

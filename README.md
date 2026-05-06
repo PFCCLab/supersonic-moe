@@ -10,6 +10,75 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 ![image](./assets/mem.png)
 ![image](./assets/tput.png)
 
+## Current FP8 Frontier Snapshot (2026-05-06)
+
+The current Blackwell frontier is **green** on branch `race-fix-paddle`. The active path is:
+
+```text
+DeepEP topk metadata
+  -> route-level padding
+  -> zero-materialization FP8 up-proj (A_idx, no x_gathered)
+  -> fused GEMM + SwiGLU + z FP8 epilogue quant
+  -> FP8 down-proj
+  -> FP8-C-load GemmDGated backward
+  -> iso32 dz dual quant
+  -> TMA reduce-add wgrad into ERNIE main_grad
+```
+
+Latest Ernie-shape benchmark (`T=8192,H=3072,I=1536,E=8,K=8`, B30Z, nsys GPU-projection):
+
+| Metric | Current value | Notes |
+|---|---:|---|
+| FP8 busy time | **2659.8 µs/iter** | `reports/fresh_benchmark_ws1/` |
+| MFU | **46.51%** | denominator: 4500 TFLOPS FP8 peak |
+| Peak measured MFU | **51.61%** | `T8192-H4096-I4096-E8-K8` |
+| Speedup vs current QuACK BF16 | **1.11x** | `2659.8` vs `2942.5 µs`; fair in-repo baseline |
+| Speedup vs historical cuBLAS/PyTorch BF16 | **~1.37x** | useful historical reference only |
+| Precision | cos >= 0.997, RRMSE < 7.6% | output/dx/ds/dw1/dw2 suites |
+| Determinism | bit-exact repeated fwd/bwd | `tests/fp8_frontier_determinism_test.py` hard gate |
+
+Core MFU formula:
+
+```text
+F = 18 * TK * H * I
+MFU = F / (busy_seconds * peak_FLOPs_per_second)
+
+Ernie:
+  TK = 8192 * 8 = 65536
+  F = 18 * 65536 * 3072 * 1536 = 5.566e12 FLOPs
+  ideal @4500 TFLOPS = 1237 µs
+  measured = 2659.8 µs
+  MFU = 46.51%
+```
+
+Empirical scaling model fit from the fresh 11-point FP8 sweep:
+
+```text
+busy_us =
+  18*TK*H*I / (4500e6 * 0.541569)
+  + 50.0 * TK * max(H,2I) * 1e-9
+  + 328.939 * E * TK * 1e-6
+  + 201.047
+```
+
+Read first:
+
+| Priority | Document | Purpose |
+|---:|---|---|
+| 1 | [`HANDOFF.md`](./HANDOFF.md) | canonical current project state, lessons, next plan |
+| 2 | [`reports/sonic_moe_fp8_frontier_newcomer_guide.md`](./reports/sonic_moe_fp8_frontier_newcomer_guide.md) | standalone FP8/CuTe/SonicMoE newcomer guide + expert Q&A |
+| 3 | [`reports/sonic_moe_comprehensive_analysis.md`](./reports/sonic_moe_comprehensive_analysis.md) | broad technical analysis and roofline/precision/perf tables |
+| 4 | [`reports/fresh_benchmark_ws1/README.md`](./reports/fresh_benchmark_ws1/README.md) | latest sweep data and MFU fit |
+| 5 | [`reports/ernie_shape_ncu_s78b/README.md`](./reports/ernie_shape_ncu_s78b/README.md) | NCU resource breakdown for the 6 GEMMs |
+
+Important current insights:
+
+- FP8 is **not** always faster. It is slower at `T=1024/2048`; crossover is around `T=3000-4000`.
+- `GemmDGatedFP8CLoadSm100ZeroMat` is the main structural bottleneck: 168 regs/thread, ~42% tensor-pipe. Do not directly add dz quant loops to this epilogue.
+- TMA reduce-add is a register/performance optimization, not higher-precision accumulation.
+- iso32 dz dual quant is measured safe for current Ernie-like `dz`; monitor `log2(block_amax/row_amax)` before generalizing.
+- `SonicMoEMlpNode.step()` must run **before** `optimizer.step()` because it flushes native CUTLASS wgrad layout into ERNIE `main_grad`.
+
 ## Prerequisites
 
 - NVIDIA Hopper GPUs (H100, H200) or Blackwell GPUs (GB200, B200, B300)
@@ -190,31 +259,30 @@ ds gradient verified via `test_cold_start_e2e.py`: cos=0.9972 across all 6 shape
 
 All cosine > 0.99, RRMSE < 7.6%.  Shapes include E=32 (production), varying topk (4/8), small/large token counts.
 
-### Performance (nsys GPU-projection, B30Z, TMA Reduce-Add)
+### Performance (nsys GPU-projection, B30Z, current fresh data)
 
-Session 65 (`SonicMoEMlpNode`, TMA reduce-add wgrad epilogue, default config):
+Current canonical data lives in `reports/fresh_benchmark_ws1/`. The table below supersedes
+older Session-65-only summaries for frontier-level comparisons.
 
-| Shape (I=1536 K=8) | S53 BF16 (µs) | Paddle FP8 (µs) | Speedup vs BF16 |
-|---|:---:|:---:|:---:|
-| T=8192 E=8 | 3644 | 2820 | **1.29x** |
-| T=8192 E=32 | 3844 | 3283 | **1.17x** |
-| T=16384 E=8 | 7953 | 5548 | **1.43x** |
-| T=16384 E=32 | 8129 | 5916 | **1.37x** |
+| Shape | QuACK BF16 (µs) | FP8 frontier (µs) | Speedup vs QuACK BF16 | FP8 MFU |
+|---|---:|---:|---:|---:|
+| T=1024 H=3072 I=1536 E=8 K=8 | 540.0 | 566.0 | 0.95x | 27.32% |
+| T=2048 H=3072 I=1536 E=8 K=8 | 847.7 | 870.1 | 0.97x | 35.54% |
+| T=4096 H=3072 I=1536 E=8 K=8 | 1533.4 | 1459.1 | 1.05x | 42.39% |
+| **T=8192 H=3072 I=1536 E=8 K=8** | **2942.5** | **2659.8** | **1.11x** | **46.51%** |
+| T=16384 H=3072 I=1536 E=8 K=8 | 6022.1 | 5224.9 | 1.15x | 47.35% |
+| T=8192 H=4096 I=4096 E=8 K=8 | 10894.7 | 8521.7 | 1.28x | **51.61%** |
 
-TMA reduce-add optimization (Session 65): replaced fused `D=A@B+1.0*C` wgrad epilogue
-(86 regs/thread) with TMA hardware atomic add on store (50 regs/thread). Improvement:
-- E=8: -65 µs/iter (-2.3%)
-- E=32: -138 µs/iter (-4.0%)
-- BF16 wgrad GEMM per-call: -16µs (E=8), -33µs (E=32), 5-7.7% faster
+Historical S53 BF16 numbers were cuBLAS/PyTorch-style and slower than the current
+QuACK BF16 path; relative to that historical baseline, Ernie-shape FP8 is ~1.37x.
+Always label which BF16 baseline is used.
 
-To fall back to the legacy fused beta=1.0 epilogue: `SONIC_MOE_FP8_WGRAD_BETA_ACCUM=1`
+TMA reduce-add remains part of the current default path. It replaced legacy
+`D=A@B+1.0*C` wgrad accumulation (86 regs/thread) with TMA store-side ADD
+(~50 regs/thread), saving 2-4% end-to-end depending on E. It does not raise
+accumulation precision; `main_grad` remains fp32 and determinism is test-gated.
 
-ERNIE-shape detail (E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096):
-- **Forward GPU-proj: 625 µs** (CUTLASS GEMM 65%, FP8 quant 10%, router 14%)
-- **Backward GPU-proj: 1904 µs** (wgrad 78%, actgrad 13%, quant 5%)
-- **Total: 2530 µs/iter** (CV < 0.3%)
-
-See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
+See `HANDOFF.md` for full kernel breakdown, memory notes, and next-step priorities.
 
 ### Key Files
 
@@ -244,14 +312,14 @@ See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 
 | Priority | Resource | Path |
 |:---:|----------|------|
-| 1 | **Handoff (current state)** | Root `HANDOFF.md` — top section is the active session, prior sessions preserved verbatim below |
+| 1 | **Handoff (current state)** | Root `HANDOFF.md` — canonical current state, lessons, and next plan |
 | 2 | **PaddleFleet migration** | `docs/PADDLEFLEET_MIGRATION_S74.md` — stream patch, `node.step()` ordering, lazy main_grad, Fleet's pre-fused-weight integration path |
 | 3 | **This README** | Root `README.md` — architecture, cache design, training loop, test matrix |
-| 4 | **Knowledge Base** | `docs/KNOWLEDGE_BASE.md` — deep expert reference |
-| 5 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log (Phases 1–26 only; superseded by HANDOFF.md sessions ≥66) |
+| 4 | **Newcomer Guide** | `reports/sonic_moe_fp8_frontier_newcomer_guide.md` — FP8/CuTe/SonicMoE basics through expert Q&A |
+| 5 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log only; current-state correction block at top |
 | 6 | **Environment** | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
 
-> **Project state (as of session 79, 2026-04-30)**: branch `myrepo/race-fix-paddle` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`, **14 commits ahead** of `fork/paddle`. **`bash tools/ci/run_core_tests.sh` → 14/14 PASS, 0 SKIP** on the paddlejob shared-GPFS host (~14 min wall, 2× B30Z Blackwell, last verified S78b). FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, multilayer/multistep main_grad accumulation correct, single-stream from deepep-fwd to deepep-bwd, post-warmup zero `cuda.synchronize()`, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. **NEW (S79)**: `tests/fp8_frontier_determinism_test.py` proves bit-exact determinism across runs (frontier path, fused_gated + alignment_assumed) and is wired into `tests/run_regression.sh` as a HARD-fail gate. **Read `HANDOFF.md` top section before any work** — S79 documents the failed dgrad1 single-kernel optimisation surface (don't re-tune stages/swizzle/launch-bounds; structural fission required) and the downstream PaddleFleet stale-`.so` triage.
+> **Project state (clean handoff, 2026-05-06)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest Ernie-shape FP8 busy time is **2659.8 µs/iter** and **46.51% MFU**. Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization, not direct dz-quant epilogue fusion.
 
 **Quick-validate the frontier before resuming work**:
 ```bash

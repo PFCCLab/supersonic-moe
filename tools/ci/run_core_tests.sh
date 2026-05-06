@@ -181,6 +181,10 @@ phase jit-key-stability run_pytest_parallel tests/ops/test_jit_key_stability.py 
 phase extreme-shapes    run_pytest_parallel tests/ops/test_mlpnode_extreme_shapes.py -q
 phase jit-concurrent    run_pytest tests/ops/test_jit_concurrent_heterogeneous.py -q
 
+# ── 4c. FP8 frontier: determinism (HARD-fail) + stress (multi-shape/routing) ─
+phase frontier-determinism run_pytest tests/fp8_frontier_determinism_test.py -x -q
+phase frontier-stress      run_pytest tests/fp8_frontier_stress_test.py -q
+
 # ── 5. Perf gate (canonical T8192-H3072-I1536-E8-K8) ─────────────────────────
 if [[ "$DO_PERF" == "1" ]]; then
   if [[ -x "$(command -v nsys)" ]]; then

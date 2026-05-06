@@ -1,6 +1,6 @@
-# Directory Index: `/benchmarks/`
+# Directory Index: `/sonicmoe/ernie_compat/`
 
-> One-off and repeatable benchmark entrypoints for FP8, BF16, and routing experiments.
+> Directory for ernie compat.
 > Regenerate with `python tools/generate_directory_indexes.py` from the repository root.
 
 ## Maintenance rules
@@ -10,15 +10,20 @@
 - If a change crosses directory boundaries, update this `INDEX.md` and the nearest affected ancestor `INDEX.md` files together.
 - Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
 
+## Stable child directories
+| Path | Summary | Notes |
+| --- | --- | --- |
+| `deepep_metadata_cuda/` | Directory for deepep metadata cuda. | — |
+| `deepep_topk_metadata_cuda/` | Directory for deepep top-k metadata cuda. | — |
+
 ## Volatile / generated child directories
 | Path | Summary | Notes |
 | --- | --- | --- |
-| `nsys_clean/` | Volatile / generated subtree. | Raw nsys capture artifacts (`.sqlite`, `.nsys-rep`); high churn and not useful for durable indexing. |
+| `__pycache__/` | Volatile / generated subtree. | Python bytecode cache; disposable. |
 
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `bench_triton_moe.py` | Benchmark entrypoint for bench triton moe. | — |
-| `e2e_fp8_vs_bf16.py` | End-to-end FP8 vs BF16 benchmark for SonicMoE. | — |
-| `moe-cute.py` | Benchmark entrypoint for moe cute. | — |
-| `moe-token-rounding.py` | Benchmark entrypoint for moe token rounding. | — |
+| `__init__.py` | Package marker and re-export surface. | — |
+| `deepep_metadata.py` | DeepEP → SonicMoE metadata conversion (zero argsort, zero sync). | — |
+| `mlp_node_v2.py` | SonicMoE ↔ ERNIE integration: ``SonicMoEMlpNode`` (FP8 production path). | — |

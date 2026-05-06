@@ -10,21 +10,12 @@
 - If a change crosses directory boundaries, update this `INDEX.md` and the nearest affected ancestor `INDEX.md` files together.
 - Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
 
-## Volatile / generated child directories
-| Path | Summary | Notes |
-| --- | --- | --- |
-| `__pycache__/` | Volatile / generated subtree. | Python bytecode cache; disposable. |
-
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
 | `__init__.py` | Package marker and re-export surface. | — |
 | `__main__.py` | Package entry-point: ``python -m visualization``. | — |
-| `benchmark_manifest.json` | JSON artifact with top-level keys: `version`, `metadata`, `performance`, `precision`. | — |
 | `frontier_viz.py` | Session 53 Frontier Visualization Suite — SonicMoE FP8 Blockscaled. | — |
-| `lifecycle_scoreboard_v3.png` | Image asset for lifecycle scoreboard v3. | — |
-| `official_vs_frontier_comparison_hd.png` | Image asset for official vs frontier comparison hd. | — |
-| `path_compare_viz.py` | Renders the BF16-vs-FP8 frontier path and contribution comparison figures. | untracked in git |
+| `path_compare_viz.py` | Renders the BF16-vs-FP8 frontier path and contribution comparison figures. | — |
 | `scoreboard_viz.py` | SonicMoE Unified Buffer Lifecycle × Scoreboard ================================================ Single composite figure fusing: • Twin Gantt timeline (BF16 left \| FP8 right) — R/W…. | — |
-| `session42_viz.py` | Executive summary triptych from refreshed benchmark and profiler data. | — |
-| `sonicmoe_dataflow.py` | SonicMoE FP8 Blockscaled — Publication-Quality Visualization Suite =================================================================== Ten data-driven figures for the zero-materia…. | — |
+| `sonicmoe_dataflow.py` | SonicMoE fig1–10: Session 53 data-driven figure suite. | — |

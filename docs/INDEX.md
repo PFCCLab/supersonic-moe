@@ -13,12 +13,13 @@
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `KNOWLEDGE_BASE.md` | Self-contained expert knowledge base: architecture, padding proof, dead ends, config, file map. | Session 60, canonical reference |
-| `HANDOFF.md` | Redirect to root `HANDOFF.md` (Session 65). | redirect only |
-| `pad_audit_methodology.md` | Route-level padding mathematical proof and correctness analysis. | Session 57, valid |
-| `session60_lessons.md` | Session 60 engineering lessons (#67-#72): gate-MLP gradient chain, torch-proxy compat. | Session 60, current |
-| `cute_dsl_optimization_guide.md` | CuTe DSL FP8 Quantization — Architecture & Optimization Guide. | Session 43, architecture valid |
-| `FP8_ARCH_SPEC.md` | SonicMoE FP8 Frontier — Architecture Specification. | Session 42, architecture valid, perf numbers stale |
-| `fp8_architecture_comparison.md` | FP8 MoE 三方架构对比：DeepEP · SonicMoE BF16 · SonicMoE FP8 Frontier. | Session 33-35, architecture valid, perf numbers stale |
-| `wgrad_fp8_dual_quant_design.md` | Wgrad FP8 Optimization — Zero-Copy Dual Quantization Design. | Historical design doc, superseded by split strategy |
-| `setup_dev_b.sh` | Blackwell (dev_b) environment setup script. | dev_b env has cutlass mismatch, not usable for quack |
+| `cute_dsl_optimization_guide.md` | Markdown note: CuTe DSL FP8 Quantization — Architecture & Optimization Guide. | — |
+| `FP8_ARCH_SPEC.md` | Markdown note: SonicMoE FP8 Frontier — Architecture Specification. | — |
+| `fp8_architecture_comparison.md` | Markdown note: FP8 MoE 三方架构对比：DeepEP · SonicMoE BF16 · SonicMoE FP8 Frontier. | — |
+| `HANDOFF.md` | Redirect/compatibility note that points readers to root `HANDOFF.md`. | redirect only |
+| `KNOWLEDGE_BASE.md` | Markdown note: SonicMoE FP8 Frontier — Knowledge Base. | local/untracked reference |
+| `pad_audit_methodology.md` | Markdown note: Route-Level Padding：面向 FP8 MoE 的零精度损失对齐方案. | — |
+| `PADDLEFLEET_MIGRATION_S74.md` | Markdown note: PaddleFleet Migration — Sonic-MoE Session 74. | — |
+| `session60_lessons.md` | Markdown note: Session 60 Engineering Log — Gate↔MLP Gradient Chain & Precision. | — |
+| `setup_dev_b.sh` | Shell helper: Setup script for dev_b environment to run SonicMoE with ERNIE integration.. | — |
+| `wgrad_fp8_dual_quant_design.md` | Markdown note: Wgrad FP8 Optimization — Zero-Copy Dual Quantization Design. | — |

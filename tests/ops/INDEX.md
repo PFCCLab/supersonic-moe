@@ -1,74 +1,69 @@
 # Directory Index: `/tests/ops/`
 
-> Focused operator and module-level tests. Two categories:
-> 1. **Native torch** (pytest): op-level precision tests, run with `python -m pytest tests/ops/ -q`.
-> 2. **Paddle compat** (script): integration tests requiring `eb_venv`, run individually.
+> Focused operator and module-level tests, including the newer MoE module suite.
+> Regenerate with `python tools/generate_directory_indexes.py` from the repository root.
 
-## Shared infrastructure
+## Maintenance rules
+- Before opening many files under this directory, read this `INDEX.md` first to narrow the search space.
+- Any create / delete / rename / move in this directory must update the summaries in this `INDEX.md`.
+- Any behavior-changing edit that invalidates a file summary must refresh the affected summary text here.
+- If a change crosses directory boundaries, update this `INDEX.md` and the nearest affected ancestor `INDEX.md` files together.
+- Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
 
-| File | Summary |
-| --- | --- |
-| `conftest.py` | Pytest fixtures, precision helpers (`rrmse`, `cosine_sim`, `assert_fp8_tolerance`), gold E8M0 references, shape constants, skip markers (`requires_blackwell`, `requires_quack`). |
-
-## FP8 quantization tests (native torch, pytest)
-
-| File | Op under test |
-| --- | --- |
-| `test_rowwise_quant.py` | `quantize_and_pack_activation` — row-wise blockscaled FP8. |
-| `test_colwise_quant.py` | `colwise_quantize_and_pack` (Triton) + `colwise_quantize_cute` (CuTe DSL). |
-| `test_dequant.py` | `dequantize_blockscaled_fp8`. |
-| `test_dual_quant.py` | `dual_quantize_varlen` — fused row+col in one HBM read. |
-| `test_fused_zy1_quant.py` | `fused_z_save_y1_quant` — fused z+y1 quantization. |
-| `test_weight_quant.py` | `quantize_and_pack_weight_iso32` — 32x32 isotropic blockscaled weight quant. |
-
-## GEMM / kernel tests (native torch, pytest)
-
-| File | Op under test |
-| --- | --- |
-| `test_gemm_gated.py` | `gemm_gated` (forward up-projection): torch vs BF16 vs FP8 3-way. |
-| `test_gemm_dgated.py` | `gemm_dgated` (backward): torch vs BF16 3-way + determinism. |
-| `test_swiglu.py` | SwiGLU forward/backward: torch vs BF16 vs FP8 3-way (6 tests). |
-| `test_varlen_gemm.py` | `blockscaled_fp8_gemm_varlen` (down-projection): subprocess-isolated 3-way. |
-| `test_wgrad_gemm.py` | `blockscaled_fp8_weight_grad_gemm`: torch vs FP8 vs BF16 3-way. |
-
-## Routing and padding correctness (native torch, pytest)
-
-| File | What it validates |
-| --- | --- |
-| `test_pad_routing.py` | Axiomatic forward routing: no token dropped, no misdirection, no phantom. |
-| `test_pad_gradient_integrity.py` | Axiomatic backward: dz[pad]==0, dw/dx negligible diff from unpadded. |
-
-## MoE module integration (Paddle compat, script)
-
-| File | What it tests | Run command |
+## Volatile / generated child directories
+| Path | Summary | Notes |
 | --- | --- | --- |
-| `test_moe_module.py` | Full MoE pipeline (permute→gate-up→SwiGLU→down→unpermute) BF16+FP8 vs f32 gold. | `python -m pytest tests/ops/test_moe_module.py` |
-| `test_moe_general_routing_fp8.py` | `moe_general_routing_inputs` FP8 fwd+bwd + main_grad accumulation + benchmark. | `$EBVENV/bin/python tests/ops/test_moe_general_routing_fp8.py` |
-| `test_sonic_moe_func.py` | `SonicMoEFunc` PyLayer (ERNIE-compat): fwd+bwd, per-expert main_grad, multi-iter. | `$EBVENV/bin/python tests/ops/test_sonic_moe_func.py` |
+| `__pycache__/` | Volatile / generated subtree. | Python bytecode cache; disposable. |
 
-## Diagnostics (Paddle compat, script)
-
-| File | Purpose |
-| --- | --- |
-| `test_argsort_sync.py` | Reproducer for Paddle argsort 1D `cudaStreamSynchronize` stall. nsys-profilable. |
-
-## Topk kernel correctness regression (Paddle compat, script + subprocess watchdog)
-
-| File | What it validates | Run command |
+## Files
+| File | Summary | Notes |
 | --- | --- | --- |
-| `test_mlpnode_correctness_large.py` | **Session 66 regression** for the two topk-metadata kernel bugs (Class A grid-spinwait deadlock, Class B grid-cap silent corruption). 9 cases × 5 tensors (out/dx/ds/dw1/dw2) vs BF16 gold; SEQ up to 16384 (TK=131072); skew/extreme/holes/0-token-expert. Subprocess-per-case + 600s hard timeout. | `CUDA_VISIBLE_DEVICES=7 $EBVENV/bin/python tests/ops/test_mlpnode_correctness_large.py` |
-| `test_recompute_z.py` | **Session 67** focused validation of `recompute_z` mode: numeric equivalence (out/dx/ds/dw1/dw2 vs `recompute_z=False` baseline, FP8 path) + forward peak-memory drop. Subprocess-per-config. | `CUDA_VISIBLE_DEVICES=0 $EBVENV/bin/python tests/ops/test_recompute_z.py` |
-| `test_recompute_z_optionB.py` | **Session 68** Layer-1 bit-exact test for the experimental Option B non-gated quant-only kernel (uniform round-robin routing only — Option B is KNOWN-BROKEN on non-uniform routing; gated by `SONIC_MOE_FP8_RECOMPUTE_OPT_B=1`). | `CUDA_VISIBLE_DEVICES=0 $EBVENV/bin/python tests/ops/test_recompute_z_optionB.py` |
-| `test_mlpnode_multilayer.py` | **Session 71** multi-layer / multi-step correctness: two-layer chained, 4 PP-interleaved schedules (1F1B / FFB-FBB / interleaved / out-of-order), and 3-layer × 4-microbatch × 3-optimizer-step main_grad accumulation. Validates that the per-`MoELayer` weight-bound `_NATIVE_W*_GRAD` plumbing has no global-state collisions across layers / steps / interleavings. | `CUDA_VISIBLE_DEVICES=0 $EBVENV/bin/python -m pytest tests/ops/test_mlpnode_multilayer.py -q` |
-| `test_precompute_weight_fp8_warmup.py` | **Session 71** bit-exact + speedup test for `precompute_weight_fp8_warmup` — the fused single-pass Triton pair-quantize that replaces the legacy 4-call sequence (~3.2x faster at H=3072 I=1536 E=8). | `CUDA_VISIBLE_DEVICES=0 $EBVENV/bin/python -m pytest tests/ops/test_precompute_weight_fp8_warmup.py -q` |
-| `audit_iso32_numerics.py` | **Session 67** pure-PyTorch quant→dequant audit comparing iso32 (32×32) vs 1×32 blockscaled FP8 weight quant on uniform/heavy-tail/per-row-variance shapes. Confirmed bit-identical aggregate metrics. | `python tests/ops/audit_iso32_numerics.py` |
-| `bench_iso32_quant_nsys.py` | **Session 67** NVTX-bracketed perf microbench for 4 weight shapes; pair with `tools/parse_nsys_per_iter.py`. | `nsys profile -o iso32_bench python tests/ops/bench_iso32_quant_nsys.py && python tools/parse_nsys_per_iter.py iso32_bench.sqlite` |
-
-## Profiling / nsys benches
-
-| File | Purpose |
-| --- | --- |
-| `bench_mlpnode_topk_nsys.py` | Gold-standard mlpnode-only nsys profile: BENCH NVTX, sqlite GPU-projection parser, `--imbalance {none,skew,extreme}`. |
-| `bench_coldstart_nsys.py` | Cache-clear → JIT → ITER NVTX per-iter + FLUSH NVTX (matches production `node.step()` semantics). |
-| `bench_mlpnode_mem.py` | E=32 fwd+bwd peak memory profile (ERNIE shape sweep including SEQ=16384). |
-| `bench_wgrad_epilogue.py` | TMA reduce-add vs fused beta=1.0 wgrad epilogue A/B (Session 65). |
+| `__init__.py` | Package marker for test discovery. | — |
+| `audit_iso32_numerics.py` | Iso32 vs 1×32 weight blockscaled-FP8 quant — rigorous numerics audit. | — |
+| `bench_coldstart_nsys.py` | Cold-start nsys benchmark: clears all caches, simulates first-time execution. | — |
+| `bench_deepep_topk_nsys.py` | nsys GPU-projection benchmark for SonicMoEMlpNode E2E. | — |
+| `bench_frontier_perf.py` | Session 62 FP8 frontier comprehensive benchmark. | — |
+| `bench_gemm_dynamic_ab.py` | A/B experiment: compare per-call GEMM latency with/without mark_layout_dynamic. | — |
+| `bench_iso32_quant_nsys.py` | Perf microbench: iso32 vs 1×32 weight blockscaled-FP8 quant kernel. | — |
+| `bench_mlpnode_mem.py` | SonicMoEMlpNode 单次前反向显存基准 用法: CUDA_VISIBLE_DEVICES=0 python tests/ops/bench_mlpnode_mem.py 配置（默认值对应 ERNIE 真实业务规格）: H=3072 I=1536 K=8 E_LOCAL=8 EP_SIZE=32 SEQ_LEN=16384 精度策略： - 前向/…. | — |
+| `bench_mlpnode_topk_nsys.py` | nsys GPU-projection benchmark for SonicMoEMlpNode topk path. | — |
+| `bench_static_vs_dynamic_gemm.py` | A/B experiment: dynamic vs static compile_key for CuTe GEMM. | — |
+| `bench_user_shape_fwd_nsys.py` | Session 69 — reproduce user shape & profile sonic-meta routing region. | — |
+| `bench_wgrad_epilogue.py` | A/B benchmark: TMA reduce-add vs fused beta=1.0 for wgrad GEMM epilogue. | — |
+| `conftest.py` | Shared fixtures, precision helpers, gold references, and shape constants for FP8 op tests. | — |
+| `mlpnode_nsys_worker.py` | Minimal MlpNode worker for nsys profiling. | — |
+| `ncu_deepep_topk.py` | Isolated NCU profiling harness for deepep_topk_metadata CUDA kernels. | — |
+| `test_argsort_sync.py` | Minimal reproducer: Paddle argsort 1D path triggers cudaStreamSynchronize. | — |
+| `test_cold_start_e2e.py` | Production cold-start E2E: cache-clear → warmup → multi-shape precision + perf. | — |
+| `test_colwise_quant.py` | Unit tests for colwise_quantize_and_pack and colwise_quantize_cute. | — |
+| `test_deepep_metadata_perf.py` | Test and benchmark deepep_metadata: CUDA kernel vs Python fallback. | — |
+| `test_deepep_topk_metadata.py` | Tests for deepep_topk_to_sonic_metadata: real DeepEP topk dispatch conversion. | — |
+| `test_dequant.py` | Unit tests for dequantize_blockscaled_fp8. | — |
+| `test_dual_quant.py` | Unit tests for dual_quantize_varlen (fused row+col quant). | — |
+| `test_e2e_mlpnode.py` | End-to-end SonicMoEMlpNode benchmark simulating real DeepEP pre-training. | — |
+| `test_fused_quant.py` | Correctness + performance test for fused_dual_colwise_quantize. | — |
+| `test_fused_zy1_quant.py` | Unit tests for fused_z_save_y1_quant. | — |
+| `test_gemm_dgated.py` | Unit tests for gemm_dgated (bwd): torch ↔ BF16 3-way cross-validation. | — |
+| `test_gemm_gated.py` | Unit tests for gemm_gated (fwd): torch ↔ BF16 ↔ FP8 3-way cross-validation. | — |
+| `test_import_smoke.py` | Coverage smoke test: import every public module under ``sonicmoe`` so that module-level decorators, dataclass declarations, and constant tables are exercised by the coverage gate. | — |
+| `test_jit_concurrent_heterogeneous.py` | Pytest coverage for jit concurrent heterogeneous. | — |
+| `test_jit_key_stability.py` | Pytest coverage for jit key stability. | — |
+| `test_jit_optimization.py` | Comprehensive JIT optimization validation: correctness, JIT recompilation, GPU performance (nsys), and memory. | — |
+| `test_mlpnode_audit.py` | Rigorous precision + performance + memory audit for SonicMoEMlpNode. | — |
+| `test_mlpnode_breakdown.py` | Paranoid-level precision breakdown + GPU-projection performance audit. | — |
+| `test_mlpnode_correctness_large.py` | Large-SEQ correctness audit for SonicMoEMlpNode FP8 frontier. | — |
+| `test_mlpnode_extreme_shapes.py` | Extreme-shape stress tests for SonicMoEMlpNode (CI gating). | — |
+| `test_mlpnode_multilayer.py` | Multi-layer correctness for SonicMoEMlpNode + flush_native_grads. | — |
+| `test_mlpnode_precision.py` | Element-wise precision audit: FP8 MlpNode vs BF16 gold (output/dx/dw1/dw2). | — |
+| `test_moe_general_routing_fp8.py` | FP8 frontier unit-test for moe_general_routing_inputs. | — |
+| `test_moe_module.py` | MoE module-level regression suite against a pure-torch reference. | — |
+| `test_pad_gradient_integrity.py` | Axiomatic backward-correctness test for route-level padding. | — |
+| `test_pad_routing.py` | Axiomatic correctness test for route-level padding. | — |
+| `test_precompute_weight_fp8_warmup.py` | Test precompute_weight_fp8_warmup is bit-exact vs. | — |
+| `test_recompute_z.py` | Focused validation of the ``recompute_z`` mode for SonicMoEMlpNode. | — |
+| `test_recompute_z_optionB.py` | Bit-exact validation for recompute_z Option B. | — |
+| `test_rowwise_quant.py` | Unit tests for quantize_and_pack_activation (row-wise blockscaled FP8 quant). | — |
+| `test_swiglu.py` | Unit tests for SwiGLU forward/backward: torch ↔ BF16 ↔ FP8 3-way cross-validation. | — |
+| `test_varlen_gemm.py` | Unit tests for blockscaled_fp8_gemm_varlen (down-projection): torch ↔ BF16 ↔ FP8 3-way. | — |
+| `test_weight_quant.py` | Unit tests for quantize_and_pack_weight_iso32 (32x32 isotropic blockscaled). | — |
+| `test_wgrad_gemm.py` | Unit tests for blockscaled_fp8_weight_grad_gemm: torch ↔ BF16 ↔ FP8 3-way. | — |
