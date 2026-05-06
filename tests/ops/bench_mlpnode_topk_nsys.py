@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """nsys GPU-projection benchmark for SonicMoEMlpNode topk path.
 
-Measures FP8 fwd+bwd wall-clock via nsys sqlite GPU-projection (merged
-overlapping kernel intervals on the same SM — the gold-standard method
-matching tools/introspect.py).
+Measures fwd+bwd wall-clock via nsys sqlite GPU-projection (merged
+overlapping kernel intervals on the same SM — the gold-standard method).
+
+Supports --mode fp8 (FP8 frontier) and --mode bf16 (BF16 baseline).
+The BENCH loop is pure fwd+bwd (matches multi-microbatch steady state).
+node.step() is called OUTSIDE the loop (once per optimizer step in prod).
 
 Usage:
-    # Profile and extract GPU-projection µs/iter:
     source .runenv.sh
-    CUDA_VISIBLE_DEVICES=0 nsys profile --trace=cuda \
+    CUDA_VISIBLE_DEVICES=0 nsys profile --trace=cuda,nvtx \
+        --sample=none --backtrace=none --resolve-symbols=false \
         --output=/tmp/mlpnode_topk \
         python tests/ops/bench_mlpnode_topk_nsys.py \
             --T 8192 --E 8 --I 1536 --topk 8 \
-            --warmup 8 --iters 12
+            --warmup 8 --iters 12 --mode fp8
 
-    # Then extract:
     nsys export --type=sqlite --output=/tmp/mlpnode_topk.sqlite \
         /tmp/mlpnode_topk.nsys-rep
     python tests/ops/bench_mlpnode_topk_nsys.py --extract /tmp/mlpnode_topk.sqlite --iters 12
@@ -30,9 +32,24 @@ import sqlite3
 import sys
 import time
 
-os.environ.setdefault("USE_QUACK_GEMM", "1")
-os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
-os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
+# ── Mode-dependent env setup (MUST happen before any sonicmoe import) ──
+# Parse --mode early from sys.argv to set env BEFORE module-level imports
+_mode = "fp8"
+for i, arg in enumerate(sys.argv):
+    if arg == "--mode" and i + 1 < len(sys.argv):
+        _mode = sys.argv[i + 1]
+
+if _mode == "bf16":
+    # BF16 baseline: completely disable FP8
+    os.environ["SONIC_MOE_FP8_MODE"] = ""
+    os.environ["SONIC_MOE_FP8_WGRAD"] = "0"
+    os.environ.setdefault("USE_QUACK_GEMM", "1")  # QuACK still needed for CuTe BF16 GEMMs
+    os.environ.pop("SONIC_MOE_FP8_ASSUME_ALIGNED", None)
+else:
+    # FP8 frontier
+    os.environ.setdefault("USE_QUACK_GEMM", "1")
+    os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
+    os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
@@ -90,8 +107,8 @@ def gpu_projection_us(sqlite_path: str, n_iters: int) -> float:
     return total_ns / 1000.0 / n_iters  # ns → µs, per iter
 
 
-def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H=3072):
-    """Run FP8 topk MlpNode benchmark (forward + backward)."""
+def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H=3072, mode="fp8"):
+    """Run MlpNode benchmark (forward + backward) in specified mode."""
     import paddle
     paddle.enable_compat()
     import torch
@@ -103,11 +120,13 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
         invalidate_weight_caches,
     )
     import sonicmoe.functional as functional
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
 
-    H = H
-    N_recv = T  # in topk dispatch, N_recv tokens each routed to topk experts
+    # FP8 path: force alignment assumed (skip H2D sync) for steady-state measurement
+    if mode == "fp8":
+        functional._ALIGNMENT_ASSUMED = True
+        functional._ALIGNMENT_STREAK = 100
+
+    N_recv = T
     device = "cuda"
 
     class MockExpert:
@@ -132,11 +151,9 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
     # Build deterministic topk dispatch
     torch.manual_seed(seed)
     if imbalance == "extreme":
-        # All tokens routed to expert 0..topk-1 — pathological hot-expert case
         idx = torch.arange(topk, device=device, dtype=torch.int32)
         dispatched_indices = idx.unsqueeze(0).expand(N_recv, topk).contiguous()
     elif imbalance == "skew":
-        # 80% of tokens go to expert 0 (rest random)
         raw_scores = torch.randn(N_recv, E, device=device)
         hot_mask = (torch.rand(N_recv, device=device) < 0.8)
         raw_scores[hot_mask, 0] += 100.0
@@ -149,13 +166,13 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
     dispatched_probs = torch.rand(N_recv, topk, device=device) * 0.5 + 0.5
     dispatched_probs = (dispatched_probs / dispatched_probs.sum(dim=1, keepdim=True)).float()
     tpe = [int((dispatched_indices == e).sum().item()) for e in range(E)]
-    print(f"  imbalance={imbalance} tpe(min/max/sum)={min(tpe)}/{max(tpe)}/{sum(tpe)}")
+    print(f"  mode={mode} imbalance={imbalance} tpe(min/max/sum)={min(tpe)}/{max(tpe)}/{sum(tpe)}")
 
     paddle.seed(0)
     x = paddle.randn([N_recv, H], dtype="bfloat16") * 0.02
     grad_out = paddle.randn([N_recv, H], dtype="bfloat16") * 0.01
 
-    # Warmup
+    # Warmup (JIT compile + cache warm)
     print(f"Warmup ({n_warmup} iters)...")
     for _ in range(n_warmup):
         out = node.forward(x, tpe,
@@ -165,12 +182,12 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
     flush_native_grads()
     torch.cuda.synchronize()
 
-    # Also capture CUDA event timing for immediate feedback
+    # ── BENCH: steady-state fwd+bwd only (matches multi-microbatch pipeline) ──
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
 
-    print(f"Benchmark ({n_iters} iters)...")
+    print(f"Benchmark ({n_iters} iters, mode={mode})...")
     torch.cuda.nvtx.range_push("BENCH")
     start_ev.record()
     for _ in range(n_iters):
@@ -182,17 +199,27 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
 
-    flush_native_grads()
+    # node.step() OUTSIDE bench loop — this is the per-optimizer-step cost
+    # (native→ernie wgrad layout conversion + cache invalidation)
+    torch.cuda.nvtx.range_push("STEP")
+    step_start = torch.cuda.Event(enable_timing=True)
+    step_end = torch.cuda.Event(enable_timing=True)
+    step_start.record()
+    node.step()
+    step_end.record()
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
 
     cuda_ms = start_ev.elapsed_time(end_ev)
     cuda_us_per_iter = cuda_ms / n_iters * 1000
+    step_us = step_start.elapsed_time(step_end) * 1000
 
     print(f"\n{'='*60}")
-    print(f"SonicMoEMlpNode topk FP8 benchmark")
+    print(f"SonicMoEMlpNode benchmark (mode={mode})")
     print(f"  Shape: N_recv={N_recv} H={H} I={I} E={E} topk={topk}")
     print(f"  TK (total token-expert pairs): {sum(tpe)}")
-    print(f"  CUDA events: {cuda_us_per_iter:.1f} µs/iter")
-    print(f"  README baseline (PyTorch native FP8): 2715 µs/iter")
+    print(f"  CUDA events (fwd+bwd): {cuda_us_per_iter:.1f} µs/iter")
+    print(f"  node.step() cost: {step_us:.1f} µs (per optimizer step, NOT per iter)")
     print(f"{'='*60}")
 
     return cuda_us_per_iter
@@ -210,21 +237,22 @@ def main():
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--iters", type=int, default=12)
     parser.add_argument("--imbalance", type=str, default="none",
-                        choices=["none", "skew", "extreme"],
-                        help="Routing distribution: none (uniform random), skew (80% to E0), extreme (all to first topk experts)")
+                        choices=["none", "skew", "extreme"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--extract", type=str, default=None,
                         help="Path to nsys sqlite file to extract GPU-projection")
+    parser.add_argument("--mode", type=str, default="fp8",
+                        choices=["fp8", "bf16"],
+                        help="fp8 (FP8 frontier) or bf16 (BF16 baseline)")
     args = parser.parse_args()
 
     if args.extract:
         us = gpu_projection_us(args.extract, args.iters)
         print(f"\nGPU-projection: {us:.1f} µs/iter ({args.iters} iters)")
-        print(f"README baseline (PyTorch native FP8): 2715 µs/iter")
         return
 
     run_benchmark(args.T, args.E, args.I, args.topk, args.warmup, args.iters,
-                  imbalance=args.imbalance, seed=args.seed, H=args.H)
+                  imbalance=args.imbalance, seed=args.seed, H=args.H, mode=args.mode)
 
 
 if __name__ == "__main__":
