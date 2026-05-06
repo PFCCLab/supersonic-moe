@@ -221,7 +221,13 @@ class MoE(nn.Module):
             std=std,
         )
 
-        self.stream_id = torch.cuda.current_stream().stream_base.raw_stream
+        stream = torch.cuda.current_stream()
+        if hasattr(stream, 'stream_base'):
+            self.stream_id = stream.stream_base.raw_stream
+        elif hasattr(stream, 'cuda_stream'):
+            self.stream_id = stream.cuda_stream
+        else:
+            self.stream_id = 0
 
     @torch.no_grad()
     def prefetch_fp8_weights(self, protocol: FP8Protocol) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:

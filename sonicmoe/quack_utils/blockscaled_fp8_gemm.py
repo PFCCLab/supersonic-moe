@@ -2042,6 +2042,173 @@ def dual_quantize_varlen(
 
 
 # ---------------------------------------------------------------------------
+# ISO32 dz quantization (S80) — single FP8 buffer + dual-layout iso32 scales
+#
+# Insight (precision-validated by tools/audit_dz_iso32_quality.py):
+# Under e4m3, a single 32×32 amax produces identical downstream-GEMM RRMSE
+# vs the production 1×32 dual-amax scheme on real Ernie-shape dz tensors
+# (ratio = 1.000× across 6 captures × 3 routing distributions).
+#
+# Because the per-block amax is shared across the row/col axes:
+#   - The FP8 quantized values are byte-identical from both row and col
+#     consumer perspectives → ONE FP8 buffer serves both dx (rowwise) and
+#     dw1 (colwise) GEMMs, eliminating the col_fp8 buffer (saves a HBM write).
+#   - The e8m0 scale BYTES are also identical between row-ISA and col-ISA
+#     layouts (same value, different placement) → both scale tensors get
+#     the same byte values, just at different storage offsets.
+# ---------------------------------------------------------------------------
+
+@wrap_triton_kernel
+@triton.jit
+def _dual_varlen_iso32_quantize_kernel(
+    src_ptr,            # (TK, dim) bf16
+    fp8_ptr,            # (TK, dim) fp8 — SINGLE output (byte-identical row/col under iso32)
+    row_scales_ptr,     # ISA scales for logical (TK, dim) layout
+    col_scales_ptr,     # ISA scales for logical (dim, TK) layout
+    TK, dim,
+    src_stride_row, src_stride_col,
+    row_k_tiles,        # ceil(dim / SF_TILE_K)
+    col_k_tiles,        # ceil(TK / SF_TILE_K)
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,       # 32
+    BLOCK_DIM: tl.constexpr,        # 128
+    SF_TILE_M: tl.constexpr,        # 128
+    SF_TILE_K: tl.constexpr,        # 128
+    SF_TILE_STORAGE: tl.constexpr,  # 512
+):
+    """iso32: ONE amax per 32×32 sub-block; one FP8 buffer + dual-layout scales."""
+    pid_tk_group = tl.program_id(0)
+    pid_dim_block = tl.program_id(1)
+
+    tk_offs = pid_tk_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)   # (32,)
+    dim_offs = pid_dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)   # (128,)
+    tk_mask = tk_offs < TK
+    dim_mask = dim_offs < dim
+    mask_2d = tk_mask[:, None] & dim_mask[None, :]
+
+    # Single HBM read.
+    src_ptrs = src_ptr + tk_offs[:, None].to(tl.int64) * src_stride_row \
+                       + dim_offs[None, :].to(tl.int64) * src_stride_col
+    values = tl.load(src_ptrs, mask=mask_2d, other=0.0).to(tl.float32)  # (32, 128)
+
+    # iso32 amax per 32×32 sub-block: reduce over both 32 TK rows and 32 dim cols.
+    GROUPS_PER_DIM: tl.constexpr = BLOCK_DIM // GROUP_SIZE  # 4
+    abs_vals = tl.abs(values)
+    abs_blocks = tl.reshape(abs_vals, (GROUP_SIZE, GROUPS_PER_DIM, GROUP_SIZE))  # (32,4,32)
+    amax = tl.max(tl.max(abs_blocks, axis=2), axis=0)  # (4,)
+
+    # E8M0 encoding (bit-exact with production integer+carry).
+    bits = amax.to(tl.int32, bitcast=True)
+    bexp = (bits >> 23) & 0xFF
+    mant = bits & 0x7FFFFF
+    carry = tl.where(mant > 0x600000, 1, 0)
+    e8m0 = tl.where(bexp > 0, bexp - 8 + carry, 0)
+    e8m0 = tl.maximum(e8m0, 0)                                # (4,)
+    qexp = tl.maximum(tl.minimum(254 - e8m0, 254), 1)
+    qscale = (qexp << 23).to(tl.float32, bitcast=True)         # (4,)
+
+    # Broadcast (4,) qscale across (32, 4, 32) sub-block layout, then reshape to (32,128).
+    qscale_3d = qscale[None, :, None] + tl.zeros(
+        (GROUP_SIZE, GROUPS_PER_DIM, GROUP_SIZE), dtype=tl.float32
+    )
+    qscale_2d = tl.reshape(qscale_3d, (GROUP_SIZE, BLOCK_DIM))
+    fp8_vals = (values * qscale_2d).to(tl.float8e4nv)  # (32, 128)
+
+    # Single FP8 store.
+    out_ptrs = fp8_ptr + tk_offs[:, None].to(tl.int64) * dim \
+                       + dim_offs[None, :].to(tl.int64)
+    tl.store(out_ptrs, fp8_vals, mask=mask_2d)
+
+    # ── Row-ISA scale store: (TK, dim/32) layout ──────────────────────────
+    # All 32 TK rows in this tile share the SAME 4 e8m0 bytes (one per dim-group).
+    e8m0_u8 = e8m0.to(tl.uint8)
+    # Pack the 4 bytes into one int32 via reinterpret: treat as 4 lanes packed.
+    # Use shift/or chain: cast each lane and combine.
+    sub_arange = tl.arange(0, GROUPS_PER_DIM)  # (4,)
+    # Compute packed_i32 = (b0) | (b1<<8) | (b2<<16) | (b3<<24)
+    shifted = e8m0.to(tl.int32) << (sub_arange * 8)  # (4,)
+    packed_i32 = tl.sum(shifted, axis=0)             # scalar i32
+
+    GROUPS_PER_K: tl.constexpr = SF_TILE_K // GROUP_SIZE  # 4
+    row_row_tiles = tk_offs // SF_TILE_M
+    row_row_in_tile = tk_offs % SF_TILE_M
+    row_row_base = (row_row_in_tile % 32) * 16 + (row_row_in_tile // 32) * 4
+    row_tile_base = (row_row_tiles * row_k_tiles + pid_dim_block) * SF_TILE_STORAGE
+    row_packed_offs = (row_tile_base + row_row_base) // 4
+    packed_per_row = tl.zeros([GROUP_SIZE], dtype=tl.int32) + packed_i32
+    row_scale_i32 = row_scales_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(row_scale_i32 + row_packed_offs.to(tl.int64), packed_per_row, mask=tk_mask)
+
+    # ── Col-ISA scale store: (dim, TK/32) layout ──────────────────────────
+    # Each of 128 dim cols → one e8m0 byte = e8m0[(col % BLOCK_DIM) // 32].
+    dim_in_block = dim_offs - pid_dim_block * BLOCK_DIM            # (128,) 0..127
+    sub_idx = dim_in_block // GROUP_SIZE                            # (128,) 0..3
+    # Extract per-dim byte: e8m0_per_dim[i] = e8m0[sub_idx[i]]
+    match = (sub_idx[:, None] == sub_arange[None, :]).to(tl.int32)  # (128, 4)
+    e8m0_per_dim = tl.sum(match * e8m0[None, :].to(tl.int32), axis=1).to(tl.uint8)  # (128,)
+
+    col_row_tiles = dim_offs // SF_TILE_M
+    col_row_in_tile = dim_offs % SF_TILE_M
+    col_k_tile_idx = pid_tk_group // GROUPS_PER_K
+    col_k_in_tile = pid_tk_group % GROUPS_PER_K
+    col_tile_base = (col_row_tiles * col_k_tiles + col_k_tile_idx) * SF_TILE_STORAGE
+    col_row_base = (col_row_in_tile % 32) * 16 + (col_row_in_tile // 32) * 4
+    col_isa_offs = col_tile_base + col_row_base + col_k_in_tile
+    tl.store(col_scales_ptr + col_isa_offs.to(tl.int64), e8m0_per_dim, mask=dim_mask)
+
+
+def iso32_dual_quantize_varlen(
+    src: torch.Tensor,
+    TK: int,
+    dim: int,
+):
+    """ISO32 dual-format quant: ONE FP8 buffer + dual-layout iso32 scales.
+
+    Returns (fp8, row_scales, col_scales). Both scale tensors have the same
+    byte values (placed in row-ISA / col-ISA layouts respectively); the FP8
+    buffer is byte-identical when interpreted from row or col perspective.
+    """
+    check_tensor(src, "src", dtype=torch.bfloat16, ndim=2)
+    if src.shape != (TK, dim):
+        raise ValueError(f"src shape {src.shape} != ({TK}, {dim})")
+    src = src.contiguous()
+    device = src.device
+    GROUP_SIZE = _SF_VEC_SIZE
+    BLOCK_DIM = 128
+
+    fp8 = torch.empty(TK, dim, dtype=torch.float8_e4m3fn, device=device)
+
+    row_per = _storage_per_batch(TK, dim)
+    col_per = _storage_per_batch(dim, TK)
+    row_aligned = (TK % _SF_TILE_M == 0 and dim % _SF_TILE_K == 0)
+    col_aligned = (dim % _SF_TILE_M == 0 and TK % _SF_TILE_K == 0)
+    row_scales = (
+        torch.empty((1, row_per), dtype=torch.uint8, device=device) if row_aligned
+        else torch.full((1, row_per), 127, dtype=torch.uint8, device=device)
+    )
+    col_scales = (
+        torch.empty((1, col_per), dtype=torch.uint8, device=device) if col_aligned
+        else torch.full((1, col_per), 127, dtype=torch.uint8, device=device)
+    )
+
+    row_k_tiles = _div_up(dim, _SF_TILE_K)
+    col_k_tiles = _div_up(TK, _SF_TILE_K)
+    grid = (_div_up(TK, GROUP_SIZE), _div_up(dim, BLOCK_DIM))
+    _dual_varlen_iso32_quantize_kernel[grid](
+        src, fp8, row_scales, col_scales,
+        TK, dim,
+        src.stride(0), src.stride(1),
+        row_k_tiles, col_k_tiles,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
+        SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        num_warps=1,
+    )
+    return fp8, row_scales.view(_E8M0_DTYPE), col_scales.view(_E8M0_DTYPE)
+
+
+# ---------------------------------------------------------------------------
 # varlen_k blockscaled FP8 GEMM for weight gradients
 # ---------------------------------------------------------------------------
 

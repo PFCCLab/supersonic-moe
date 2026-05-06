@@ -20,7 +20,9 @@
 | File | Summary | Notes |
 | --- | --- | --- |
 | `_inline_audit.py` | Inline audit: monkey-patch backward to print tensor inventory at dgated completion. | — |
+| `audit_dz_iso32_quality.py` | S80 — pure-pytorch iso32 vs 1×32 quant fidelity audit on captured dz tensors; computes downstream dx/dw1 GEMM RRMSE ratio (the binding gate). | S80 |
 | `cluster_idle_launch.py` | Developer utility for cluster idle launch. | — |
+| `dump_real_dz.py` | S80 — captures real dz `(TK, 2I)` bf16 tensors from `SonicMoEMlpNode` bwd via gemm_dgated_kernel monkey-patch; saves `.npy` for proxy-free torch consumption. | S80 |
 | `fp8_frontier_breakdown.py` | FP8 Frontier rigorous breakdown: memory, precision, performance. | — |
 | `generate_directory_indexes.py` | Generate human- and agent-friendly INDEX.md files for stable directories. | untracked in git |
 | `introspect.py` | Main profiling harness for nsys, precision, grid, and memory experiments. | — |

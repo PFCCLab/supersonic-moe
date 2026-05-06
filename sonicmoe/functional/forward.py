@@ -7,14 +7,11 @@ from __future__ import annotations
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
-import triton
-import triton.language as tl
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import torch2cute_dtype_map
 
 from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from ..utils import convert_torch_tensor_to_cute_tensor
-from ..triton_utils import wrap_triton_kernel
 from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 from .topk_softmax import TopK_Softmax
@@ -40,7 +37,8 @@ def _topk_fwd(
     )
 
     x_tensor, values_tensor, indices_tensor = [convert_from_dlpack(tensor) for tensor in (x, values, indices)]
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    _s = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(_s.stream_base.raw_stream if hasattr(_s, 'stream_base') else _s.cuda_stream)
     compile_key = (input_dtype, output_dtype, N, k, require_softmax_fusion)
     if compile_key not in _topk_fwd.compile_cache:
         topk_op = TopK_Softmax(input_dtype, output_dtype, N, k, require_softmax_fusion)
@@ -204,26 +202,6 @@ def _router_forward(
         H,
         is_varlen_K,
     )
-
-
-@wrap_triton_kernel
-@triton.jit
-def _softmax_fwd_small_kernel(
-    logits_ptr, stride_lm: tl.constexpr, stride_ln: tl.constexpr, K: tl.constexpr, BLOCK_K: tl.constexpr
-):
-    row = tl.program_id(axis=0)
-
-    # tl.assume(K <= BLOCK_K)
-    k_offs = tl.arange(0, BLOCK_K)
-    k_mask = k_offs < K
-
-    # load full row (all columns) in one go (N is small)
-    x = tl.load(logits_ptr + row * stride_lm + k_offs * stride_ln, mask=k_mask, other=-float("inf")).to(tl.float32)
-    x = x - tl.max(x, axis=0)
-    ex = tl.exp(x)
-    y = ex / tl.sum(ex, axis=0)
-
-    tl.store(logits_ptr + row * stride_lm + k_offs * stride_ln, y, mask=k_mask)
 
 
 @torch.library.custom_op(

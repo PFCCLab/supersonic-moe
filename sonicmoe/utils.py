@@ -2,27 +2,11 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-from typing import Any, Callable
-
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
-from paddle.utils import map_structure
-
-
-def make_contiguous(x: Any) -> Any:
-    return x.contiguous() if isinstance(x, torch.Tensor) else x
-
-
-def ensure_contiguous(func: Callable) -> Callable:
-    def inner(*args, **kwargs):
-        args = map_structure(make_contiguous, args)
-        kwargs = map_structure(make_contiguous, kwargs)
-        return func(*args, **kwargs)
-
-    return inner
 
 
 def ceil_divide(x: int, y: int) -> int:
@@ -61,23 +45,6 @@ def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=No
         assumed_align=tensor.iterator.max_alignment,
     )
     return cute.make_tensor(new_ptr, tensor.layout)
-
-
-def divide_if_divisible(dividend: int, divisor: int, msg: str = "") -> int:
-    assert dividend % divisor == 0, msg
-    return dividend // divisor
-
-
-def get_next_power_of_2(x: int) -> int:
-    x -= 1
-    x |= x >> 1
-    x |= x >> 2
-    x |= x >> 4
-    x |= x >> 8
-    x |= x >> 16
-    x |= x >> 32
-    x += 1
-    return x
 
 
 class _TensorWithStream:

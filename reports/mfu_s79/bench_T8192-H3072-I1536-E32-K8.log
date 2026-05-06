@@ -1,0 +1,27 @@
+/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/lib/python3.12/site-packages/torch/cuda/__init__.py:63: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/lib/python3.12/site-packages/paddle/library.py:116: UserWarning: The feature 'device_types' in function 'torch.library.custom_op' is not implemented in PaddlePaddle's custom operator interface.
+  warn_about_unimplemented_torch_features(
+/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/lib/python3.12/site-packages/paddle/library.py:120: UserWarning: The feature 'schema' in function 'torch.library.custom_op' is not implemented in PaddlePaddle's custom operator interface.
+  warn_about_unimplemented_torch_features(
+/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/lib/python3.12/site-packages/paddle/library.py:68: UserWarning: The feature 'register_fake' in function 'torch.library.CustomOpDef' is not implemented in PaddlePaddle's custom operator interface.
+  warn_about_unimplemented_torch_features(
+/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/lib/python3.12/site-packages/paddle/library.py:158: UserWarning: The feature 'register_fake' in function 'torch.library.register_fake' is not implemented in PaddlePaddle's custom operator interface.
+  warn_about_unimplemented_torch_features(
+W0430 15:37:48.397964 453359 gpu_resources.cc:116] Please NOTE: device: 0, GPU Compute Capability: 10.3, Driver API Version: 13.0, Runtime API Version: 13.0
+  imbalance=none tpe(min/max/sum)=1961/2121/65536
+Warmup (8 iters)...
+Benchmark (12 iters)...
+
+============================================================
+SonicMoEMlpNode topk FP8 benchmark
+  Shape: N_recv=8192 H=3072 I=1536 E=32 topk=8
+  TK (total token-expert pairs): 65536
+  CUDA events: 5334.9 µs/iter
+  README baseline (PyTorch native FP8): 2715 µs/iter
+============================================================
+Collecting data...
+Generating '/tmp/nsys-root/nsys-report-3d46.qdstrm'
+[1/1] [0%                          ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [0%                          ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [=======39%                  ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [=========44%                ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [==========49%               ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [============54%             ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [============55%             ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [=============60%            ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [===============65%          ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [================70%         ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [==================75%       ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [===================80%      ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [====================85%     ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [======================90%   ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [=======================94%  ] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [========================100%] trace_T8192-H3072-I1536-E32-K8.nsys-rep[1/1] [========================100%] trace_T8192-H3072-I1536-E32-K8.nsys-rep
+Generated:
+	/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/reports/mfu_s79/trace_T8192-H3072-I1536-E32-K8.nsys-rep

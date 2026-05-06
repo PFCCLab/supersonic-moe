@@ -1,0 +1,2 @@
+# Heavy capture tensors — regenerate with `python tools/dump_real_dz.py`
+dz_*.npy

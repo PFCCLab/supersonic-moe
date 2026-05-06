@@ -1,10 +1,7 @@
 #!/bin/bash
 set -e
-export CUDA_VISIBLE_DEVICES=0
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/.runenv.sh
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-unset PADDLE_ELASTIC_JOB_ID PADDLE_TRAINER_ENDPOINTS DISTRIBUTED_TRAINER_ENDPOINTS FLAGS_START_PORT PADDLE_ELASTIC_TIMEOUT
-export NNODES=1 PADDLE_TRAINERS_NUM=1
 
 echo "=== Running full regression test suite ==="
 echo "Date: $(date)"
@@ -26,6 +23,12 @@ USE_QUACK_GEMM=1 python -m pytest tests/moe_blackwell_test.py -v --tb=short 2>&1
 echo ""
 echo "--- moe_test.py ---"
 USE_QUACK_GEMM=1 python -m pytest tests/moe_test.py -v --tb=short 2>&1 || true
+
+# FP8 frontier determinism — HARD failure (non-determinism is a correctness bug,
+# not a flaky test). Do NOT swallow with `|| true`.
+echo ""
+echo "--- fp8_frontier_determinism_test.py (2 tests, HARD-fail on non-determinism) ---"
+USE_QUACK_GEMM=1 python -m pytest tests/fp8_frontier_determinism_test.py -v --tb=short 2>&1
 
 echo ""
 echo "=== Regression complete ==="

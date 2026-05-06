@@ -241,3 +241,4 @@ docs/KNOWLEDGE_BASE.md
 .ci_artifacts/
 .jit_cache_ci/
 log/
+core

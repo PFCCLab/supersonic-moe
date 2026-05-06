@@ -251,11 +251,14 @@ See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 | 5 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log (Phases 1–26 only; superseded by HANDOFF.md sessions ≥66) |
 | 6 | **Environment** | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
 
-> **Project state (as of session 77, 2026-04-29)**: branch `myrepo/race-fix-paddle` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`. **`bash tools/ci/run_core_tests.sh` → 13/13 PASS, 0 SKIP** on the paddlejob shared-GPFS host (~15 min wall, 2× B30Z Blackwell). FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, multilayer/multistep main_grad accumulation correct, single-stream from deepep-fwd to deepep-bwd, post-warmup zero `cuda.synchronize()`, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. S77 added: cross-test FP8 config isolation, paddlejob cluster-env whitelist for multicard launcher, eager device-pool init to fix `Place(gpu:N) is not supported` under autograd, multi-process JIT cache hardening on shared GPFS.
+> **Project state (as of session 79, 2026-04-30)**: branch `myrepo/race-fix-paddle` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`, **14 commits ahead** of `fork/paddle`. **`bash tools/ci/run_core_tests.sh` → 14/14 PASS, 0 SKIP** on the paddlejob shared-GPFS host (~14 min wall, 2× B30Z Blackwell, last verified S78b). FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, multilayer/multistep main_grad accumulation correct, single-stream from deepep-fwd to deepep-bwd, post-warmup zero `cuda.synchronize()`, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. **NEW (S79)**: `tests/fp8_frontier_determinism_test.py` proves bit-exact determinism across runs (frontier path, fused_gated + alignment_assumed) and is wired into `tests/run_regression.sh` as a HARD-fail gate. **Read `HANDOFF.md` top section before any work** — S79 documents the failed dgrad1 single-kernel optimisation surface (don't re-tune stages/swizzle/launch-bounds; structural fission required) and the downstream PaddleFleet stale-`.so` triage.
 
 **Quick-validate the frontier before resuming work**:
 ```bash
 source .runenv.sh
+bash tests/run_regression.sh                  # full regression incl. determinism gate
+# OR a fast spot-check:
+python -m pytest tests/fp8_frontier_determinism_test.py -v
 python -m pytest tests/ops/test_mlpnode_multilayer.py tests/ops/test_mlpnode_correctness_large.py \
                  tests/ops/test_colwise_quant.py tests/ops/test_rowwise_quant.py tests/ops/test_fused_quant.py
 python tests/ops/test_mlpnode_precision.py     # 6-shape topk precision audit

@@ -53,6 +53,7 @@ These tests pass in a pure-torch environment (xfer) but require `sonicmoe/__init
 | `fp8_protocol_test.py` | FP8Protocol API coverage | needs xfer |
 | `fp8_large_project_contract_test.py` | FP8 contract E=128 | needs xfer |
 | `fp8_frontier_strict_test.py` | Strict fused-gated test | needs xfer |
+| `fp8_frontier_determinism_test.py` | Bit-exact determinism on FP8 frontier (fused-gated, alignment_assumed) | runs in CI (eb_venv via .runenv.sh) |
 | `test_blockscaled_fp8_varlen.py` | Varlen GEMM against gold | needs xfer |
 | `count_cumsum_test.py` | count_cumsum extension | needs xfer |
 | `run_regression.sh` | Regression runner | needs xfer |
