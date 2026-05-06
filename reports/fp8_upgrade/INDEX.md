@@ -19,7 +19,7 @@
 | `BLOCKSCALED_ALIGNMENT.md` | Markdown note: Blockscaled FP8: 128-Row Alignment Constraint. | — |
 | `engineering_log.md` | Markdown note: FP8 Engineering Log. | historical reference |
 | `FP8_BENCHMARK_REPORT.md` | Markdown note: SonicMoE FP8 Blockscaled — 基准测试报告. | — |
-| `HANDOFF.md` | Markdown note: STALE — Superseded by docs/HANDOFF.md. | stale, superseded by `docs/HANDOFF.md` |
+| `HANDOFF.md` | Markdown note: STALE — Superseded by root `HANDOFF.md`. | stale, superseded by root `HANDOFF.md` |
 
 ## Redundancy and cleanup watchlist
 - This subtree is historical by default; new authoritative state should go to `docs/` or newer `reports/` summaries unless there is a strong reason otherwise.

@@ -1,6 +1,6 @@
-# Directory Index: `/benchmarks/`
+# Directory Index: `/reports/nsys_xfw/T8192_H3072_I1536_E8_K8/paddle_fp8/`
 
-> One-off and repeatable benchmark entrypoints for FP8, BF16, and routing experiments.
+> Directory for paddle fp8.
 > Regenerate with `python tools/generate_directory_indexes.py` from the repository root.
 
 ## Maintenance rules
@@ -10,15 +10,15 @@
 - If a change crosses directory boundaries, update this `INDEX.md` and the nearest affected ancestor `INDEX.md` files together.
 - Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
 
-## Volatile / generated child directories
-| Path | Summary | Notes |
-| --- | --- | --- |
-| `nsys_clean/` | Volatile / generated subtree. | Raw nsys capture artifacts (`.sqlite`, `.nsys-rep`); high churn and not useful for durable indexing. |
-
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `bench_triton_moe.py` | Benchmark entrypoint for bench triton moe. | — |
-| `e2e_fp8_vs_bf16.py` | End-to-end FP8 vs BF16 benchmark for SonicMoE. | — |
-| `moe-cute.py` | Benchmark entrypoint for moe cute. | — |
-| `moe-token-rounding.py` | Benchmark entrypoint for moe token rounding. | — |
+| `r0.nsys-rep` | nsys report artifact for r0. | untracked in git |
+| `r0.py` | Python source for r0. | — |
+| `r0.sqlite` | SQLite profiling artifact for r0. | untracked in git |
+| `r1.nsys-rep` | nsys report artifact for r1. | untracked in git |
+| `r1.py` | Python source for r1. | — |
+| `r1.sqlite` | SQLite profiling artifact for r1. | untracked in git |
+| `r2.nsys-rep` | nsys report artifact for r2. | untracked in git |
+| `r2.py` | Python source for r2. | — |
+| `r2.sqlite` | SQLite profiling artifact for r2. | untracked in git |

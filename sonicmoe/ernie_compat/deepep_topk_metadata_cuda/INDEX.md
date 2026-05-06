@@ -1,6 +1,6 @@
-# Directory Index: `/benchmarks/`
+# Directory Index: `/sonicmoe/ernie_compat/deepep_topk_metadata_cuda/`
 
-> One-off and repeatable benchmark entrypoints for FP8, BF16, and routing experiments.
+> Directory for deepep top-k metadata cuda.
 > Regenerate with `python tools/generate_directory_indexes.py` from the repository root.
 
 ## Maintenance rules
@@ -13,12 +13,10 @@
 ## Volatile / generated child directories
 | Path | Summary | Notes |
 | --- | --- | --- |
-| `nsys_clean/` | Volatile / generated subtree. | Raw nsys capture artifacts (`.sqlite`, `.nsys-rep`); high churn and not useful for durable indexing. |
+| `__pycache__/` | Volatile / generated subtree. | Python bytecode cache; disposable. |
 
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `bench_triton_moe.py` | Benchmark entrypoint for bench triton moe. | — |
-| `e2e_fp8_vs_bf16.py` | End-to-end FP8 vs BF16 benchmark for SonicMoE. | — |
-| `moe-cute.py` | Benchmark entrypoint for moe cute. | — |
-| `moe-token-rounding.py` | Benchmark entrypoint for moe token rounding. | — |
+| `__init__.py` | Package marker and re-export surface. | — |
+| `kernel.cu` | CUDA source for kernel. | — |

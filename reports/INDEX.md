@@ -44,7 +44,7 @@
 | `nsys_breakdown_session64.json` | JSON artifact with top-level keys: `T8192_E8`, `T8192_E32`, `T16384_E8`, `T16384_E32`. | — |
 | `nsys_grid_session64.json` | JSON artifact with top-level keys: `T8192_E8`, `T8192_E32`, `T16384_E8`, `T16384_E32`. | — |
 | `pad_audit_results.json` | JSON artifact with top-level keys: `shape`, `precision`, `performance`, `memory`. | — |
-| `phase1a_ws5_status.md` | Markdown note: WS5: Phase 1A 实施状态 — Mixin + EpiOp + Class Selection 已实现，JIT compile 待调试. | untracked in git |
+| `phase1a_ws5_status.md` | Historical WS5 Phase 1A epilogue-fusion design draft; superseded by later NCU register-pressure findings. | historical; do not execute as current P0 |
 | `quant_bench_final.json` | Legacy flat quant benchmark snapshot still emitted by `tools/introspect.py`. | legacy snapshot, compare with `reports/quant_bench.json` before reusing |
 | `race_fix_paddle_migration.md` | Markdown note: Race-fix-paddle migration report. | — |
 | `README.md` | High-level map of report outputs and profiling artifacts. | keep aligned with root `HANDOFF.md` |

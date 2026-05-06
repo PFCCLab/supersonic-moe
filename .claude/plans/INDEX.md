@@ -9,8 +9,3 @@
 - Any behavior-changing edit that invalidates a file summary must refresh the affected summary text here.
 - If a change crosses directory boundaries, update this `INDEX.md` and the nearest affected ancestor `INDEX.md` files together.
 - Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
-
-## Files
-| File | Summary | Notes |
-| --- | --- | --- |
-| `native_fp8_params.md` | Markdown note: Plan: 全链路 FP8 参数 (native_fp8_params) 分支. | local planning artifact |
