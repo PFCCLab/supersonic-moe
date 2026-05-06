@@ -1,5 +1,8 @@
 import os
 
+import paddle
+paddle.enable_compat()
+
 import torch
 
 import sonicmoe.functional as functional

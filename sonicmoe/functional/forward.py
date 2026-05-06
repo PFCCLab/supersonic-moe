@@ -37,7 +37,8 @@ def _topk_fwd(
     )
 
     x_tensor, values_tensor, indices_tensor = [convert_from_dlpack(tensor) for tensor in (x, values, indices)]
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    _s = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(_s.stream_base.raw_stream if hasattr(_s, 'stream_base') else _s.cuda_stream)
     compile_key = (input_dtype, output_dtype, N, k, require_softmax_fusion)
     if compile_key not in _topk_fwd.compile_cache:
         topk_op = TopK_Softmax(input_dtype, output_dtype, N, k, require_softmax_fusion)
