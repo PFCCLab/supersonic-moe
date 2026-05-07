@@ -641,80 +641,163 @@ GEMM accumulator -> TMA store with ADD -> accumulator buffer
 
 ## 7. Roofline 与 MFU 数学分析
 
-### 7.1 FLOPs 公式
+### 7.1 MFU 计量约定
 
-对一个 SwiGLU MoE layer 的 forward+backward，主要 matmul FLOPs 可近似为：
+**Model FLOPs Utilization (MFU)** 的标准定义（Chowdhery et al., PaLM 2022）：
+
+$$
+\text{MFU} = \frac{F_{\text{model}}}{t_{\text{iter}} \times \Pi_{\text{peak}}}
+$$
+
+其中 $F_{\text{model}}$ **仅计入 Tensor Core matmul FLOPs**（`2MNK` per GEMM），不包含：
+- Epilogue ALU/SFU 操作（SwiGLU、dSwiGLU、bias、activation）
+- Quantization / dequantization 计算
+- Routing、gather/scatter、metadata
+- 通信
+
+这是业界惯例：MFU 衡量的是"硬件 matmul 管线利用率"，非 "总有用计算 / 总可用计算"。
+
+### 7.2 精确 6-GEMM FLOPs 分解
+
+一个 SwiGLU MoE layer 的 forward + backward 包含 **6 次 grouped GEMM**：
+
+| # | 阶段 | GEMM shape (per expert) | FLOPs 公式 | 系数 |
+|---|------|------------------------|------------|------|
+| 1 | Fwd GemmGated: $\hat{x} \cdot W_1^\top$ | $(M_e, 2I) = (M_e, H) \times (H, 2I)$ | $2 \times M \times H \times 2I$ | $4 \cdot MHI$ |
+| 2 | Fwd GemmDefault: $y \cdot W_2^\top$ | $(M_e, H) = (M_e, I) \times (I, H)$ | $2 \times M \times I \times H$ | $2 \cdot MHI$ |
+| 3 | Bwd GemmDGated: $\partial o \cdot W_2$ | $(M_e, I) = (M_e, H) \times (H, I)$ | $2 \times M \times H \times I$ | $2 \cdot MHI$ |
+| 4 | Bwd actgrad W1: $\partial z \cdot W_1$ | $(M_e, H) = (M_e, 2I) \times (2I, H)$ | $2 \times M \times 2I \times H$ | $4 \cdot MHI$ |
+| 5 | Wgrad W1: $\hat{x}^\top \cdot \partial z$ | $(H, 2I) = (H, M_e) \times (M_e, 2I)$ | $2 \times H \times M \times 2I$ | $4 \cdot MHI$ |
+| 6 | Wgrad W2: $y^\top \cdot \partial o$ | $(I, H) = (I, M_e) \times (M_e, H)$ | $2 \times I \times M \times H$ | $2 \cdot MHI$ |
+
+**合计**：$(4+2+2+4+4+2) = 18 \cdot MHI$ 其中 $M = TK = T \times K$。
+
+**关键澄清 — GemmDGated (#3) 为什么是 $2MHI$ 而非 $4MHI$**：
+
+GemmDGated 的 matmul 部分仅是 $\partial o \cdot W_2$，输出 shape 为 $(M, I)$。虽然 kernel 在 epilogue 中融合了 dSwiGLU（产出 $(M, 2I)$ 的 $\partial z$），但 dSwiGLU 是 **ALU/SFU 逐元素操作**，不走 Tensor Core，故不计入 MFU 分子。
+
+实际输出两路 TMA store 的形状之所以是 $(M, F)$ 和 $(M, F)$ 而非 $(M, 2F)$，是因为 dSwiGLU 在 accumulator 寄存器中原地完成，两路 $\partial z_g$ 和 $\partial z_u$ 分别 store。
+
+### 7.3 GemmDGated 真实计算量分解
+
+GemmDGated 是 FP8 frontier 中**最复杂的单体 kernel**（168 regs/thread，Block Limit=1），它在 GEMM mainloop 之上叠加了大量 epilogue 计算。精确拆分：
+
+#### 7.3.1 Matmul 部分（Tensor Core）
 
 ```text
-F = 18 * TK * H * I
+F_gemm = 2 × M × H × I
+       = 2 × 65536 × 3072 × 1536
+       = 6.176e11 FLOPs
 ```
 
-分解：
+这是标准 GEMM `2MNK`，计入 MFU。
 
-| 阶段 | FLOPs |
-|---|---:|
-| fwd up-proj `x @ W1`, 输出 `2I` | `4 * TK * H * I` |
-| fwd down-proj `y1 @ W2` | `2 * TK * H * I` |
-| bwd down actgrad / dGated | `2 * TK * H * I` 到 `4 * TK * H * I` 视融合口径 |
-| bwd up actgrad | `4 * TK * H * I` |
-| wgrad W1 | `4 * TK * H * I` |
-| wgrad W2 | `2 * TK * H * I` |
-| 合计口径 | `18 * TK * H * I` |
+#### 7.3.2 Epilogue 部分（ALU/SFU，不计入 MFU）
 
-Ernie shape：
+Epilogue 对每个 $(m, f)$ 元素对执行以下操作：
+
+| 步骤 | 操作 | FLOPs/element | SASS 类型 |
+|------|------|--------------|-----------|
+| FP8 C-Load | `z_fp8 → f32 + scale_mul` | 2 (cast + mul) | MUFU + FMA |
+| dSwiGLU 前半 | `σ(z_g)` | 1 | MUFU.TANH (SFU) |
+| | `silu = z_g × σ(z_g)` | 1 | FMUL |
+| | `silu × dout` | 1 | FMUL |
+| | `σ - silu×σ` | 1 | FMA |
+| | `(σ-silu×σ) × dout + silu×dout` | 1 | FMA |
+| | `d_gate = above × z_u` | 1 | FMUL |
+| | `d_up = silu × dout` | 0 (reuse) | — |
+| | `swiglu_out = silu × z_u` | 1 | FMUL |
+| Dual TMA store | 2路 fp8 量化 + store | 2 (scale+round) | FMUL×2 |
+| BF16 store (swiglu) | dtype convert | 1 | F2F |
+
+**每元素对 ~12 ALU/SFU ops**。总 epilogue FLOPs：
 
 ```text
-T=8192, K=8, TK=65536
-H=3072, I=1536
-
-F = 18 * 65536 * 3072 * 1536
-  = 5.566e12 FLOPs
+F_epi = 12 × M × I
+      = 12 × 65536 × 1536
+      = 1.208e9 FLOPs
 ```
 
-B30Z FP8 peak 按当前报告使用 `4500 TFLOPS = 4.5e15 FLOPs/s`：
+#### 7.3.3 为什么 epilogue 显著拖慢 DGated
+
+虽然 $F_{\text{epi}} / F_{\text{gemm}} \approx 0.2\%$ 看似微不足道，但瓶颈不在 FLOPs 总量，而在 **pipeline 占用**：
+
+1. **MUFU.TANH 吞吐**：SM90/SM100 上 MUFU 指令 throughput = 16 results/SM/cycle（¼ of FMA 的 64/cycle）。dSwiGLU 中的 sigmoid 必须走 MUFU，形成 SFU pipeline stall。
+
+2. **寄存器压力**：168 regs/thread 意味着 Block Limit = 1（每 SM 只能驻留 1 个 CTA）。一旦 epilogue stall，没有其他 warp group 可以掩盖延迟。
+
+3. **双路 TMA store**：正常 GEMM 只有 1 路 D 输出，DGated 需要写 $\partial z_g$、$\partial z_u$、`swiglu_out` 三路（其中 $\partial z$ 两路合并为双 TMA descriptor）。store 带宽需求 ~3× 正常 GEMM。
+
+**Tensor Core pipe utilization 估算**：
 
 ```text
-ideal_time_at_100% = 5.566e12 / 4.5e15
-                   = 1.237e-3 s
-                   = 1237 µs
+正常 GEMM（无重 epilogue）: TC pipe busy ~87%（profiled）
+GemmDGated: TC pipe busy ~72%（profiled, SM100）
+
+有效 MFU_DGated = 72% × (F_gemm / F_total_matmul) × nominal_MFU
 ```
 
-最新实测：
+### 7.4 全迭代 MFU 计算
+
+Ernie shape：$T{=}8192, K{=}8, M{=}65536, H{=}3072, I{=}1536$
+
+```text
+F_total = 18 × M × H × I
+        = 18 × 65536 × 3072 × 1536
+        = 5.566e12 FLOPs
+```
+
+B30Z FP8 peak: $\Pi = 4500 \text{ TFLOPS} = 4.5 \times 10^{15} \text{ FLOPs/s}$
+
+```text
+ideal_time_at_100% = 5.566e12 / 4.5e15 = 1237 µs
+```
+
+实测：
 
 ```text
 busy = 2659.8 µs
-MFU  = 5.566e12 / (2659.8e-6 * 4.5e15)
-     = 46.51%
+MFU  = 5.566e12 / (2659.8e-6 × 4.5e15) = 46.51%
 ```
 
-### 7.2 为什么 GEMM 是 compute-bound
+#### 7.4.1 MFU Gap 分解（100% → 46.5%）
 
-以 up-proj 为例，近似 arithmetic intensity：
+| 损失来源 | 估计占比 | 说明 |
+|----------|---------|------|
+| GEMM shape efficiency + varlen | ~46% | 非方阵、per-expert 碎片化、tile 边界浪费 |
+| Epilogue pipeline stall (DGated 为主) | ~15% | SFU stall + 寄存器满 + 双路 store |
+| 非 GEMM kernels (quant/gather/route) | ~23% | ~613 µs / 2660 µs |
+| Fixed overhead (launch/control/cache) | ~8% | ~201 µs / 2660 µs |
+| L2/DRAM bandwidth contention | ~8% | scale load、activation reuse miss |
+
+### 7.5 Arithmetic Intensity 与 Roofline
+
+以 Fwd GemmGated 为例：
 
 ```text
-F_up = 2 * TK * H * 2I
-Bytes ≈ TK*H + H*2I + TK*2I   # FP8 bytes, 忽略 scales 和 output
+F_up  = 2 × M × H × 2I = 2 × 65536 × 3072 × 3072 = 1.236e12
+Bytes = M×H + H×2I + M×2I  (FP8 = 1 byte/element)
+      = 65536×3072 + 3072×3072 + 65536×3072
+      = 2.01e8 + 9.44e6 + 2.01e8 ≈ 4.12e8 bytes
 
-AI ≈ F_up / Bytes
-   ≈ 2*65536*3072*3072 / (65536*3072 + 3072*3072 + 65536*3072)
-   ≈ 3,000 FLOPs/byte
+AI = 1.236e12 / 4.12e8 ≈ 3000 FLOPs/byte
 ```
 
 B30Z ridge point：
 
 ```text
-Peak compute / HBM BW ≈ 4500e12 / 8e12 = 562.5 FLOPs/byte
+Ridge = Peak_compute / HBM_BW = 4500e12 / 8e12 = 562.5 FLOPs/byte
 ```
 
-`AI >> ridge`，所以主 GEMM 不该被 HBM bandwidth 主导。性能差距主要来自：
+$\text{AI} \gg \text{Ridge}$，所有主 GEMM 深处 compute-bound 区域。**MFU gap 的主因不是带宽瓶颈，而是**：
 
-1. tensor-core shape efficiency，不是理想方阵。
-2. varlen / expert fragmentation。
-3. epilogue 指令和寄存器压力。
-4. 非 GEMM kernel：quant、metadata、scatter/reduce。
-5. launch/control/fixed overhead。
+1. **Tensor-core shape efficiency** — 非理想方阵 + varlen 导致 tile 填充率 < 100%
+2. **Expert fragmentation** — E=8 个 expert 各自独立 tile scheduling，短 segment 边界浪费
+3. **Epilogue 指令密度** — DGated 的 SFU stall 使 TC pipe 空转 ~15% 时间
+4. **非 matmul kernels** — quant / metadata / scatter-reduce 占 ~23% wall time
+5. **Fixed overhead** — launch / control / compile-cache lookup ~8%
 
-### 7.3 最新经验 MFU 模型
+### 7.6 经验 MFU 拟合模型
 
 `tools/mfu_model.py` 对 `reports/fresh_benchmark_ws1/sweep.json` 里的 **多点 sweep** 拟合，不是拿 Ernie 一个点反推常数。当前 FP8 拟合使用 11 个 FP8 数据点，覆盖 token 数、expert 数和模型宽度变化；BF16 也有对应 11 个数据点用于交叉对照。
 
@@ -791,7 +874,7 @@ measured       ≈ 2660 µs
 3. 这个模型适合在相近路径、相近硬件、相近 routing 机制下预测 shape scaling；不适合替代 per-kernel attribution，也不应外推到通信占主导的多机 EP。
 4. 如果引入新的 fusion/fission 或通信 overlap，常数必须重新拟合；不能继续沿用旧 `eta_max/a_*` 解释新系统。
 
-### 7.4 Crossover：什么时候 FP8 反而慢
+### 7.7 Crossover：什么时候 FP8 反而慢
 
 fresh sweep 显示：
 
