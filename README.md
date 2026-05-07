@@ -10,7 +10,7 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 ![image](./assets/mem.png)
 ![image](./assets/tput.png)
 
-## Current FP8 Frontier Snapshot (2026-05-06)
+## Current FP8 Frontier Snapshot (2026-05-07)
 
 The current Blackwell frontier is **green** on branch `race-fix-paddle`. The active path is:
 
@@ -67,9 +67,11 @@ Read first:
 |---:|---|---|
 | 1 | [`HANDOFF.md`](./HANDOFF.md) | canonical current project state, lessons, next plan |
 | 2 | [`reports/sonic_moe_fp8_frontier_newcomer_guide.md`](./reports/sonic_moe_fp8_frontier_newcomer_guide.md) | standalone FP8/CuTe/SonicMoE newcomer guide + expert Q&A |
-| 3 | [`reports/sonic_moe_comprehensive_analysis.md`](./reports/sonic_moe_comprehensive_analysis.md) | broad technical analysis and roofline/precision/perf tables |
-| 4 | [`reports/fresh_benchmark_ws1/README.md`](./reports/fresh_benchmark_ws1/README.md) | latest sweep data and MFU fit |
-| 5 | [`reports/ernie_shape_ncu_s78b/README.md`](./reports/ernie_shape_ncu_s78b/README.md) | NCU resource breakdown for the 6 GEMMs |
+| 3 | [`docs/gemm_dgated_fp8cload.md`](./docs/gemm_dgated_fp8cload.md) | GemmDGatedFP8CLoad design: Int16 trick, dSwiGLU, FP8 dequant, zero-materialization |
+| 4 | [`docs/expert_interleave_weight_layout.md`](./docs/expert_interleave_weight_layout.md) | Expert Interleave weight layout: 5-layer benefit analysis + originality |
+| 5 | [`reports/sonic_moe_comprehensive_analysis.md`](./reports/sonic_moe_comprehensive_analysis.md) | broad technical analysis and roofline/precision/perf tables |
+| 6 | [`reports/fresh_benchmark_ws1/README.md`](./reports/fresh_benchmark_ws1/README.md) | latest sweep data and MFU fit |
+| 7 | [`reports/ernie_shape_ncu_s78b/README.md`](./reports/ernie_shape_ncu_s78b/README.md) | NCU resource breakdown for the 6 GEMMs |
 
 Important current insights:
 
@@ -312,14 +314,16 @@ See `HANDOFF.md` for full kernel breakdown, memory notes, and next-step prioriti
 
 | Priority | Resource | Path |
 |:---:|----------|------|
-| 1 | **Handoff (current state)** | Root `HANDOFF.md` — canonical current state, lessons, and next plan |
+| 1 | **Handoff (current state)** | Root `HANDOFF.md` — canonical current state, lessons, insights, and next plan |
 | 2 | **PaddleFleet migration** | `docs/PADDLEFLEET_MIGRATION_S74.md` — stream patch, `node.step()` ordering, lazy main_grad, Fleet's pre-fused-weight integration path |
 | 3 | **This README** | Root `README.md` — architecture, cache design, training loop, test matrix |
-| 4 | **Newcomer Guide** | `reports/sonic_moe_fp8_frontier_newcomer_guide.md` — FP8/CuTe/SonicMoE basics through expert Q&A |
-| 5 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log only; current-state correction block at top |
-| 6 | **Environment** | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
+| 4 | **Newcomer Guide** | `reports/sonic_moe_fp8_frontier_newcomer_guide.md` — FP8/CuTe/SonicMoE basics through expert Q&A, MFU math (Section 7) |
+| 5 | **GemmDGated Design Doc** | `docs/gemm_dgated_fp8cload.md` — Int16 trick, dSwiGLU SASS decomposition, FP8 blockscaled dequant, zero-materialization |
+| 6 | **Expert Interleave Design Doc** | `docs/expert_interleave_weight_layout.md` — full-stack benefit analysis of gate/up interleaved weight layout |
+| 7 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log only; current-state correction block at top |
+| 8 | **Environment** | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
 
-> **Project state (clean handoff, 2026-05-06)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest Ernie-shape FP8 busy time is **2659.8 µs/iter** and **46.51% MFU**. Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization, not direct dz-quant epilogue fusion.
+> **Project state (clean handoff, 2026-05-07)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest Ernie-shape FP8 busy time is **2659.8 µs/iter** and **46.51% MFU**. Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization (live-range shortening / fission), not direct dz-quant epilogue fusion.
 
 **Quick-validate the frontier before resuming work**:
 ```bash

@@ -6,7 +6,7 @@
 > claims that were later corrected. Do **not** use an old phase as current truth
 > without checking the correction block below and the root handoff.
 
-## Current-state correction block (2026-05-06)
+## Current-state correction block (2026-05-07)
 
 Use these facts to interpret the historical entries below:
 
@@ -15,12 +15,14 @@ Use these facts to interpret the historical entries below:
 | Active path | DeepEP topk metadata + route-level padding + zero-materialization `A_idx` + FP8 blockscaled CuTe/CUTLASS GEMMs + fused gated up-proj + FP8-C-load dGated + iso32 dz dual quant + TMA reduce-add wgrad into ERNIE `main_grad`. |
 | Performance | Ernie shape `T=8192,H=3072,I=1536,E=8,K=8`: FP8 frontier `2659.8 µs/iter`, `46.51%` MFU vs 4500 TFLOPS; peak measured MFU `51.61%` on `H4096,I4096`. |
 | Baselines | Current in-repo QuACK BF16 baseline gives only `1.11x` speedup at Ernie shape (`2659.8` vs `2942.5 µs`). Historical `~1.37x` is vs Session-53 cuBLAS/PyTorch BF16 and must be labeled as such. |
-| GemmDGated FP8 C-load | The old “FP8 PreAct impossible” / “expert 1-7 garbage” records are fixed by the later `GemmDGatedFP8CLoadSm100ZeroMat` path. Current issue is not correctness; it is register/epilogue pressure: 168 regs/thread, ~42% tensor-pipe. |
-| dz epilogue fusion | Do **not** treat “fuse dz quant into GemmDGated epilogue” as ready P0. NCU shows almost no register headroom; direct epilogue loops risk spill/segfault. Current P0 is structural dgrad1 work: C-load/L2 reuse, live-range reduction, or fission. |
+| GemmDGated FP8 C-load | The old “FP8 PreAct impossible” / “expert 1-7 garbage” records are fixed by the later `GemmDGatedFP8CLoadSm100ZeroMat` path. Current issue is not correctness; it is register/epilogue pressure: 168 regs/thread, ~42% tensor-pipe. GEMM is 2MHI (not 4MHI); dSwiGLU is epilogue ALU, not TC. |
+| DGated FLOPs | The matmul is $2 \times M \times H \times I$ (output shape M×I). Epilogue adds ~12 ALU/SFU ops per element pair but does NOT count toward MFU. See `reports/sonic_moe_fp8_frontier_newcomer_guide.md` Section 7.3. |
+| dz epilogue fusion | Do **not** treat “fuse dz quant into GemmDGated epilogue” as ready P0. NCU shows almost no register headroom; direct epilogue loops risk spill/segfault. Current P0 is structural dgrad1 work: live-range shortening, C-load/L2 reuse, or fission. |
 | TMA reduce-add | TMA reduce-add is a performance/register optimization, not higher-precision accumulation. It keeps fp32 `main_grad`; determinism is guarded by `tests/fp8_frontier_determinism_test.py`. |
 | iso32 | iso32 dz dual quant is validated on real Ernie-like `dz` captures with downstream GEMM RRMSE ratio `1.000x`, but it is measured-scope safe, not a universal theorem. Monitor `log2(block_amax/row_amax)` for new distributions. |
 | Memory | FP8 perf path keeps multiple FP8 weight layouts cached. `z` is saved as `z_fp8 + scales`, but cache retention and backward temporaries mean FP8 is not automatically lower-peak than BF16. Re-measure with current benches before quoting old memory numbers. |
-| Documentation | Newcomer/frontier source: `reports/sonic_moe_fp8_frontier_newcomer_guide.md`; broad report: `reports/sonic_moe_comprehensive_analysis.md`; latest handoff: root `HANDOFF.md`. |
+| Expert Interleave | Full-stack architectural decision (not kernel trick). See `docs/expert_interleave_weight_layout.md`. Enables GEMM epilogue SwiGLU fusion + Int16 view trick + coalesced SwiGLU kernel + zero-cost wgrad layout + FP8 quantization symmetry. |
+| Documentation | Newcomer/frontier: `reports/sonic_moe_fp8_frontier_newcomer_guide.md`; DGated deep-dive: `docs/gemm_dgated_fp8cload.md`; Interleave design: `docs/expert_interleave_weight_layout.md`; latest handoff: root `HANDOFF.md`. |
 
 ---
 

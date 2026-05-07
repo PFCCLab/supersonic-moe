@@ -1,8 +1,8 @@
-# HANDOFF — SonicMoE FP8 Frontier (clean state, 2026-05-06)
+# HANDOFF — SonicMoE FP8 Frontier (clean state, 2026-05-07)
 
 > **Branch**: `race-fix-paddle`
 >
-> **Repository**: PFCCLab/supersonic-moe
+> **Repository**: A-nnonymous/supersonic-moe (remote: `myrepo`)
 >
 > **Frontier status**: GREEN for the documented FP8 frontier path. Precision, determinism, stress, and integration contracts are understood; no known blocker in the default path.
 >
@@ -155,24 +155,71 @@ Read these before changing the frontier:
 | 1 | `reports/sonic_moe_fp8_frontier_newcomer_guide.md` | Standalone training guide: basics, dataflow, symbols, roofline, precision, expert Q&A |
 | 2 | `reports/fresh_benchmark_ws1/README.md` + `sweep.json` + `mfu_model.json` | Latest 22-point performance sweep and fitted MFU model |
 | 3 | `reports/ernie_shape_ncu_s78b/README.md` | NCU full report and bottleneck reasoning for 6 GEMMs |
-| 4 | `reports/sonic_moe_comprehensive_analysis.md` | Broad analysis report and newcomer summary |
-| 5 | `sonicmoe/functional/__init__.py` | `_UpProjection` / `_DownProjection` orchestration and FP8 state transfer |
-| 6 | `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | zero-materialization SM100 specialization |
-| 7 | `sonicmoe/quack_utils/gemm_gated.py` | fused gated GEMM + epilogue blockscaled quant |
-| 8 | `sonicmoe/quack_utils/gemm_dgated.py` | FP8 C-load dGated backward |
-| 9 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | quant kernels, iso32, TMA reduce-add, FP8 GEMM wrappers |
-| 10 | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` | machine, proxy, ncu lock reset, profiling methodology |
+| 4 | `docs/gemm_dgated_fp8cload.md` | GemmDGatedFP8CLoad deep-dive: Int16 trick, dSwiGLU 9-SASS decomposition, FP8 blockscaled dequant, zero-materialization gather |
+| 5 | `docs/expert_interleave_weight_layout.md` | Expert Interleave 权重布局设计动机 — 5 层全栈收益分析 + 独创性论证 |
+| 6 | `reports/sonic_moe_comprehensive_analysis.md` | Broad analysis report and newcomer summary |
+| 7 | `sonicmoe/functional/__init__.py` | `_UpProjection` / `_DownProjection` orchestration and FP8 state transfer |
+| 8 | `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | zero-materialization SM100 specialization |
+| 9 | `sonicmoe/quack_utils/gemm_gated.py` | fused gated GEMM + epilogue blockscaled quant |
+| 10 | `sonicmoe/quack_utils/gemm_dgated.py` | FP8 C-load dGated backward |
+| 11 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | quant kernels, iso32, TMA reduce-add, FP8 GEMM wrappers |
+| 12 | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` | machine, proxy, ncu lock reset, profiling methodology |
 
 Historical but non-authoritative:
 
-- `reports/fp8_upgrade/engineering_log.md`: chronological lessons only. It now has a current-state correction block at the top.
+- `reports/fp8_upgrade/engineering_log.md`: chronological lessons only (Sessions 1–66). It has a current-state correction block at the top.
 - `reports/fp8_upgrade/HANDOFF.md`: stale historical reference.
 
 ---
 
-## 5. Most valuable formulas and mental models
+## 5. Deep technical insights (compacted from analysis sessions)
 
-### 5.1 MFU
+### 5.1 GemmDGatedFP8CLoad — the structural bottleneck
+
+`GemmDGatedFP8CLoadSm100ZeroMat` (file: `sonicmoe/quack_utils/gemm_dgated.py:510-708`) is the most complex kernel in the forward/backward pipeline. Its GEMM is only $2MHI$ (not $4MHI$) because the actual matmul is $\partial o \cdot W_2$ with output shape $(M, I)$. The remaining computation is fused in the epilogue:
+
+1. **FP8 C-Load via Int16 view trick**: The saved $z_{\text{fp8}}$ of shape $(M, 2I)$ is `view`ed as $(M, I)$ Int16. Each Int16 = `[z_g_fp8, z_u_fp8]` — two fp8 elements packed. This aligns C and D tile shapes for the CUTLASS epilogue framework without any framework changes.
+
+2. **Blockscaled FP8 dequant in-register**: UE8M0 scale bytes are left-shifted 23 bits and reinterpreted as f32 power-of-two values (`_i32_as_f32(Int32(scale) << 23)`). This avoids any int-to-float conversion — exploits IEEE 754 biased exponent encoding directly.
+
+3. **dSwiGLU fused at 9 SASS instructions per element pair**: `1 MUFU.TANH + 4 FMUL + 4 FMA` — algebraically minimal. The sigmoid is computed as `0.5 * tanh(0.5*x) + 0.5` via MUFU.TANH (¼ throughput of FMUL).
+
+4. **Dual TMA store**: Outputs $\partial z_g$ and $\partial z_u$ as two FP8 streams + a BF16 `swiglu_out` stream via separate TMA descriptors.
+
+**Why 168 regs/thread**: C-load smem layout + Int16 recast registers + dequant scale registers + dSwiGLU intermediates + dual TMA store coordinates. Block Limit = 1 (only 1 CTA per SM). No headroom for epilogue dz quant loops.
+
+**Key profiled metrics**: TC pipe busy ~42%, DRAM ~22.5%, L2 hit ~61%. This kernel is epilogue-bound, not compute-bound or memory-bound in isolation.
+
+### 5.2 Expert Interleave — system-level weight layout decision
+
+SonicMoE stores $W_1$ as `[gate_row_0, up_row_0, gate_row_1, up_row_1, ...]` (interleaved) instead of the standard split-half `[all gate rows, all up rows]`. This is NOT a single-kernel optimization — it's a full-stack architectural decision with 5 cascading benefits:
+
+1. **GEMM epilogue SwiGLU fusion** — gate/up pair lands in adjacent accumulator registers → no cross-tile access needed
+2. **FP8 Int16 view trick** — physically adjacent `z_g, z_u` bytes can be `view`ed as a single Int16 → enables the C-load mechanism
+3. **SwiGLU Triton kernel coalesced access** — stride-2 pattern hits same cacheline for both gate and up
+4. **Wgrad GEMM native output** — CUTLASS wgrad naturally outputs interleaved → zero mid-iteration transpose
+5. **FP8 blockscaled quantization symmetry** — each 32-element scale group mixes gate+up → error averaging
+
+The layout conversion to ERNIE's split-half happens **only at `node.step()` time**, amortized over `grad_acc_steps` microbatches. See `docs/expert_interleave_weight_layout.md` for full derivation.
+
+This design is enabled by self-authored CUTLASS-DSL GEMM kernels (QuACK) with programmable epilogues — frameworks using black-box GEMM libraries cannot realize these benefits.
+
+### 5.3 MFU gap decomposition (updated 2026-05-07)
+
+The newcomer guide Section 7 now contains the precise 6-GEMM FLOPs table and DGated real compute breakdown. Key insight: DGated's epilogue is only ~0.2% of its GEMM FLOPs, but causes ~15% TC pipe utilization loss because MUFU.TANH is ¼ throughput and 168 regs means no latency hiding.
+
+Full MFU gap (100% → 46.5%):
+- GEMM shape efficiency + varlen: ~46%
+- Epilogue pipeline stall (DGated): ~15%
+- Non-GEMM kernels: ~23%
+- Fixed overhead: ~8%
+- L2/DRAM contention: ~8%
+
+---
+
+## 6. Most valuable formulas and mental models
+
+### 6.1 MFU
 
 ```text
 F = 18 * TK * H * I
@@ -186,7 +233,7 @@ Ernie:
   MFU = 46.51%
 ```
 
-### 5.2 Empirical performance model
+### 6.2 Empirical performance model
 
 Fitted from multiple fresh sweep points, not one point:
 
@@ -211,7 +258,7 @@ Interpretation:
 - `a_expert` captures fragmentation and per-expert overhead as E increases.
 - Refit if any fusion/fission/communication overlap changes the system.
 
-### 5.3 iso32 precision risk
+### 6.3 iso32 precision risk
 
 ```text
 extra_bits_lost = log2(block_amax_32x32 / row_amax_1x32)
@@ -219,7 +266,7 @@ extra_bits_lost = log2(block_amax_32x32 / row_amax_1x32)
 
 If p95 exceeds ~1.5 bits or max exceeds ~2.5 bits, consider fallback to 1x32 dual quant for that tensor/expert/step. Thresholds need training calibration; this is a guardrail, not a theorem.
 
-### 5.4 Fusion vs fission
+### 6.4 Fusion vs fission
 
 Fuse when:
 
@@ -241,7 +288,7 @@ Current application: `GemmDGatedFP8CLoadSm100ZeroMat` is a fission candidate bec
 
 ---
 
-## 6. Lessons learned / pitfalls
+## 7. Lessons learned / pitfalls
 
 1. **Do not claim “FP8 is 2x faster.”** Current fair in-repo speedup at Ernie shape is 1.11x vs QuACK BF16; historical 1.37x is vs an older cuBLAS/PyTorch BF16 baseline.
 2. **Do not try to directly add dz quant loops to GemmDGated epilogue.** NCU shows 168 regs/thread × 384 threads = 64512/65536 regs, leaving effectively no register headroom.
@@ -256,28 +303,33 @@ Current application: `GemmDGatedFP8CLoadSm100ZeroMat` is a fission candidate bec
 
 ---
 
-## 7. Next plan
+## 8. Next plan
 
-### P0 — dgrad1 structural optimization
+### P0 — dgrad1 structural optimization (GemmDGatedFP8CLoad)
 
-Target: `GemmDGatedFP8CLoadSm100ZeroMat`.
+Target: `GemmDGatedFP8CLoadSm100ZeroMat` — the worst per-FLOP kernel (42% TC pipe).
 
 Facts:
 
-- 168 regs/thread, near register cliff.
-- Tensor pipe ~42%, L2 hit ~61%.
-- Direct dz quant epilogue fusion is not viable in current shape.
+- 168 regs/thread, near register cliff. Block Limit = 1.
+- Tensor pipe ~42%, L2 hit ~61%, DRAM ~22.5%.
+- Direct dz quant epilogue fusion is NOT viable (zero register headroom).
+- The MFU loss from this kernel’s epilogue stall is ~15% of total gap.
+- MUFU.TANH (sigmoid) is the SFU bottleneck: ¼ throughput of FMUL.
 
-Promising directions:
+Promising directions (ranked by expected ROI):
 
-1. shorten live ranges in FP8 C-load + dSwiGLU epilogue;
-2. split `ds` reduction out if it materially contributes to register pressure;
-3. fission main GEMM and dSwiGLU/quant/reduce if occupancy gain exceeds HBM/grid-sync cost;
-4. test C-load/L2 locality scheduling without changing numerical semantics.
+1. **Live-range shortening in FP8 C-load + dSwiGLU epilogue** — the Int16 recast path holds `tRS_rXY_f32x2` and dequant scales across the full epilogue iteration. If scale reuse or register aliasing can free 4-8 regs, occupancy may jump to Block Limit = 2.
+2. **Fission: split GEMM mainloop from dSwiGLU+store** — GEMM alone would be ~56 regs, full occupancy. dSwiGLU+store as a separate small kernel reading accumulator from smem/L2. Trade: +1 kernel launch + accumulator spill to smem (~12 MiB per tile). Needs careful modeling.
+3. **C-load scheduling: prefetch scales while GEMM tiles still running** — overlap scale TMA with mainloop; currently scales are loaded only in `epi_visit_subtile`.
+4. **Sigmoid approximation** — replace MUFU.TANH with polynomial approximation using FMUL/FMA (4× throughput). Risk: precision regression in dSwiGLU chain.
 
 ### P1 — Training-side persistent pipeline research
 
-Inference communication+expert-compute megakernels do not directly transfer to training because training has activation lifetimes, wgrad, router score grad, `main_grad` layout, and deterministic accumulation. A realistic future path is a stage-wise persistent pipeline, not a single full-layer fwd+bwd megakernel.
+Inference megakernels don’t transfer to training. A realistic path:
+
+- Stage-wise persistent pipeline (fwd1 → fwd2 → dgrad1 → dgrad2) with producer-consumer via smem/L2 — not a single-kernel solution, but a multi-kernel persistent occupancy scheme.
+- Pre-requisite: dgrad1 occupancy improvement (P0) so it can share SMs with other kernels.
 
 ### P2 — Monitoring and safeguards
 
@@ -285,15 +337,16 @@ Inference communication+expert-compute megakernels do not directly transfer to t
 - Keep frontier determinism hard-gated.
 - Add tests around `node.step()` ordering / repeated accumulation / cache invalidation.
 
-### P3 — Documentation and onboarding
+### P3 — Documentation maintenance
 
-- Keep `reports/sonic_moe_fp8_frontier_newcomer_guide.md` as the newcomer source.
-- Keep README’s quick facts aligned with this handoff.
+- Keep `reports/sonic_moe_fp8_frontier_newcomer_guide.md` as the newcomer source (updated Section 7: MFU).
+- Keep `docs/gemm_dgated_fp8cload.md` and `docs/expert_interleave_weight_layout.md` for deep technical reference.
+- Keep README aligned with this handoff.
 - Treat `engineering_log.md` as history only.
 
 ---
 
-## 8. Validation commands for the next agent
+## 9. Validation commands for the next agent
 
 ```bash
 source .runenv.sh
