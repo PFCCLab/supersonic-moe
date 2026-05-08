@@ -20,7 +20,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _BENCH = os.path.join(_REPO, "tests", "ops", "bench_mlpnode_topk_nsys.py")
 _OUTPUT_DIR = os.path.join(_REPO, "reports", "fresh_benchmark_ws1")
-_NSYS = "/opt/nvidia/nsight-compute/2025.3.1/host/target-linux-x64/nsys"
+_NSYS = "/usr/local/bin/nsys"
 _PYTHON = sys.executable
 
 PEAK_TFLOPS = 4500.0  # Target GPU FP8 boost-clock empirical peak

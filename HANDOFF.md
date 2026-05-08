@@ -35,10 +35,10 @@ Hardware/method: Target GPU SM100 (`SM100`, 148 SMs, HBM3e), nsys GPU-projection
 
 Baseline caveat:
 
-- **FP8 full vs FP8-no-wgrad**: Ernie shape is `2659.8 µs` (full FP8 wgrad) vs `2942.5 µs` (BF16 wgrad only) = **1.11x**. This comparison measures the wgrad FP8 benefit only — both configurations use FP8 for fwd up-proj and bwd DGated because `SonicMoEMlpNode` forces FP8 mode.
-- **True BF16 baseline**: `SonicMoEMlpNode` has no true BF16 path — the node architecture requires FP8 for its gather-GEMM fusion + wgrad accumulator design. A true BF16 comparison requires the raw `MoE` class or the official SonicMoE (non-Paddle) API.
-- **FP8 vs historical S53 cuBLAS/PyTorch BF16**: Ernie shape was `3644 µs` vs `2659.8 µs` = **~1.37x**. Do not mix this with the MlpNode "bf16" mode.
-- **Small batches**: FP8 is slower at `T=1024/2048` because quant/scale/metadata overhead is not amortized. Crossover is around `T=3000-4000`.
+- **FP8 vs true BF16**: Ernie shape is `2659.8 µs` (FP8 frontier) vs `4428 µs` (true BF16, CuTe DSL GemmGatedSm100 + GemmDGatedSm100, zero FP8 kernels) = **1.67x speedup**.
+- **True BF16 baseline**: `SonicMoEMlpNode` now supports BF16 when `SONIC_MOE_FP8_MODE=""`. The BF16 path uses CuTe DSL BF16 GEMMs with the same zero-materialization, varlen, and wgrad accumulator infrastructure — just without quantization.
+- **vs S53 cuBLAS BF16**: Session 53's official PyTorch cuBLAS baseline was `3644 µs`. Our CuTe DSL BF16 is `4428 µs` (~21% slower, likely due to Paddle proxy overhead and less-optimized BF16 variant of the gated kernel).
+- **Small batches**: FP8 crossover is around `T=3000-4000`.
 
 ### 2.2 Kernel breakdown at Ernie shape
 
