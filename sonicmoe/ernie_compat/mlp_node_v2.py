@@ -728,12 +728,27 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
     ) -> torch.Tensor:
+        # ── Determine FP8 vs BF16 mode ──────────────────────────────────
+        # Respect the global FP8 mode setting. When SONIC_MOE_FP8_MODE is unset
+        # or empty, ideally run a true BF16 path. However the BF16 GEMM path
+        # with gather_A + varlen has compatibility gaps on SM100 (untested for
+        # the node's weight layout). Fall back to FP8 with a warning.
+        from sonicmoe.functional.utils import is_fp8_active
+        use_fp8 = is_fp8_active()
+        if not use_fp8:
+            import warnings
+            warnings.warn(
+                "SonicMoEMlpNode: SONIC_MOE_FP8_MODE is not set to 'perf'/'mem'. "
+                "Forcing FP8 mode because the BF16 varlen+gather path is not yet "
+                "validated for SM100 node integration. Set SONIC_MOE_FP8_MODE=perf "
+                "for production, or use the raw functional API for true BF16 baselines.",
+                stacklevel=3,
+            )
+            use_fp8 = True
+
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
-        with enable_fp8(True):
-            # Refresh FP8 config inside the enable_fp8(True) block so the
-            # snapshot sees ``_IS_FP8_ACTIVE=True`` regardless of the global
-            # state any prior caller / test may have left behind.
+        with enable_fp8(use_fp8):
             _refresh_fp8_config()
             y1, z = _UpProjection.forward(
                 up_ctx,
@@ -749,7 +764,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
 
         # ── DownProjection forward (via FakeCtx) ─────────────────────────
         down_ctx = _FakeCtx()
-        with enable_fp8(True):
+        with enable_fp8(use_fp8):
             out = _DownProjection.forward(
                 down_ctx,
                 y1, z, w2, None,                # y1, z, w2, b2
@@ -800,14 +815,14 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         dx = up_grads[0]
         dw1 = up_grads[1]
 
-        # FP8 wgrad accumulator path MUST write into the native view directly
-        # and return None — ``SonicMoEMlpNode`` always runs in
-        # ``enable_fp8(True)``, so the BF16 fallback (which would return
-        # non-None tensors) is unreachable.
+        # Wgrad accumulator path writes directly into _w{1,2}_native_view and
+        # returns None for dw. SonicMoEMlpNode currently forces FP8 mode (with
+        # warning when env says BF16), so the BF16 no-accumulator fallback
+        # (which would return non-None dw) is unreachable.
         assert dw1 is None, (
-            "Unexpected non-None dw1 in SonicMoEMlpNode backward — the FP8 "
-            "wgrad accumulator must write into _w1_native_view directly. "
-            "If this fires, the BF16 fallback was hit unexpectedly."
+            "Unexpected non-None dw1 in SonicMoEMlpNode backward — the wgrad "
+            "accumulator must write into _w1_native_view directly. "
+            "If this fires, the node entered the BF16 no-accumulator fallback."
         )
         assert dw2 is None, (
             "Unexpected non-None dw2 in SonicMoEMlpNode backward — see dw1."

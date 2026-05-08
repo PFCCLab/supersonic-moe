@@ -867,6 +867,24 @@ predicted      ≈ 2668 µs
 measured       ≈ 2660 µs
 ```
 
+由拟合 $\hat{t}_{\mu s}$ 反推 MFU：
+
+$$
+\widehat{\text{MFU}} = \frac{F_{\text{model}}}{\hat{t}_{\mu s} \times 10^{-6} \times \Pi_{\text{peak}}} = \frac{18 \cdot TK \cdot H \cdot I}{\hat{t}_{\mu s} \cdot \Pi_{\text{TFLOPS}} \cdot 10^{6}}
+$$
+
+其中 $\hat{t}_{\mu s}$ 为上式预测的 `busy_us`（µs），$\Pi_{\text{TFLOPS}}$ 为 FP8 峰值算力（TFLOPS，当前取 4500）。代入 Ernie 验证：
+
+$$
+\widehat{\text{MFU}} = \frac{5.566 \times 10^{12}}{2668 \times 4500 \times 10^{6}} = 46.3\% \quad (\text{实测 } 46.5\%)
+$$
+
+渐近 MFU（$TK \to \infty$，固定项可忽略）：
+
+$$
+\text{MFU}_{\infty} = \frac{1}{\frac{1}{\eta_{\max}} + \frac{\Pi \cdot a_q \cdot \max(H,2I)}{18 \cdot H \cdot I} + \frac{\Pi \cdot a_e \cdot E}{18 \cdot H \cdot I}} \approx 48.2\%
+$$
+
 解释限制：
 
 1. 不要把 `t_quant_term=10µs` 误解成“量化 kernel 只花 10µs”。nsys breakdown 中 quant kernels 合计数百微秒。

@@ -40,10 +40,14 @@ for i, arg in enumerate(sys.argv):
         _mode = sys.argv[i + 1]
 
 if _mode == "bf16":
-    # BF16 baseline: completely disable FP8
+    # NOTE: SonicMoEMlpNode always forces FP8 for fwd/bwd GEMMs (by design —
+    # the node's wgrad accumulation mechanism requires FP8 native layout).
+    # Setting SONIC_MOE_FP8_WGRAD=0 disables ONLY the FP8 wgrad path.
+    # What this actually measures: FP8 forward + FP8 DGated backward + BF16 wgrad.
+    # For a true BF16 baseline, use the raw MoE / functional API, not MlpNode.
     os.environ["SONIC_MOE_FP8_MODE"] = ""
     os.environ["SONIC_MOE_FP8_WGRAD"] = "0"
-    os.environ.setdefault("USE_QUACK_GEMM", "1")  # QuACK still needed for CuTe BF16 GEMMs
+    os.environ.setdefault("USE_QUACK_GEMM", "1")
     os.environ.pop("SONIC_MOE_FP8_ASSUME_ALIGNED", None)
 else:
     # FP8 frontier
