@@ -217,8 +217,13 @@ def _differentiable_router_scores(
         )
         gather_idx = built
 
+    if isinstance(dispatched_probs.size, int):
+        dispatched_probs_numel = torch.to_tensor(dispatched_probs.size, place="cpu")
+    else:
+        dispatched_probs_numel = dispatched_probs.numel()
+
     gathered = _GatherRouterScores.apply(
-        dispatched_probs.reshape(-1), gather_idx, dispatched_probs.numel()
+        dispatched_probs.reshape(-1), gather_idx, dispatched_probs_numel
     )  # [TK]
 
     if TK_padded > TK:

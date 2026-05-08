@@ -338,7 +338,7 @@ def _copy_tpe_h2d_async(tpe_list, device):
 
     nbytes = (cpu_tensor.nbytes
               if hasattr(cpu_tensor, "nbytes")
-              else cpu_tensor.numel() * cpu_tensor.element_size())
+              else cpu_tensor.size * cpu_tensor.itemsize)
     raw_stream = (current_stream.stream_base.cuda_stream
                   if hasattr(current_stream, "stream_base")
                   else current_stream.cuda_stream)
