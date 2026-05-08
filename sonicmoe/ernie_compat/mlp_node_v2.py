@@ -729,22 +729,13 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         stream_id: int = 0,
     ) -> torch.Tensor:
         # ── Determine FP8 vs BF16 mode ──────────────────────────────────
-        # Respect the global FP8 mode setting. When SONIC_MOE_FP8_MODE is unset
-        # or empty, ideally run a true BF16 path. However the BF16 GEMM path
-        # with gather_A + varlen has compatibility gaps on SM100 (untested for
-        # the node's weight layout). Fall back to FP8 with a warning.
+        # Respect the global FP8 mode setting:
+        #   SONIC_MOE_FP8_MODE=perf/mem → FP8 frontier path
+        #   SONIC_MOE_FP8_MODE="" or unset → true BF16 path (CuTe DSL BF16 GEMMs)
+        # The BF16 path uses the same zero-materialization, varlen, and wgrad
+        # accumulator infrastructure — just without FP8 quantization.
         from sonicmoe.functional.utils import is_fp8_active
         use_fp8 = is_fp8_active()
-        if not use_fp8:
-            import warnings
-            warnings.warn(
-                "SonicMoEMlpNode: SONIC_MOE_FP8_MODE is not set to 'perf'/'mem'. "
-                "Forcing FP8 mode because the BF16 varlen+gather path is not yet "
-                "validated for SM100 node integration. Set SONIC_MOE_FP8_MODE=perf "
-                "for production, or use the raw functional API for true BF16 baselines.",
-                stacklevel=3,
-            )
-            use_fp8 = True
 
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
