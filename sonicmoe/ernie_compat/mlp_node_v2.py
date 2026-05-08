@@ -217,6 +217,9 @@ def _differentiable_router_scores(
         )
         gather_idx = built
 
+    # CRITICAL: avoid dispatched_probs.numel() — triggers cudaMemcpy D2H sync
+    # under Paddle proxy. Use .size (int property) directly. See PR#22.
+    # Gated by tests/test_no_memcpy_sync.py.
     if isinstance(dispatched_probs.size, int):
         dispatched_probs_numel = torch.to_tensor(dispatched_probs.size, place="cpu")
     else:

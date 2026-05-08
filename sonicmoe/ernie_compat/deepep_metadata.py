@@ -336,6 +336,9 @@ def _copy_tpe_h2d_async(tpe_list, device):
     gpu_tensor = torch.empty_like(cpu_tensor, device=device)
     current_stream = torch.cuda.current_stream(device)
 
+    # CRITICAL: .size * .itemsize — NOT .numel() * .element_size()
+    # The latter triggers cudaMemcpy D2H (GPU stream sync) under Paddle proxy.
+    # Gated by tests/test_no_memcpy_sync.py. See PR#22.
     nbytes = (cpu_tensor.nbytes
               if hasattr(cpu_tensor, "nbytes")
               else cpu_tensor.size * cpu_tensor.itemsize)

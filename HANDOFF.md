@@ -300,6 +300,7 @@ Current application: `GemmDGatedFP8CLoadSm100ZeroMat` is a fission candidate bec
 8. **nsys and ncu answer different questions.** End-to-end busy/MFU uses nsys GPU-projection; kernel resource bottlenecks use ncu SoL/register/L2/DRAM. Do not compare their durations directly unless clock/replay policy matches.
 9. **`node.step()` order is non-negotiable.** It must precede `optimizer.step()`.
 10. **Use whitelisted env for paddlejob launch.** Denylist cleanup is unsafe; cluster env vars can silently force multi-node rendezvous.
+11. **Never use `.numel()` or `.element_size()` in hot-path Paddle proxy code.** These trigger implicit cudaMemcpy D2H (GPU stream sync). Use `.size` (int property) and `.itemsize` instead. Gated by `tests/test_no_memcpy_sync.py`. See PR#22.
 
 ---
 

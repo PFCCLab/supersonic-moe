@@ -30,5 +30,11 @@ echo ""
 echo "--- fp8_frontier_determinism_test.py (2 tests, HARD-fail on non-determinism) ---"
 USE_QUACK_GEMM=1 python -m pytest tests/fp8_frontier_determinism_test.py -v --tb=short 2>&1
 
+# Synchronized memcpy guard — HARD failure. Any implicit GPU sync in the
+# metadata/routing hot path is a latency regression. See PR#22 (lshpku).
+echo ""
+echo "--- test_no_memcpy_sync.py (3 tests, HARD-fail on implicit sync) ---"
+USE_QUACK_GEMM=1 python -m pytest tests/test_no_memcpy_sync.py -v --tb=short 2>&1
+
 echo ""
 echo "=== Regression complete ==="
