@@ -598,7 +598,7 @@ def _use_fused_blockscaled_gated() -> bool:
     When enabled, the blockscaled FP8 path uses fused gemm_gated/gemm_dgated
     (single CUTLASS kernel: GEMM + SwiGLU + blockscaled descale) instead of
     separate blockscaled_fp8_gemm_varlen + standalone SwiGLU.  This is the
-    best-performing FP8 up-proj path on Blackwell and is enabled by default.
+    best-performing FP8 up-proj path on SM100 and is enabled by default.
     """
     from ..config import get_active_config
     cfg = get_active_config()
@@ -834,7 +834,7 @@ def _refresh_fp8_config() -> _FP8Config:
 
 
 def _get_blockscaled_protocol() -> FP8Protocol:
-    """Return FP8Protocol with 1×32 blockscaling for Blackwell hardware-native descaling."""
+    """Return FP8Protocol with 1×32 blockscaling for SM100 hardware-native descaling."""
     return FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
 
 

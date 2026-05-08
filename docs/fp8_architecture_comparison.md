@@ -95,7 +95,7 @@ x(BF16, T×H) ─→ Router → TopK → gather metadata
 
 ### 3.1 GEMM Precision vs. Throughput
 
-| 路径 | Mainloop Precision | Epilogue | TFLOPS (B200理论) |
+| 路径 | Mainloop Precision | Epilogue | TFLOPS (Target GPU理论) |
 |------|-------------------|----------|-------------------|
 | DeepEP | FP8 E4M3×E4M3→FP32 | BF16 store | ~4500 (blockscaled) |
 | SonicMoE BF16 | BF16×BF16→FP32 | BF16 store + SwiGLU | ~2250 |
@@ -146,7 +146,7 @@ x(BF16, T×H) ─→ Router → TopK → gather metadata
 | 维度 | DeepEP | SonicMoE FP8 Frontier |
 |------|--------|----------------------|
 | **Scale 算法** | `ComputeScaleImpl<Power2Scaling>` + ε=1e-4 | integer+carry E8M0 (与Paddle/Triton bit-exact) |
-| **Scale 格式** | UE8M0 (pow2 scale) on Blackwell | UE8M0 ISA-packed |
+| **Scale 格式** | UE8M0 (pow2 scale) on SM100 | UE8M0 ISA-packed |
 | **量化粒度** | 1×128 blockscaled | 1×32 blockscaled (hardware-native) |
 | **Epilogue 融合** | 无（quant在kernel外） | 有但当前 disabled（研发中） |
 | **精度验证** | 训练 loss 对齐 | per-tensor RRMSE < 2.4%, cosine > 0.999 |

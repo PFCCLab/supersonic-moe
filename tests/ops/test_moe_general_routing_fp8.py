@@ -1,7 +1,7 @@
 """FP8 frontier unit-test for moe_general_routing_inputs.
 
 Entry point: moe_general_routing_inputs  (user-controlled routing)
-FP8 backend: GemmGatedSm100ZeroMat + quackgemm_default (SM100 / Blackwell)
+FP8 backend: GemmGatedSm100ZeroMat + quackgemm_default (SM100)
 
 Usage
 -----

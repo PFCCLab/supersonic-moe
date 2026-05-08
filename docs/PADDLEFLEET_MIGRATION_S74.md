@@ -536,7 +536,7 @@ actuals). For PaddleFleet:
 
 ## 8. Validation snapshot accompanying this doc
 
-Captured on B30Z, paddlejob shared GPFS host, post-S77 commit `7660ade`:
+Captured on Target GPU, paddlejob shared GPFS host, post-S77 commit `7660ade`:
 
 | Suite                                      | Result               |
 | ------------------------------------------ | -------------------- |

@@ -23,7 +23,7 @@ _OUTPUT_DIR = os.path.join(_REPO, "reports", "fresh_benchmark_ws1")
 _NSYS = "/opt/nvidia/nsight-compute/2025.3.1/host/target-linux-x64/nsys"
 _PYTHON = sys.executable
 
-PEAK_TFLOPS = 4500.0  # B30Z FP8 boost-clock empirical peak
+PEAK_TFLOPS = 4500.0  # Target GPU FP8 boost-clock empirical peak
 PEAK_BF16_TFLOPS = 2250.0  # BF16 = FP8/2
 
 SHAPES = [

@@ -3,7 +3,7 @@
 > **日期**: 2026-04-08 (Session 40)
 > **分支**: `native-fp8-exploration`
 > **Shape**: Ernie — T=8192, H=3072, I=1536, E=8, K=8 (TK=65536)
-> **GPU**: B200 (SM 10.0, 148 SMs, HBM3e)
+> **GPU**: Target GPU (SM 10.0, 148 SMs, HBM3e)
 > **测量节点**: tjzj-inf-sci-k8s-bzz2-0274 (7 idle GPUs, 验证 0% 利用率, <5 MiB VRAM)
 > **方法论**: nsys GPU Projection (NVTX scoped), 5 warmup + 10 profiled iterations, 子进程隔离
 
@@ -190,5 +190,5 @@ python tools/cluster_idle_launch.py scan
 
 ---
 
-> 报告基于 B200 (SM 10.0) idle 节点实测数据。所有 nsys 数据存于 `benchmarks/nsys_clean/`。
+> 报告基于 Target GPU (SM 10.0) idle 节点实测数据。所有 nsys 数据存于 `benchmarks/nsys_clean/`。
 > 复现方式请以 `docs/HANDOFF.md` 中的当前复现说明为准；本目录下 handoff 仅作历史参考。

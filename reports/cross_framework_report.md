@@ -1,6 +1,6 @@
 # Cross-Framework MoE Benchmark Report (4-Way)
 
-Generated: 2026-04-16 10:47:46  |  GPU: NVIDIA B30Z (Blackwell)  |  Seeds: [42, 123, 777]
+Generated: 2026-04-16 10:47:46  |  GPU: NVIDIA Target GPU (SM100)  |  Seeds: [42, 123, 777]
 nsys: 5 warmup + 20 measured × 3 repeats (median)
 
 ## 1. Experimental Setup
@@ -75,7 +75,7 @@ All 4 paths: **forward + backward** (permute → expert fwd → unpermute → ex
 
 ## 5. Theoretical Analysis
 
-### Roofline Model (B30Z)
+### Roofline Model (Target GPU)
 
 - BF16 tensor-core peak: 2250 TFLOPS
 - FP8 tensor-core peak: 4500 TFLOPS

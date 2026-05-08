@@ -25,7 +25,7 @@ class BlackwellMoETest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
 

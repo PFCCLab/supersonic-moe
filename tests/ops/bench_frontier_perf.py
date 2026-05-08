@@ -41,7 +41,7 @@ for _p in (_QUACK, _REPO):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-# Session 53 baseline from README.md (nsys GPU-projection, B30Z)
+# Session 53 baseline from README.md (nsys GPU-projection, Target GPU)
 BASELINE = {
     # (T, E, I): (bf16_us, fp8_us, speedup)
     (8192, 8, 1536): (3644, 2715, 1.34),

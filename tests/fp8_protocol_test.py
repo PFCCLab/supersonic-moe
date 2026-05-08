@@ -93,7 +93,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -128,7 +128,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -155,7 +155,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -182,7 +182,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -221,7 +221,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -262,7 +262,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -295,7 +295,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -328,7 +328,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -357,7 +357,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -386,7 +386,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -426,7 +426,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         protocol = get_default_fp8_protocol()
         a = torch.randn(129, 256, device="cuda", dtype=torch.bfloat16)
@@ -450,7 +450,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -473,7 +473,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -500,7 +500,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -531,7 +531,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -572,7 +572,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         moe = MoE(
@@ -621,7 +621,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         a = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
@@ -655,7 +655,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         moe = MoE(
@@ -696,7 +696,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -758,7 +758,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()
@@ -779,7 +779,7 @@ class FP8ProtocolTest(TestCommons):
 
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
         self.set_seed(_SEED)
         protocol = get_default_fp8_protocol()

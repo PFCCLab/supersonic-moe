@@ -43,7 +43,7 @@
 | `parse_nsys_per_iter.py` | Parse nsys sqlite, compute per-iter GPU-projection µs for each BENCH range. | — |
 | `rigorous_benchmark_s42.py` | Rigorous benchmark: 3 modes × 3 seeds × 3 repeats, subprocess-isolated. | — |
 | `rigorous_profiler.py` | Rigorous GPU-projection kernel profiling + fine-grained memory lifecycle. | — |
-| `run_blackwell_test_shards.py` | Developer utility for run blackwell test shards. | — |
+| `run_sm100_test_shards.py` | Developer utility for run sm100 test shards. | — |
 | `run_frontier_perf_sweep.py` | Sweep nsys profiles for SonicMoE FP8 frontier MlpNode (Paddle compat path). | — |
 | `run_regression.sh` | Shell helper for run regression. | — |
 | `scoreboard.py` | SonicMoE Buffer Scoreboard — Operator-buffer dependency & phase-state analysis. | — |

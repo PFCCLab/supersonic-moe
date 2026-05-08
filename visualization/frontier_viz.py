@@ -57,7 +57,7 @@ C_GEMM      = "#2563EB"
 CMAP_SPEEDUP = "RdYlGn"
 CMAP_MEMORY  = "RdYlBu_r"
 
-_HW = "Blackwell B30Z  ·  PyTorch 2.11  ·  QuACK 0.3.7"
+_HW = "SM100 Target GPU  ·  PyTorch 2.11  ·  QuACK 0.3.7"
 
 # ── Canonical axis orderings ──────────────────────────────────────────────────
 T_VALS = [8192, 16384, 32768]

@@ -21,7 +21,7 @@ def _has_quack() -> bool:
 
 
 requires_blackwell = pytest.mark.skipif(
-    not _has_blackwell(), reason="Requires Blackwell GPU (SM100+)"
+    not _has_blackwell(), reason="Requires SM100+ GPU (SM100+)"
 )
 requires_quack = pytest.mark.skipif(
     not _has_quack(), reason="Requires USE_QUACK_GEMM=1"

@@ -12,7 +12,7 @@
 
 ## 1. Project state in one paragraph
 
-SonicMoE is a Blackwell/Hopper Mixture-of-Experts expert-MLP engine. The active production path on Blackwell uses DeepEP topk metadata, route-level padding, blockscaled FP8 E4M3 + UE8M0 scales, CuTe/CUTLASS/QuACK GEMMs, zero-materialization `A_idx` gather, fused gated up-projection (`GEMM + SwiGLU + z FP8 epilogue quant`), FP8 down-projection, FP8-C-load `GemmDGated` backward, iso32 dz dual quant, and TMA reduce-add wgrad directly into ERNIE/Paddle `main_grad`. The Paddle integration entrypoint is `sonicmoe.ernie_compat.SonicMoEMlpNode`; `node.step()` must run before `optimizer.step()` to flush native CUTLASS wgrad layout into ERNIE layout.
+SonicMoE is a SM100/Hopper Mixture-of-Experts expert-MLP engine. The active production path on SM100 uses DeepEP topk metadata, route-level padding, blockscaled FP8 E4M3 + UE8M0 scales, CuTe/CUTLASS/QuACK GEMMs, zero-materialization `A_idx` gather, fused gated up-projection (`GEMM + SwiGLU + z FP8 epilogue quant`), FP8 down-projection, FP8-C-load `GemmDGated` backward, iso32 dz dual quant, and TMA reduce-add wgrad directly into ERNIE/Paddle `main_grad`. The Paddle integration entrypoint is `sonicmoe.ernie_compat.SonicMoEMlpNode`; `node.step()` must run before `optimizer.step()` to flush native CUTLASS wgrad layout into ERNIE layout.
 
 ---
 
@@ -20,7 +20,7 @@ SonicMoE is a Blackwell/Hopper Mixture-of-Experts expert-MLP engine. The active 
 
 ### 2.1 Latest single-GPU training performance
 
-Hardware/method: B30Z Blackwell (`sm_103`, 148 SMs, HBM3e), nsys GPU-projection over BENCH NVTX range, `USE_QUACK_GEMM=1`, `SONIC_MOE_FP8_MODE=perf`, `SONIC_MOE_FP8_WGRAD=1`.
+Hardware/method: Target GPU SM100 (`SM100`, 148 SMs, HBM3e), nsys GPU-projection over BENCH NVTX range, `USE_QUACK_GEMM=1`, `SONIC_MOE_FP8_MODE=perf`, `SONIC_MOE_FP8_WGRAD=1`.
 
 | Shape | FP8 busy | MFU vs 4500 TFLOPS | TFLOPS | Source |
 |---|---:|---:|---:|---|

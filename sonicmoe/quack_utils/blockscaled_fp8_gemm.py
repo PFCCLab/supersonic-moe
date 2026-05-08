@@ -2834,7 +2834,7 @@ def blockscaled_fp8_gemm_grouped(
 ) -> torch.Tensor:
     protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), a.device, quack_enabled=True)
     if get_device_capacity(a.device)[0] != 10:
-        raise RuntimeError("blockscaled_fp8_gemm currently supports Blackwell only")
+        raise RuntimeError("blockscaled_fp8_gemm currently supports SM100+ only")
 
     if a.ndim != 2:
         raise ValueError(f"expected activation to be 2D, got shape {tuple(a.shape)}")
@@ -4413,7 +4413,7 @@ def blockscaled_fp8_gemm_varlen(
     # --- Full validation path (legacy / first few iterations) ---
     device = a.device
     if get_device_capacity(device)[0] != 10:
-        raise RuntimeError("blockscaled_fp8_gemm_varlen requires Blackwell (sm_100)")
+        raise RuntimeError("blockscaled_fp8_gemm_varlen requires SM100+")
 
     if a.ndim != 2:
         raise ValueError(f"expected activation 2D, got {tuple(a.shape)}")
@@ -4747,7 +4747,7 @@ def blockscaled_fp8_weight_grad_gemm(
     """
     device = a_flat.device
     if get_device_capacity(device)[0] != 10:
-        raise RuntimeError("blockscaled_fp8_weight_grad_gemm requires Blackwell (sm_100)")
+        raise RuntimeError("blockscaled_fp8_weight_grad_gemm requires SM100+")
     if a_flat.ndim != 2 or b_flat.ndim != 2:
         raise ValueError(
             f"expected 2D operands, got a={tuple(a_flat.shape)}, b={tuple(b_flat.shape)}"
@@ -4958,7 +4958,7 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     """
     device = a_flat.device
     if get_device_capacity(device)[0] != 10:
-        raise RuntimeError("blockscaled_fp8_weight_grad_gemm_fast requires Blackwell (sm_100)")
+        raise RuntimeError("blockscaled_fp8_weight_grad_gemm_fast requires SM100+")
     if a_flat.ndim != 2 or b_flat.ndim != 2:
         raise ValueError(f"expected 2D operands, got a={tuple(a_flat.shape)}, b={tuple(b_flat.shape)}")
 

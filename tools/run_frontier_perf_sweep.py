@@ -51,7 +51,7 @@ SHAPES: list[Shape] = [
     Shape("baseline_T8K_E8",     8192,  8, 1536, 8, "none",    s53_bf16=3644, s53_fp8=2715, notes="S53 anchor"),
     # ERNIE production EP=32 shape (HANDOFF Session 65).
     Shape("ernie_T8K_E32",       8192, 32, 1536, 8, "none",                                  notes="ERNIE EP=32"),
-    # Large-N: stress B30Z / activates many wgrad blocks (was the bug-class regime).
+    # Large-N: stress Target GPU / activates many wgrad blocks (was the bug-class regime).
     Shape("large_T16K_E8",      16384,  8, 1536, 8, "none",    s53_bf16=7953, s53_fp8=5227, notes="2× tokens"),
     Shape("large_T16K_E32",     16384, 32, 1536, 8, "none",                                  notes="2× tokens, EP=32"),
     # Tiny / edge — quant overhead dominated.

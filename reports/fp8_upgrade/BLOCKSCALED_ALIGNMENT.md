@@ -2,7 +2,7 @@
 
 ## Summary
 
-Blockscaled FP8 on Blackwell requires each expert's M-dimension segment to be a multiple of **128**. This is a **hardware ISA constraint** from `tcgen05.mma` scale-factor atom layout, not a software choice.
+Blockscaled FP8 on SM100 requires each expert's M-dimension segment to be a multiple of **128**. This is a **hardware ISA constraint** from `tcgen05.mma` scale-factor atom layout, not a software choice.
 
 **Token rounding routing** (SonicMoE paper Section 5, Algorithm 4) guarantees 128-aligned segments in production. The padding fallback in `blockscaled_fp8_gemm_varlen` is a safety net for vanilla top-K and tests.
 

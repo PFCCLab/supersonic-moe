@@ -1,7 +1,7 @@
 """sgl-kernel MXFP8 blockscaled grouped GEMM for varlen MoE.
 
 Uses ``es_sm100_mxfp8_blockscaled_grouped_mm`` from sgl-kernel for
-hardware-native MXFP8 blockscaled GEMM on Blackwell SM100 GPUs.
+hardware-native MXFP8 blockscaled GEMM on SM100 GPUs.
 
 Scale layout
 ------------

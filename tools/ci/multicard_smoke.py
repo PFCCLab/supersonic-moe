@@ -168,7 +168,7 @@ def main() -> int:
         if any(k.startswith(p) for p in KEEP_PREFIXES) and k not in DROP_NCCL:
             env[k] = v
     env["CUDA_VISIBLE_DEVICES"] = "0,1"
-    # Triton's bundled ptxas does not know about Blackwell sm_103a; prefer the
+    # Triton's bundled ptxas does not know about SM100 sm_103a; prefer the
     # system CUDA 13 ptxas if available so JIT compilation works on B200/RTX
     # PRO 6000 hosts.
     if "TRITON_PTXAS_PATH" not in env:

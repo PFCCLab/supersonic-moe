@@ -9,7 +9,7 @@
 - **8 PRs merged into upstream `PFCCLab/supersonic-moe`** (PR #10–#18, modulo #14 which is an external contributor).
 - **43 commits** authored on the fork (myrepo), **260 files touched**, **+19 029 / −4 696 LOC** net.
 - **4 additional commits** queued on `race-fix-paddle` post-PR-#18 (S79 + S79b: determinism CI, MFU sweep tooling, hardware-identity audit) — pushed to fork, not yet PR'd to upstream.
-- Headline outcomes: FP8 frontier reached **~45 % MFU at Ernie production shape (T8192/E8/K8) ≈ 2 020 TFLOPS achieved on B30Z**, bit-exact deterministic across runs and gated in CI.
+- Headline outcomes: FP8 frontier reached **~45 % MFU at Ernie production shape (T8192/E8/K8) ≈ 2 020 TFLOPS achieved on Target GPU**, bit-exact deterministic across runs and gated in CI.
 
 ---
 
@@ -35,7 +35,7 @@
 | `d0c1e6a` | 04-30 14:44 | **S79.1**: `tests/fp8_frontier_determinism_test.py` (NEW). Two tests (small-aligned + Ernie-prod) prove FP8 frontier path produces byte-identical `(out, dx, every grad)` across three independent runs. Wired into `tests/run_regression.sh` as a HARD-fail gate. Documents three paddle-proxy quirks (scope-limited proxy missing `stream_base`; `torch.equal` element-wise under proxy; `.to(dtype=...)` requires explicit `device=`). |
 | `c04b651` | 04-30 15:07 | **S79.2 + cleanup**: HANDOFF/README rewrite for clean S79 frontier. Documents the dgrad1 single-kernel optimization audit as a documented no-go (scale-LDG dedup, packed-mul collapse — all neutral or regressed; reverted). |
 | `ba40169` | 04-30 15:46 | **S79b.1**: `tools/mfu_sweep_s79.py` (NEW). nsys-driven 11-shape FP8 frontier MFU sweep. Adds `--H` flag to `bench_mlpnode_topk_nsys.py`. Generates `reports/mfu_s79/{README.md, sweep.{csv,json}, 4 seaborn plots, per-shape bench logs}`. Headline: Ernie MFU 44.91 % (2021 TFLOPS), best 50.88 % (T8192-H6144). |
-| `df5f86e` | 04-30 16:06 | **S79b.2**: hardware identity audit. Confirms GPU is **B30Z** (not B300), 1100 W cap is VBIOS-locked, sustained pure-GEMM hits cap and throttles 2032→1249 MHz, MoE bench stays under cap at full boost. |
+| `df5f86e` | 04-30 16:06 | **S79b.2**: hardware identity audit. Confirms GPU is **Target GPU** (not Target GPU), 1100 W cap is VBIOS-locked, sustained pure-GEMM hits cap and throttles 2032→1249 MHz, MoE bench stays under cap at full boost. |
 | `b92d944` | 04-30 16:22 | **S79b.3**: corrects an erroneous peak derivation (the spec-scaling formula has no power term — peak = SMs × ops/cycle × clock; the earlier `× (1100/1400)` was double-counting). 4500 TFLOPS retained as empirically-anchored boost-clock peak. |
 
 ---
@@ -77,7 +77,7 @@
 
 - nsys overhead audit (PR #15).
 - Dgrad1 single-kernel optimization audit (S79.2): documented as no-go after exhaustive trial of scale-LDG dedup, packed-mul collapse, register hints, register-budget reshaping. **All single-kernel knobs exhausted**; further wins require multi-kernel restructuring (fold FP8 cast into bwd-side wgrad producer — listed as next-step lever).
-- Hardware-identity audit (S79b.2–3): confirmed B30Z (not B300), reconciled the 4500 TFLOPS peak figure with first-principles formula (peak = SMs × ops/cycle × clock; no power term). Pure-GEMM does hit 1100 W cap and throttles; MoE bench does not.
+- Hardware-identity audit (S79b.2–3): confirmed Target GPU (not Target GPU), reconciled the 4500 TFLOPS peak figure with first-principles formula (peak = SMs × ops/cycle × clock; no power term). Pure-GEMM does hit 1100 W cap and throttles; MoE bench does not.
 - HANDOFF + README rewritten twice (PR #10 production-state, S79 cleanup) to keep the next agent's onboarding crisp.
 
 ### 5. Inherited / external work touched
@@ -91,7 +91,7 @@
 
 1. **MFU at Ernie shape ≈ 45 %** with our frontier path; **production bottleneck is non-matmul overhead** (routing/quant/scatter/dGated/FP8-cast inflate the busy denominator). The constituent FP8 GEMMs each hit ≥80 % of peak in isolation. **Highest-leverage remaining work** = fuse FP8 cast into the bwd-side wgrad producer (the fwd-side fold is already in).
 2. **Single-kernel optimization on `GemmDGatedFP8CLoadSm100ZeroMat` is exhausted** — every register/scale/epilogue tweak landed neutral or regressed. Future wins require restructuring (multi-kernel fusion or rewriting the dGated epilogue).
-3. **Hardware ground truth**: GPU is **B30Z (148 SMs, 2032 MHz boost, 1100 W VBIOS cap, 268 GiB HBM3e), NOT retail B300**. The 4500 TFLOPS peak is empirically anchored (1800 BF16 TFLOPS @ 2032 MHz / 0.8 cuBLAS efficiency × 2 for FP8). Tensor-core peak formula has **no power term** — power only enters as a runtime throttling consequence.
+3. **Hardware ground truth**: GPU is **Target GPU (148 SMs, 2032 MHz boost, 1100 W VBIOS cap, 268 GiB HBM3e), NOT retail Target GPU**. The 4500 TFLOPS peak is empirically anchored (1800 BF16 TFLOPS @ 2032 MHz / 0.8 cuBLAS efficiency × 2 for FP8). Tensor-core peak formula has **no power term** — power only enters as a runtime throttling consequence.
 4. **Sweep MFU numbers are valid**: MoE bench averages 921 W (under 1100 W cap), runs at full 2032 MHz, so 4500 TFLOPS reference is self-consistent. In production async training the cap WILL bite (~25 % absolute throughput drop), but **MFU % is invariant under throttling** because numerator and denominator scale linearly with clock.
 5. **Reverse-engineering paddle's torch proxy is a recurring tax**: scoped proxy missing `stream_base`; `torch.equal` element-wise; `.to(dtype=)` needing explicit device. Documented in S79.1 commit message and the determinism test header — next agent should consult before writing any new paddle-proxy-aware test.
 6. **Multi-layer refactor needs frontier-IMA regression coverage** — the session-71/72 rollback cost time. The S79.1 determinism test now fills this gap.

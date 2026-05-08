@@ -34,7 +34,7 @@
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `CONTRIBUTION_SUMMARY.md` | Markdown note: Contribution Summary: Blockscaled FP8 Training for SonicMoE on Blackwell. | — |
+| `CONTRIBUTION_SUMMARY.md` | Markdown note: Contribution Summary: Blockscaled FP8 Training for SonicMoE on SM100. | — |
 | `cross_framework_report.json` | JSON artifact with top-level keys: `T8192_H3072_I1536_E8_K8`. | — |
 | `cross_framework_report.md` | Markdown note: Cross-Framework MoE Benchmark Report (4-Way). | — |
 | `fp8_frontier_path_analysis.json` | Compiled BF16-vs-FP8 path-comparison report consumed by the new visualization module. | — |

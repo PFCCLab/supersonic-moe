@@ -32,7 +32,7 @@
 | `fp8_large_project_contract_test.py` | Pytest coverage for fp8 large project contract. | — |
 | `fp8_operator_options.py` | Pytest coverage for fp8 operator options. | — |
 | `fp8_protocol_test.py` | Pytest coverage for fp8 protocol. | — |
-| `moe_blackwell_test.py` | Pytest coverage for moe blackwell. | — |
+| `moe_sm100_test.py` | Pytest coverage for moe sm100. | — |
 | `moe_test.py` | Pytest coverage for moe. | — |
 | `precision_compare_paths.py` | Precision: Path A (direct .apply(), is_varlen_K=False) vs Path B (SonicMoEMlpNode, is_varlen_K=True, route-level padding) Same weights, same routing, same input, same out_grad. | — |
 | `report1.nsys-rep` | nsys report artifact for report1. | untracked in git |

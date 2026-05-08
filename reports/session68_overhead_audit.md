@@ -2,7 +2,7 @@
 
 > **Branch:** `myrepo/session60-ds-fix`
 > **Shape:** ERNIE — T=8192, K=8, E=8, H=3072, I=1536 (uniform routing)
-> **Hardware:** B30Z (sm_103a)
+> **Hardware:** Target GPU (SM100)
 > **Method:** nsys 2026.2.1 GPU-projection (merged-overlap kernel intervals
 > inside an NVTX `BENCH` range, divided by iteration count). 8 warmup + 20 timed
 > iters. Raw `.nsys-rep` files committed alongside this report.

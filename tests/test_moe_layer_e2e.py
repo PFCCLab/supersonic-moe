@@ -522,7 +522,7 @@ class AddAuxiliaryLoss(paddle.autograd.PyLayer):
 
 
 # ---------------------------------------------------------------------------
-# README baseline data (Session 53, nsys GPU-projection, B30Z)
+# README baseline data (Session 53, nsys GPU-projection, Target GPU)
 # Key: (T, H, I, E, K) → {"bf16_us": ..., "fp8_us": ...}
 # ---------------------------------------------------------------------------
 README_BASELINES = {

@@ -58,7 +58,7 @@ class MoETest(TestCommons):
         if device.type == "cuda":
             major, _ = torch.cuda.get_device_capability(device)
             if major >= 10 and not use_quack_gemm:
-                self.skipTest("Blackwell requires the QuACK path for the sonicmoe kernel backend")
+                self.skipTest("SM100 requires the QuACK path for the sonicmoe kernel backend")
 
         if use_quack_gemm and (is_compiling or add_bias):
             self.skipTest("unsupported test")
@@ -72,7 +72,7 @@ class MoETest(TestCommons):
         if use_fp8 and device.type == "cuda":
             major, _ = torch.cuda.get_device_capability(device)
             if major < 10:
-                self.skipTest("FP8 requires Blackwell SM100+")
+                self.skipTest("FP8 requires SM100+")
 
         self.set_seed(_SEED)
 

@@ -1,6 +1,6 @@
 # Paddle Compat 27-Shape Grid Benchmark Report
 
-Generated: 2026-04-16 | GPU: NVIDIA B30Z | 27 shapes (3T x 3E x 3I) | H=3072 K=8
+Generated: 2026-04-16 | GPU: NVIDIA Target GPU | 27 shapes (3T x 3E x 3I) | H=3072 K=8
 nsys: 3 repeats x 20 measured iters (median) | 8 GPUs parallel | Precision: 54/54 PASS
 
 ## 1. Methodology
