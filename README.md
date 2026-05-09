@@ -5,14 +5,14 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # SonicMoE: Accelerating MoE with IO and Tile-aware Optimizations
 [![arXiv](https://img.shields.io/badge/arXiv-2512.14080-b31b1b.svg)](https://arxiv.org/abs/2512.14080)
 
-**SonicMoE** is a blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and Blackwell GPUs, leveraging [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html).
+**SonicMoE** is a blazing-fast Mixture-of-Experts (MoE) implementation optimized for NVIDIA Hopper and SM100 GPUs, leveraging [CuTeDSL](https://docs.nvidia.com/cutlass/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html) and [Triton](https://triton-lang.org/main/getting-started/tutorials/index.html).
 
 ![image](./assets/mem.png)
 ![image](./assets/tput.png)
 
 ## Current FP8 Frontier Snapshot (2026-05-07)
 
-The current Blackwell frontier is **green** on branch `race-fix-paddle`. The active path is:
+The current SM100 frontier is **green** on branch `race-fix-paddle`. The active path is:
 
 ```text
 DeepEP topk metadata
@@ -25,15 +25,15 @@ DeepEP topk metadata
   -> TMA reduce-add wgrad into ERNIE main_grad
 ```
 
-Latest Ernie-shape benchmark (`T=8192,H=3072,I=1536,E=8,K=8`, B30Z, nsys GPU-projection):
+Latest Ernie-shape benchmark (`T=8192,H=3072,I=1536,E=8,K=8`, Target GPU, nsys GPU-projection):
 
 | Metric | Current value | Notes |
 |---|---:|---|
 | FP8 busy time | **2659.8 µs/iter** | `reports/fresh_benchmark_ws1/` |
 | MFU | **46.51%** | denominator: 4500 TFLOPS FP8 peak |
 | Peak measured MFU | **51.61%** | `T8192-H4096-I4096-E8-K8` |
-| Speedup vs current QuACK BF16 | **1.11x** | `2659.8` vs `2942.5 µs`; fair in-repo baseline |
-| Speedup vs historical cuBLAS/PyTorch BF16 | **~1.37x** | useful historical reference only |
+| Speedup vs true BF16 (same codebase) | **1.63x** | `2659.8` vs `4346 µs`; BF16 verified zero FP8 kernels |
+| Speedup vs historical S53 cuBLAS BF16 | **~1.84x** | S53 `3644 µs` is PyTorch-native, no Paddle proxy |
 | Precision | cos >= 0.997, RRMSE < 7.6% | output/dx/ds/dw1/dw2 suites |
 | Determinism | bit-exact repeated fwd/bwd | `tests/fp8_frontier_determinism_test.py` hard gate |
 
@@ -83,10 +83,10 @@ Important current insights:
 
 ## Prerequisites
 
-- NVIDIA Hopper GPUs (H100, H200) or Blackwell GPUs (GB200, B200, B300)
-- CUDA 12.9+ (13.0+ for B300)
+- NVIDIA Hopper GPUs (H100, H200) or SM100 GPUs (Target GPU, Target GPU, Target GPU)
+- CUDA 12.9+ (13.0+ for Target GPU)
 - Python 3.12+, PyTorch 2.7+
-- `USE_QUACK_GEMM=1` for Blackwell kernels
+- `USE_QUACK_GEMM=1` for SM100 kernels
 
 ## Default Path & Environment Flags
 
@@ -105,7 +105,7 @@ rm -rf $TORCH_EXTENSIONS_DIR/sonicmoe_deepep_topk_metadata_cuda  # (or matching 
 | Env flag | Default | Recommended | What it gates |
 |---|:---:|:---:|---|
 | `SONIC_MOE_FP8_MODE` | unset | `perf` (or via `enable_fp8()` ctx) | Master switch. `perf` enables the full FP8 frontier; `mem` enables FP8 with stage-wise memory reuse; unset = BF16 path. |
-| `USE_QUACK_GEMM` | unset | `1` | Required on Blackwell (B200/B300) to enable the CuTeDSL FP8 GEMMs. Without it the Paddle compat layer falls back to BF16. |
+| `USE_QUACK_GEMM` | unset | `1` | Required on SM100 (SM100 architecture) to enable the CuTeDSL FP8 GEMMs. Without it the Paddle compat layer falls back to BF16. |
 | `SONIC_MOE_FP8_WGRAD` | unset | `1` | Enable FP8 wgrad (otherwise wgrad runs in BF16). Implied when `fp8_wgrad=True` on the config. |
 | `SONIC_MOE_FP8_FUSED_GATED` | `1` | `1` | Fuse SwiGLU gate + epilogue blockscaled quant inside the up-proj GEMM. |
 | `SONIC_MOE_FP8_EPILOGUE_QUANT` | `1` | `1` | Quantize y2 / z to FP8 inside the GEMM epilogue (vs. a separate quant kernel). |
@@ -233,7 +233,7 @@ steady-state on iteration ≥ 2.
 - **Multi-process JIT cache on shared GPFS**: `sonicmoe.jit` uses `FileLock` on a stable parent directory (NOT inside `build_directory`, which paddle wipes mid-cycle). Triton + Quack disk caches naturally support multi-rank reuse; sentinel (`{cache_root}/warmup_sentinel.json`) gates cold compile. Cross-rank shape divergence (rank 0 sees shape A, rank 1 sees shape B) is supported because each rank takes the file lock per-key.
 - **quack import path**: `/usr/local/bin/python` (the default `python` on this host) lacks the `quack` site-package; it lives at `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack`. `tests/conftest.py` injects this into `sys.path` automatically; `tools/ci/jit_bench.py::_run_subprocess` and `tools/ci/multicard_smoke.WORKER_BODY` do the same for spawned workers.
 - **Hipify proxy install order matters**. paddle's torch-proxy intercepts `torch.utils.hipify.hipify_python` lookups and raises `KeyError`. Fix: pre-import the real `torch.utils.hipify[.hipify_python]` and add it to `paddle.compat.extend_torch_proxy_blocked_modules`. Re-arm inside the JIT lock so the patch applies regardless of `import sonicmoe` vs `paddle.enable_compat()` ordering.
-- **Blackwell ptxas mismatch**. Bundled Triton 3.5 ptxas does not recognize `sm_103a`. Tests/CI globally export `TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas` (handled in `tests/conftest.py::_ensure_blackwell_ptxas`). Production deployment should set this if running on B300.
+- **SM100 ptxas mismatch**. Bundled Triton 3.5 ptxas does not recognize `SM100`. Tests/CI globally export `TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas` (handled in `tests/conftest.py::_ensure_sm100_ptxas`). Production deployment should set this if running on Target GPU.
 - **`dispatched_indices` per-row uniqueness contract**. The kernel (`sonicmoe/ernie_compat/deepep_topk_metadata_cuda/kernel.cu` L315-333) assumes each row of `dispatched_indices` contains pairwise-distinct expert ids. Real DeepEP dispatch always satisfies this; custom test fixtures must. The optional contract validator at `deepep_metadata.py` (gated by `SONIC_MOE_VALIDATE_DISPATCH=1`) catches violations early.
 - **paddle's `cpp_extension.load()` writes a wrapper `.py` whose `__bootstrap__` references `*_pd_.so`**. In this paddle build the file is plain `*.so` and the wrapper is non-functional; importing the `.so` directly via `spec_from_file_location` (PYBIND11 handles symbol export) is the correct fast-path.
 - **Stable lock paths matter**. paddle's `load()` may wipe its `build_directory` mid-cycle. The FileLock must live in the *parent* dir so the lock inode survives.
@@ -261,7 +261,7 @@ ds gradient verified via `test_cold_start_e2e.py`: cos=0.9972 across all 6 shape
 
 All cosine > 0.99, RRMSE < 7.6%.  Shapes include E=32 (production), varying topk (4/8), small/large token counts.
 
-### Performance (nsys GPU-projection, B30Z, current fresh data)
+### Performance (nsys GPU-projection, Target GPU, current fresh data)
 
 Current canonical data lives in `reports/fresh_benchmark_ws1/`. The table below supersedes
 older Session-65-only summaries for frontier-level comparisons.
@@ -323,7 +323,7 @@ See `HANDOFF.md` for full kernel breakdown, memory notes, and next-step prioriti
 | 7 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log only; current-state correction block at top |
 | 8 | **Environment** | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
 
-> **Project state (clean handoff, 2026-05-07)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest Ernie-shape FP8 busy time is **2659.8 µs/iter** and **46.51% MFU**. Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization (live-range shortening / fission), not direct dz-quant epilogue fusion.
+> **Project state (clean handoff, 2026-05-09)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest Ernie-shape FP8 busy time is **2659.8 µs/iter** (**46.51% MFU**, **1.63x vs true BF16**). BF16 baseline (4346 µs) now verified clean via nsys (zero FP8 kernels). Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization (live-range shortening / fission), NOT direct dz-quant epilogue fusion. MXFP8 128-row alignment waste analysis completed — see `/panzhaowu/bkup/mxfp8_alignment_waste_analysis.pdf`.
 
 **Quick-validate the frontier before resuming work**:
 ```bash

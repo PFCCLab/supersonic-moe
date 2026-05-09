@@ -11,7 +11,7 @@
 
 | 指标 | 本周结果 | 说明 |
 |------|---------|------|
-| **Ernie生产Shape（T8192/E8/K8）** | **MFU 44.91%**（2021 TFLOPS） | 在B30Z上达成，超越基准模块40%目标已兑现 |
+| **Ernie生产Shape（T8192/E8/K8）** | **MFU 44.91%**（2021 TFLOPS） | 在Target GPU上达成，超越基准模块40%目标已兑现 |
 | **最佳Shape（T8192-H6144）** | **MFU 50.88%** | 宽hidden场景性能更优，为未来Ernie升级预留空间 |
 | **量化算子效率** | **90–93% HBM峰值带宽** | NCU驱动调优，消除显存瓶颈 |
 | **Wgrad路径** | **1.14–1.43× vs BF16** | 生产默认`fp8_wgrad=False`路径已稳定，TMA reduce-add融合epilogue节省664 µs/iter |
@@ -29,7 +29,7 @@
 
 - **多卡集群安全**：完成race-safe JIT + FP8配置隔离，适配文心实际训练中的多卡并行策略；`main_grad`惰性分配 + `step()`顺序修正，保障分布式场景稳定性。
 - **CI基础设施**：Triton autotune缓存持久化，大幅降低冷启动JIT耗时；nsys/ncu基准基线固化，6个Ernie Shape GEMM已建立`--set full`级性能档案。
-- **硬件基线确认**：完成B30Z硬件身份审计（148 SMs / 2032 MHz boost / 1100W VBIOS / 268 GiB HBM3e），4500 TFLOPS峰值经empirical锚定，MoE基准运行在全频boost状态，功耗未触墙。
+- **硬件基线确认**：完成Target GPU硬件身份审计（148 SMs / 2032 MHz boost / 1100W VBIOS / 268 GiB HBM3e），4500 TFLOPS峰值经empirical锚定，MoE基准运行在全频boost状态，功耗未触墙。
 
 ---
 

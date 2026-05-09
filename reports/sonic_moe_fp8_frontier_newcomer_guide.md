@@ -4,13 +4,13 @@
 >
 > 目标水平：读完后能解释 SonicMoE FP8 frontier 的端到端数据流、关键符号、kernel breakdown、roofline 数学、overhead 来源、精度风险和运维坑，并能回答苛刻的大模型预训练高性能专家追问。
 >
-> 当前事实基线：`race-fix-paddle` 分支，NVIDIA B30Z / Blackwell `sm_103`，Ernie production shape `T=8192, H=3072, I=1536, E=8, K=8`。最新 fresh benchmark 为 FP8 frontier `2659.8 µs/iter`、`46.51% MFU`；峰值测得 `51.61% MFU`。这些数字来自 `reports/fresh_benchmark_ws1/` 和根 `HANDOFF.md`，优先级高于历史报告。
+> 当前事实基线：`race-fix-paddle` 分支，NVIDIA Target GPU / SM100 `SM100`，Ernie production shape `T=8192, H=3072, I=1536, E=8, K=8`。最新 fresh benchmark 为 FP8 frontier `2659.8 µs/iter`、`46.51% MFU`；峰值测得 `51.61% MFU`。这些数字来自 `reports/fresh_benchmark_ws1/` 和根 `HANDOFF.md`，优先级高于历史报告。
 
 ---
 
 ## 0. 先建立正确心智模型
 
-SonicMoE 不是“把 MoE 里的 GEMM 换成 FP8”这么简单。它是一个面向 Blackwell 的 **MoE expert MLP 计算子系统**，把路由后的 token-expert assignments、FP8 blockscaled 量化、CuTe/CUTLASS GEMM、SwiGLU、wgrad 累加、Paddle ERNIE `main_grad` 布局转换串成一条尽量少物化、少同步、少 HBM 往返的路径。
+SonicMoE 不是“把 MoE 里的 GEMM 换成 FP8”这么简单。它是一个面向 SM100 的 **MoE expert MLP 计算子系统**，把路由后的 token-expert assignments、FP8 blockscaled 量化、CuTe/CUTLASS GEMM、SwiGLU、wgrad 累加、Paddle ERNIE `main_grad` 布局转换串成一条尽量少物化、少同步、少 HBM 往返的路径。
 
 如果只记住一句话：
 
@@ -747,7 +747,7 @@ F_total = 18 × M × H × I
         = 5.566e12 FLOPs
 ```
 
-B30Z FP8 peak: $\Pi = 4500 \text{ TFLOPS} = 4.5 \times 10^{15} \text{ FLOPs/s}$
+Target GPU FP8 peak: $\Pi = 4500 \text{ TFLOPS} = 4.5 \times 10^{15} \text{ FLOPs/s}$
 
 ```text
 ideal_time_at_100% = 5.566e12 / 4.5e15 = 1237 µs
@@ -783,7 +783,7 @@ Bytes = M×H + H×2I + M×2I  (FP8 = 1 byte/element)
 AI = 1.236e12 / 4.12e8 ≈ 3000 FLOPs/byte
 ```
 
-B30Z ridge point：
+Target GPU ridge point：
 
 ```text
 Ridge = Peak_compute / HBM_BW = 4500e12 / 8e12 = 562.5 FLOPs/byte
@@ -866,6 +866,24 @@ c_fixed        ≈ 201 µs
 predicted      ≈ 2668 µs
 measured       ≈ 2660 µs
 ```
+
+由拟合 $\hat{t}_{\mu s}$ 反推 MFU：
+
+$$
+\widehat{\text{MFU}} = \frac{F_{\text{model}}}{\hat{t}_{\mu s} \times 10^{-6} \times \Pi_{\text{peak}}} = \frac{18 \cdot TK \cdot H \cdot I}{\hat{t}_{\mu s} \cdot \Pi_{\text{TFLOPS}} \cdot 10^{6}}
+$$
+
+其中 $\hat{t}_{\mu s}$ 为上式预测的 `busy_us`（µs），$\Pi_{\text{TFLOPS}}$ 为 FP8 峰值算力（TFLOPS，当前取 4500）。代入 Ernie 验证：
+
+$$
+\widehat{\text{MFU}} = \frac{5.566 \times 10^{12}}{2668 \times 4500 \times 10^{6}} = 46.3\% \quad (\text{实测 } 46.5\%)
+$$
+
+渐近 MFU（$TK \to \infty$，固定项可忽略）：
+
+$$
+\text{MFU}_{\infty} = \frac{1}{\frac{1}{\eta_{\max}} + \frac{\Pi \cdot a_q \cdot \max(H,2I)}{18 \cdot H \cdot I} + \frac{\Pi \cdot a_e \cdot E}{18 \cdot H \cdot I}} \approx 48.2\%
+$$
 
 解释限制：
 
@@ -1067,7 +1085,7 @@ UE8M0 是 power-of-two scale。好处：
 
 1. 硬件/bit 操作简单，乘 scale 可变成指数位构造。
 2. scale 存储 1 byte，overhead 低。
-3. 与 Blackwell blockscaled FP8 tensor core layout 匹配。
+3. 与 SM100 blockscaled FP8 tensor core layout 匹配。
 
 代价：
 
@@ -1152,7 +1170,7 @@ iso32 的经验结论来自真实 dz tensors，不应无限外推。
 
 ### Q1：你说 FP8 frontier 46.5% MFU，分母是什么？FLOPs 有没有虚高？
 
-**答：** 分母使用 B30Z FP8 peak `4500 TFLOPS`。FLOPs 采用 MoE expert MLP forward+backward 主 matmul 口径 `18*TK*H*I`。Ernie shape `TK=8192*8=65536,H=3072,I=1536`，FLOPs 为 `5.566e12`。实测 busy `2659.8µs`，所以 MFU=`5.566e12/(2659.8e-6*4.5e15)=46.51%`。这个口径不把 quant/scatter/metadata 算作有用 FLOPs，所以不会因为额外 kernel 虚高；反而这些 overhead 会降低 MFU。
+**答：** 分母使用 Target GPU FP8 peak `4500 TFLOPS`。FLOPs 采用 MoE expert MLP forward+backward 主 matmul 口径 `18*TK*H*I`。Ernie shape `TK=8192*8=65536,H=3072,I=1536`，FLOPs 为 `5.566e12`。实测 busy `2659.8µs`，所以 MFU=`5.566e12/(2659.8e-6*4.5e15)=46.51%`。这个口径不把 quant/scatter/metadata 算作有用 FLOPs，所以不会因为额外 kernel 虚高；反而这些 overhead 会降低 MFU。
 
 ### Q2：为什么不是 100%？GEMM arithmetic intensity 明明远高于 ridge point。
 
@@ -1172,7 +1190,7 @@ iso32 的经验结论来自真实 dz tensors，不应无限外推。
 
 ### Q6：为什么 scale 必须 gather？data 都能 `A_idx`，scale 不能也 `A_idx`？
 
-**答：** Blackwell blockscaled GEMM 的 SFA scale layout 和 GEMM M/K tile 坐标绑定。data 的 A rows 可以在 mainloop 用 `A_idx` 间接寻址，但 SFA layout 原生按 GEMM M rows (`TK`) 解释；如果直接用 T-space scale，`cu_seqlens_m` offset 对 expert 1+ 会越界/错位。当前做法只 gather scales，体积约 data 的几个百分点，比 gather FP8/BF16 activation 便宜得多。
+**答：** SM100 blockscaled GEMM 的 SFA scale layout 和 GEMM M/K tile 坐标绑定。data 的 A rows 可以在 mainloop 用 `A_idx` 间接寻址，但 SFA layout 原生按 GEMM M rows (`TK`) 解释；如果直接用 T-space scale，`cu_seqlens_m` offset 对 expert 1+ 会越界/错位。当前做法只 gather scales，体积约 data 的几个百分点，比 gather FP8/BF16 activation 便宜得多。
 
 ### Q7：TMA reduce-add 的 atomic order 会不会导致非确定性？
 

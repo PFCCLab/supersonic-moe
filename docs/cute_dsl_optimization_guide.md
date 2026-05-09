@@ -1,6 +1,6 @@
 # CuTe DSL FP8 Quantization — Architecture & Optimization Guide
 
-> Session 43 accumulated knowledge for next agent. All claims NCU-verified on B200.
+> Session 43 accumulated knowledge for next agent. All claims NCU-verified on Target GPU.
 
 ## 1. Project Architecture Overview
 
@@ -175,7 +175,7 @@ def _compile(dtype_width, TK, dim):
 | Two-pass, outer unrolled, inner runtime | 48 | 55% | 105µs | |
 | **Two-pass, both runtime loops** | **30** | **89%** | **91µs** | **YES** |
 
-**Insight:** For compute-bound kernels on B200, occupancy wins over ILP. 89% occupancy with more warps to hide ALU latency beats 44% occupancy with more ILP per warp.
+**Insight:** For compute-bound kernels on Target GPU, occupancy wins over ILP. 89% occupancy with more warps to hide ALU latency beats 44% occupancy with more ILP per warp.
 
 ### Coalesced Scale Store
 **Problem:** (dim, num_groups) layout → 32 lanes write stride=num_groups apart = 97% sector waste.
@@ -229,7 +229,7 @@ NCU metrics: 90µs, 30 regs, 89% occ, 110K bank conflicts, SM 79%.
 ### Split Strategy (current winner)
 CuTe colwise (84µs NCU) + Triton rowwise (62µs) = 146µs.
 Beats Triton fused (168µs) by 1.15×.
-L2 cache keeps the 2nd read hot (200MB bf16 fits in B200's 50MB L2 partially).
+L2 cache keeps the 2nd read hot (200MB bf16 fits in Target GPU's 50MB L2 partially).
 
 ### Paddle Reference (gold standard for fused)
 File: `/root/paddlejob/.../Paddle_B/paddle/phi/kernels/legacy/gpu/fp8_quant_blockwise_kernel.cu`

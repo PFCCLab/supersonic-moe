@@ -1,6 +1,6 @@
 # Ernie-shape nsys timeline — S78
 
-> Captured 2026-04-29 on B30Z (paddlejob shared-GPFS host) via the same
+> Captured 2026-04-29 on Target GPU (paddlejob shared-GPFS host) via the same
 > CI helper that gates `tools/ci/run_core_tests.sh::perf` —
 > `tools/ci/perf_gate.py --shape T8192-H3072-I1536-E8-K8 --keep-trace`.
 > Underlying bench: `tests/ops/bench_mlpnode_topk_nsys.py` (FP8 frontier,
@@ -22,7 +22,7 @@
 * Bench: 12 iters, NVTX-tagged `BENCH`
 * Path: FP8 frontier (`enable_fp8(True)`) — fused epilogue main_grad add,
   FP8 wgrad, dual-quant, gated SM100 GEMM, sonic-moe Triton stream patch
-* GPU: NVIDIA B30Z (compute capability 10.3, driver 13.0)
+* GPU: NVIDIA Target GPU (compute capability 10.3, driver 13.0)
 * CUDA stream: paddle compute stream (Triton patch verified active)
 
 ## Headline numbers

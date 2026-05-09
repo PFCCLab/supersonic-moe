@@ -1,7 +1,7 @@
-# Contribution Summary: Blockscaled FP8 Training for SonicMoE on Blackwell
+# Contribution Summary: Blockscaled FP8 Training for SonicMoE on SM100
 
 > **Branch:** `paddle_compat` (vs `main`)
-> **Hardware:** NVIDIA B30Z (SM100a, Blackwell)
+> **Hardware:** NVIDIA Target GPU (SM100a, SM100)
 > **Measurement:** nsys GPU-projection, 27-shape grid, 12 iterations after 3 warmup
 > **Authoritative Data Source:** `python tools/introspect.py --mode benchmark` produces unified JSON covering performance × precision × memory.  All tables below should be re-generated from this JSON.
 
@@ -11,7 +11,7 @@
 
 This branch adds a complete **blockscaled FP8 (E4M3 + E8M0, 1×32) training path** to
 SonicMoE, achieving **1.29×–1.70× speedup** (mean 1.53×) over BF16 across 27 production
-shapes on Blackwell GPUs, with **6.5% RRMSE** (pure quantization noise, no routing error).
+shapes on SM100 GPUs, with **6.5% RRMSE** (pure quantization noise, no routing error).
 A novel **route-level padding** scheme enables FP8 128-alignment for arbitrary expert counts
 (E=8/32/128) without modifying any GEMM kernel, and is mathematically proven to introduce
 **exact zero** backward error. Additionally, Paddle framework compatibility is verified
@@ -39,7 +39,7 @@ The core algorithmic contribution is ~10K lines of dense GPU kernel code; the re
 
 ### 2.1 Speedup (27-Shape Grid)
 
-All measurements use nsys GPU-projection on fully idle B30Z GPUs. BF16 baseline is
+All measurements use nsys GPU-projection on fully idle Target GPU GPUs. BF16 baseline is
 the upstream SonicMoE (`main` branch), verified within <1%.
 
 | Dimension | Speedup Range | Mean |

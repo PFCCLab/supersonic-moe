@@ -89,5 +89,5 @@
 # ********************************************************************************
 
 # Placeholder — actual implementation requires CUTLASS DSL compilation testing
-# on a Blackwell GPU node with the quack environment.
+# on an SM100 GPU node with the quack environment.
 

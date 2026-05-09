@@ -77,10 +77,10 @@ _assign_worker_gpu()
 
 
 def _ensure_blackwell_ptxas():
-    """Triton 3.5's bundled ptxas does not support sm_103a (Blackwell B30Z).
+    """Triton 3.5's bundled ptxas does not support sm_103a (SM100 architecture).
     System CUDA 13's ptxas does. Set TRITON_PTXAS_PATH globally so every
     test (including ones that don't set it locally) can compile fresh
-    Triton kernels on B30Z."""
+    Triton kernels on Target GPU."""
     if os.environ.get("TRITON_PTXAS_PATH"):
         return
     for cand in (

@@ -217,6 +217,9 @@ def _differentiable_router_scores(
         )
         gather_idx = built
 
+    # CRITICAL: avoid dispatched_probs.numel() — triggers cudaMemcpy D2H sync
+    # under Paddle proxy. Use .size (int property) directly. See PR#22.
+    # Gated by tests/test_no_memcpy_sync.py.
     if isinstance(dispatched_probs.size, int):
         dispatched_probs_numel = torch.to_tensor(dispatched_probs.size, place="cpu")
     else:
@@ -725,12 +728,18 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
     ) -> torch.Tensor:
+        # ── Determine FP8 vs BF16 mode ──────────────────────────────────
+        # Respect the global FP8 mode setting:
+        #   SONIC_MOE_FP8_MODE=perf/mem → FP8 frontier path
+        #   SONIC_MOE_FP8_MODE="" or unset → true BF16 path (CuTe DSL BF16 GEMMs)
+        # The BF16 path uses the same zero-materialization, varlen, and wgrad
+        # accumulator infrastructure — just without FP8 quantization.
+        from sonicmoe.functional.utils import is_fp8_active
+        use_fp8 = is_fp8_active()
+
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
-        with enable_fp8(True):
-            # Refresh FP8 config inside the enable_fp8(True) block so the
-            # snapshot sees ``_IS_FP8_ACTIVE=True`` regardless of the global
-            # state any prior caller / test may have left behind.
+        with enable_fp8(use_fp8):
             _refresh_fp8_config()
             y1, z = _UpProjection.forward(
                 up_ctx,
@@ -746,7 +755,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
 
         # ── DownProjection forward (via FakeCtx) ─────────────────────────
         down_ctx = _FakeCtx()
-        with enable_fp8(True):
+        with enable_fp8(use_fp8):
             out = _DownProjection.forward(
                 down_ctx,
                 y1, z, w2, None,                # y1, z, w2, b2
@@ -797,14 +806,14 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         dx = up_grads[0]
         dw1 = up_grads[1]
 
-        # FP8 wgrad accumulator path MUST write into the native view directly
-        # and return None — ``SonicMoEMlpNode`` always runs in
-        # ``enable_fp8(True)``, so the BF16 fallback (which would return
-        # non-None tensors) is unreachable.
+        # Wgrad accumulator path writes directly into _w{1,2}_native_view and
+        # returns None for dw. SonicMoEMlpNode currently forces FP8 mode (with
+        # warning when env says BF16), so the BF16 no-accumulator fallback
+        # (which would return non-None dw) is unreachable.
         assert dw1 is None, (
-            "Unexpected non-None dw1 in SonicMoEMlpNode backward — the FP8 "
-            "wgrad accumulator must write into _w1_native_view directly. "
-            "If this fires, the BF16 fallback was hit unexpectedly."
+            "Unexpected non-None dw1 in SonicMoEMlpNode backward — the wgrad "
+            "accumulator must write into _w1_native_view directly. "
+            "If this fires, the node entered the BF16 no-accumulator fallback."
         )
         assert dw2 is None, (
             "Unexpected non-None dw2 in SonicMoEMlpNode backward — see dw1."

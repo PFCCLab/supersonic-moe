@@ -29,7 +29,7 @@ def _require_blackwell() -> None:
     major, _ = torch.cuda.get_device_capability()
     if major < 10:
         raise RuntimeError(
-            f"FP8 frontier requires Blackwell SM100+ (got SM{major}0). "
+            f"FP8 frontier requires SM100+ (got SM{major}0). "
             f"This test intentionally refuses to skip — wrong hardware."
         )
 

@@ -37,7 +37,7 @@ C_TEXT   = "#1F2937"
 C_NEUTRAL= "#6B7280"
 C_GRID   = "#E5E7EB"
 C_PANEL  = "#F9FAFB"
-_HW      = "NVIDIA B30Z (SM100)"
+_HW      = "NVIDIA Target GPU (SM100)"
 
 STAGE_NAMES = [
     "Router &\nMeta",

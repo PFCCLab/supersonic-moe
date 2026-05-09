@@ -2,7 +2,7 @@
 
 Replaces the slow CUTLASS ``GemmDefaultSm100`` path (6.8× slower than BF16)
 with a Triton kernel that uses ``tl.dot_scaled`` — the hardware-native MXFP8
-path on Blackwell SM100 tensor cores.
+path on SM100 tensor cores.
 
 Key design choices
 ------------------

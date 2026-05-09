@@ -2,7 +2,7 @@
 
 > **文件**: `sonicmoe/quack_utils/gemm_dgated.py` (class `GemmDGatedFP8CLoadMixin`, line 510)
 > **Zero-Mat 变体**: `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` (class `GemmDGatedFP8CLoadSm100ZeroMat`, line 397)
-> **目标硬件**: NVIDIA Blackwell SM100 (B200/B300)
+> **目标硬件**: NVIDIA SM100 SM100 (SM100 architecture)
 > **实测性能**: 2660 µs/iter, 46.5% MFU (Ernie shape)
 
 ---

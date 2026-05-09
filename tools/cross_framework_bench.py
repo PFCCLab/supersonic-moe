@@ -3,7 +3,7 @@
 
 Compares precision, peak memory, and GPU-projection performance of four
 MoE expert computation paths on **identical data** (numpy dump/load) using
-the same B30Z GPU.
+the same Target GPU GPU.
 
 Four paths:
   1. Paddle BF16  — BF16 matmul per expert (no FP8, ERNIE-core convention)
@@ -87,10 +87,10 @@ NSYS_REPEATS = 3        # repeat nsys profiling, report median
 # Precision
 SEEDS = [42, 123, 777]  # repeated measurements for precision
 
-# B30Z hardware constants (for theoretical analysis)
-B30Z_FP8_TFLOPS = 4500       # E4M3 tensor-core peak (TFLOPS)
-B30Z_BF16_TFLOPS = 2250      # BF16 tensor-core peak (TFLOPS)
-B30Z_HBM_BW_GBPS = 8000      # HBM3e bandwidth (GB/s)
+# Target GPU hardware constants (for theoretical analysis)
+Target GPU_FP8_TFLOPS = 4500       # E4M3 tensor-core peak (TFLOPS)
+Target GPU_BF16_TFLOPS = 2250      # BF16 tensor-core peak (TFLOPS)
+Target GPU_HBM_BW_GBPS = 8000      # HBM3e bandwidth (GB/s)
 
 # ── Path registry ─────────────────────────────────────────────────────────────
 PATH_NAMES = ["paddle_bf16", "paddle_fp8", "sonic_bf16", "sonic_fp8"]
@@ -255,10 +255,10 @@ def compute_theory(shape: dict) -> dict:
     total_bytes_fp8 = act_bytes_bf16 // 2 + weight_bytes_bf16 // 2  # rough
 
     # Roofline bounds
-    bf16_compute_us = flops_total / (B30Z_BF16_TFLOPS * 1e6)
-    fp8_compute_us = flops_total / (B30Z_FP8_TFLOPS * 1e6)
-    bf16_mem_us = total_bytes_bf16 / (B30Z_HBM_BW_GBPS * 1e3)
-    fp8_mem_us = total_bytes_fp8 / (B30Z_HBM_BW_GBPS * 1e3)
+    bf16_compute_us = flops_total / (Target GPU_BF16_TFLOPS * 1e6)
+    fp8_compute_us = flops_total / (Target GPU_FP8_TFLOPS * 1e6)
+    bf16_mem_us = total_bytes_bf16 / (Target GPU_HBM_BW_GBPS * 1e3)
+    fp8_mem_us = total_bytes_fp8 / (Target GPU_HBM_BW_GBPS * 1e3)
 
     return {
         "TK": TK,
@@ -812,7 +812,7 @@ def _nsys_parse_sqlite(db_path: str, num_iters: int) -> dict:
 def generate_report(results: dict, report_path: str) -> None:
     L = []
     L.append("# Cross-Framework MoE Benchmark Report (4-Way)")
-    L.append(f"\nGenerated: {time.strftime('%Y-%m-%d %H:%M:%S')}  |  GPU: NVIDIA B30Z (Blackwell)  |  Seeds: {SEEDS}")
+    L.append(f"\nGenerated: {time.strftime('%Y-%m-%d %H:%M:%S')}  |  GPU: NVIDIA Target GPU (SM100)  |  Seeds: {SEEDS}")
     L.append(f"nsys: {NSYS_WARMUP} warmup + {NSYS_ITERS} measured × {NSYS_REPEATS} repeats (median)")
     L.append("")
 
@@ -924,10 +924,10 @@ def generate_report(results: dict, report_path: str) -> None:
 
     # ── 5. Theoretical Analysis ──
     L.append("## 5. Theoretical Analysis\n")
-    L.append("### Roofline Model (B30Z)\n")
-    L.append(f"- BF16 tensor-core peak: {B30Z_BF16_TFLOPS} TFLOPS")
-    L.append(f"- FP8 tensor-core peak: {B30Z_FP8_TFLOPS} TFLOPS")
-    L.append(f"- HBM3e bandwidth: {B30Z_HBM_BW_GBPS} GB/s\n")
+    L.append("### Roofline Model (Target GPU)\n")
+    L.append(f"- BF16 tensor-core peak: {Target GPU_BF16_TFLOPS} TFLOPS")
+    L.append(f"- FP8 tensor-core peak: {Target GPU_FP8_TFLOPS} TFLOPS")
+    L.append(f"- HBM3e bandwidth: {Target GPU_HBM_BW_GBPS} GB/s\n")
     L.append("| Shape | FLOPs (G) | AI (BF16) | AI (FP8) | Compute Bound BF16 (us) | Compute Bound FP8 (us) | Mem Bound BF16 (us) |")
     L.append("|-------|--------:|------:|-----:|----------:|----------:|----------:|")
     for sl in results:

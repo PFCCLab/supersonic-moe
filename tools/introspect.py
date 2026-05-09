@@ -3193,8 +3193,8 @@ def _print_wgrad_force_summary(data: dict) -> None:
                   f"bwd={mem_delta.get('peak_bwd_delta_mib', '?'):+.1f} MiB")
 
 
-# B200/B30Z peak HBM bandwidth (GB/s)
-_B200_PEAK_HBM_GBPS = 8000
+# Target GPU peak HBM bandwidth (GB/s)
+_PEAK_HBM_GBPS = 8000
 
 
 def run_quant_bench(
@@ -3217,7 +3217,7 @@ def run_quant_bench(
         shapes_json=json.dumps(shapes),
         warmup=warmup,
         trials=trials,
-        peak_hbm_gbps=_B200_PEAK_HBM_GBPS,
+        peak_hbm_gbps=_PEAK_HBM_GBPS,
     )
 
     env = _subprocess_env_for_gpu(gpu)

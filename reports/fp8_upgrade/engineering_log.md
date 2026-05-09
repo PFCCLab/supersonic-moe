@@ -239,7 +239,7 @@ Use these facts to interpret the historical entries below:
 - **Wgrad FP8 shape auto-tuning**: `_FP8Config.resolve_wgrad(I)` — ON for I>=2048, OFF for I<2048. Based on measured crossover: I=1536 wgrad is 0.913x (net negative).
 - **Total quant overhead reduction in DownProj wgrad**: ~676us -> ~388us = 43% savings.
 - **introspect.py: quant-bench + wgrad-bench modes** — isolated CUDA-event kernel benchmarks with statistics, JSON output.
-- **End-to-end results** (CUDA events, TK=65536, B30Z): I=1536: 0.983x, I=2048: 1.031x, I=3072: 1.136x. FP8 forward consistently ~19% slower (quant overhead), FP8 backward consistently faster (9.6-23.2%).
+- **End-to-end results** (CUDA events, TK=65536, Target GPU): I=1536: 0.983x, I=2048: 1.031x, I=3072: 1.136x. FP8 forward consistently ~19% slower (quant overhead), FP8 backward consistently faster (9.6-23.2%).
 - 34/34 tests + 20 subtests PASS.
 
 ### Lessons (Session 52)

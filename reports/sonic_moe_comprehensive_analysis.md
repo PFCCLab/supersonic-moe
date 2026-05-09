@@ -1,6 +1,6 @@
 # SonicMoE 综合技术分析报告
 
-> 撰写日期: 2026-05-06 | 分支: `race-fix-paddle` | 硬件: NVIDIA B30Z (sm_103, 148 SMs, 2032 MHz boost, 268 GiB HBM3e)
+> 撰写日期: 2026-05-06 | 分支: `race-fix-paddle` | 硬件: NVIDIA Target GPU (SM100, 148 SMs, 2032 MHz boost, 268 GiB HBM3e)
 > 本文档面向新接手的管理者和开发者，系统梳理 FP8 frontier 的实现、性能分析和 MoE 架构设计。
 
 ---
@@ -246,7 +246,7 @@ Gap = 54.07%, 分解如下:
 | Token scatter/gather | 148 µs | ~80 µs* | ~54% | Memory-BW bound |
 | Routing metadata | ~80 µs | ~20 µs | ~25% | Latency-bound |
 
-*理论下界基于 HBM bandwidth = 8 TB/s (B30Z HBM3e)
+*理论下界基于 HBM bandwidth = 8 TB/s (Target GPU HBM3e)
 
 #### GEMM Arithmetic Intensity 分析
 
@@ -255,7 +255,7 @@ Up-proj:   AI = 2·TK·H·2I / (TK·H + H·2I + TK·2I) × sizeof(fp8)
          = 2·65536·3072·3072 / (65536·3072 + 3072·3072 + 65536·3072) × 1
          ≈ 2·3072 / (1 + 3072/65536 + 1) ≈ 3025 FLOPs/byte
 
-对于 B30Z: compute/bandwidth ridge = 4500e12 / 8e12 ≈ 562 FLOPs/byte
+对于 Target GPU: compute/bandwidth ridge = 4500e12 / 8e12 ≈ 562 FLOPs/byte
 → AI >> ridge → 所有 GEMM 都是 compute-bound ✓
 ```
 
@@ -417,7 +417,7 @@ SonicMoE FP8 frontier 是一条 **DeepEP topk metadata → route-level padding �
 | Production shape | `T=8192,H=3072,I=1536,E=8,K=8` | `TK=T*K=65536` |
 | 有用 FLOPs | `18*TK*H*I=5.566e12` | MoE expert MLP fwd+bwd 主 matmul 口径 |
 | FP8 frontier busy | `2659.8 µs/iter` | fresh S81 nsys GPU-projection |
-| Ernie MFU | `46.51%` | 分母为 B30Z FP8 peak `4500 TFLOPS` |
+| Ernie MFU | `46.51%` | 分母为 Target GPU FP8 peak `4500 TFLOPS` |
 | measured peak MFU | `51.61%` | fresh sweep wide shape |
 | vs 当前 QuACK BF16 | `1.11×` | `2659.8 µs` vs `2942.5 µs` |
 | vs 历史 cuBLAS/PyTorch BF16 | `~1.37×` | 与 S53 baseline 口径不同，不可混报 |
@@ -428,7 +428,7 @@ SonicMoE FP8 frontier 是一条 **DeepEP topk metadata → route-level padding �
 |---|---|
 | “FP8 一定比 BF16 快 2×” | 2×只是 peak ratio；小 T 下 FP8 quant/scale/metadata overhead 反而会让 FP8 慢。fresh sweep 中 T=1024/2048 分别只有 `0.95×/0.97×`。 |
 | “zero-materialization 只是把 gather 藏起来” | 它避免了 `x_gathered(TK,H)` 的 HBM 写入和再读取；Ernie BF16 gathered activation 约 `384 MiB`。 |
-| “data 不 gather，scale 也不需要 gather” | Blackwell blockscaled SFA layout 按 GEMM `M=TK` 坐标解释；data 可以 `A_idx` 间接读，scale 必须预 gather 到 TK layout，否则 expert offset 会错。 |
+| “data 不 gather，scale 也不需要 gather” | SM100 blockscaled SFA layout 按 GEMM `M=TK` 坐标解释；data 可以 `A_idx` 间接读，scale 必须预 gather 到 TK layout，否则 expert offset 会错。 |
 | “下一步就是把 dz quant 塞进 GemmDGated epilogue” | 最新 NCU 显示 GemmDGated 已 `168 regs/thread`，几乎无寄存器余量；直接融合不是当前 P0。 |
 | “nsys/ncu duration 可以直接比较” | ncu 默认 base clock + replay；nsys 是真实 timeline/boost clock。端到端信 nsys GPU-projection，单 kernel 资源瓶颈看 ncu SoL/regs/L2。 |
 | “`node.step()` 就是 optimizer step” | 不是。`node.step()` 是 wgrad native layout → ERNIE `main_grad` layout flush，必须在 `optimizer.step()` 前。 |
@@ -473,7 +473,7 @@ measured_time = 2659.8 µs
 MFU = F / (measured_time * 4.5e15) = 46.51%
 ```
 
-GEMM arithmetic intensity 远高于 B30Z ridge point：
+GEMM arithmetic intensity 远高于 Target GPU ridge point：
 
 ```
 AI_up ≈ 3000 FLOPs/byte
@@ -1259,7 +1259,7 @@ bash tests/run_regression.sh  # 验证 frontier 状态
 | CuTe DSL | NVIDIA CUTLASS Python DSL for custom GEMM |
 | Blockscaled FP8 | 每 32 个元素共享一个 E8M0 scale 的 FP8 格式 |
 | ISA-packed | 硬件 tensor core 要求的 scale 物理布局 |
-| TMA | Tensor Memory Accelerator (Hopper/Blackwell 硬件单元) |
+| TMA | Tensor Memory Accelerator (Hopper/SM100 硬件单元) |
 | ZeroMat | Zero-materialization, 避免中间 tensor 物化 |
 | SwiGLU | `SiLU(gate) × up`, 门控线性单元变体 |
 | MFU | Model FLOPS Utilization = 有效计算/峰值算力 |

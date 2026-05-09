@@ -155,7 +155,7 @@ Must pass without modifying CI:
 - `tests/fp8_protocol_test.py`
 - `tests/ops/test_gemm_dgated.py` (per-shape numerical)
 - `tests/ops/test_dual_quant.py` (downstream consumer)
-- `tests/moe_blackwell_test.py` (end-to-end)
+- `tests/moe_sm100_test.py` (end-to-end)
 
 Phase 0 audit shows these *should* pass (downstream RRMSE identical to
 production 1×32 path), but the bit-exact determinism test will only pass

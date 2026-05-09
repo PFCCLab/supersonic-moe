@@ -1,7 +1,7 @@
 # Ernie-shape NCU Full Report — 6 GEMM Kernels (S78c)
 
 Full-feature `ncu --set full` report for the 6 cutlass GEMM kernels that fire
-in **one** SonicMoEMlpNode iter at the canonical Ernie-1B-MoE shape on B200.
+in **one** SonicMoEMlpNode iter at the canonical Ernie-1B-MoE shape on Target GPU.
 
 ## Shape
 
@@ -130,7 +130,7 @@ absolute numbers are larger than the production timeline but the
   3 wgrad GEMMs; we differentiate by launch order inside the NVTX `BENCH/`
   range, which is deterministic (see `forward.py` / `backward.py` call
   sequence).
-- The 6 cutlass GEMM symbols on B200 (sm_103) are:
+- The 6 cutlass GEMM symbols on Target GPU (SM100) are:
   - `cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmGatedSm100ZeroMatBlockscaledQuant_…`
   - `cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_…`
   - `cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmDGatedFP8CLoadSm100ZeroMat_…`

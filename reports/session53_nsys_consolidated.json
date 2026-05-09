@@ -1,6 +1,6 @@
 {
   "session": 53,
-  "device": "NVIDIA B30Z",
+  "device": "NVIDIA Target GPU",
   "method": "nsys GPU-projection",
   "common": {
     "H": 3072,

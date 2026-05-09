@@ -96,7 +96,7 @@ def parse_arguments() -> argparse.Namespace:
         "--fp8_protocol",
         choices=["none", "blackwell"],
         default="none",
-        help="Enable the Blackwell FP8 protocol path for the up-proj/down-proj activation boundary",
+        help="Enable the SM100 FP8 protocol path for the up-proj/down-proj activation boundary",
     )
     parser.add_argument(
         "--report_fp8_metrics",

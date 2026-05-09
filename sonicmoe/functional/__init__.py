@@ -598,7 +598,7 @@ def _use_fused_blockscaled_gated() -> bool:
     When enabled, the blockscaled FP8 path uses fused gemm_gated/gemm_dgated
     (single CUTLASS kernel: GEMM + SwiGLU + blockscaled descale) instead of
     separate blockscaled_fp8_gemm_varlen + standalone SwiGLU.  This is the
-    best-performing FP8 up-proj path on Blackwell and is enabled by default.
+    best-performing FP8 up-proj path on SM100 and is enabled by default.
     """
     from ..config import get_active_config
     cfg = get_active_config()
@@ -834,7 +834,7 @@ def _refresh_fp8_config() -> _FP8Config:
 
 
 def _get_blockscaled_protocol() -> FP8Protocol:
-    """Return FP8Protocol with 1×32 blockscaling for Blackwell hardware-native descaling."""
+    """Return FP8Protocol with 1×32 blockscaling for SM100 hardware-native descaling."""
     return FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
 
 
@@ -1500,15 +1500,32 @@ class _UpProjection(torch.autograd.Function):
                         "Ensure _DownProjection backward creates bwd prequant."
                     )
             else:
-                # Non-FP8 BF16 fallback (FP8 non-aligned is unreachable — DownProj
-                # backward raises before reaching here). Keep original fast path.
-                dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
-                dw1 = dw1_base.permute(1, 2, 0)
-                gemm(
-                    x.T, dz, out=dw1_base.permute(0, 2, 1),
-                    cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
-                    batch_idx_permute=None, dynamic_scheduler=False,
-                )
+                # Non-FP8 BF16 path: actgrad + wgrad using CuTe DSL BF16 GEMMs.
+                # Supports wgrad accumulator (MlpNode main_grad) and zero-mat gather.
+                _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
+                if _wgrad_accum is not None:
+                    accum_view = _wgrad_accum.permute(0, 2, 1)  # [E,2I,H] → [E,H,2I]
+                    if _use_wgrad_beta_accum():
+                        gemm(
+                            x.T, dz, out=accum_view, C=accum_view, beta=1.0,
+                            cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
+                            batch_idx_permute=None, dynamic_scheduler=False,
+                        )
+                    else:
+                        gemm_add(
+                            x.T, dz, C=accum_view, out=accum_view, beta=1.0,
+                            cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
+                            batch_idx_permute=None, dynamic_scheduler=False,
+                        )
+                    dw1 = None
+                else:
+                    dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
+                    dw1 = dw1_base.permute(1, 2, 0)
+                    gemm(
+                        x.T, dz, out=dw1_base.permute(0, 2, 1),
+                        cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
+                        batch_idx_permute=None, dynamic_scheduler=False,
+                    )
                 dx_expanded = gemm(
                     dz, w1.permute(2, 0, 1),
                     cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
@@ -2240,17 +2257,32 @@ class _DownProjection(torch.autograd.Function):
                 _reset_stage_memory_probe()
 
                 y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
-                dw2_base = torch.empty((w2.shape[2], w2.shape[0], w2.shape[1]), dtype=w2.dtype, device=w2.device)
-                dw2 = dw2_base.permute(1, 2, 0)
-                gemm(
-                    dout.T,
-                    y1s_wgrad,
-                    out=dw2.permute(2, 0, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
+                _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
+                if _wgrad_accum_w2 is not None:
+                    if _use_wgrad_beta_accum():
+                        gemm(
+                            dout.T, y1s_wgrad,
+                            out=_wgrad_accum_w2, C=_wgrad_accum_w2, beta=1.0,
+                            cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
+                            batch_idx_permute=None, dynamic_scheduler=False,
+                        )
+                    else:
+                        gemm_add(
+                            dout.T, y1s_wgrad,
+                            C=_wgrad_accum_w2, out=_wgrad_accum_w2, beta=1.0,
+                            cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
+                            batch_idx_permute=None, dynamic_scheduler=False,
+                        )
+                    dw2 = None
+                else:
+                    dw2_base = torch.empty((w2.shape[2], w2.shape[0], w2.shape[1]), dtype=w2.dtype, device=w2.device)
+                    dw2 = dw2_base.permute(1, 2, 0)
+                    gemm(
+                        dout.T, y1s_wgrad,
+                        out=dw2.permute(2, 0, 1),
+                        cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
+                        batch_idx_permute=None, dynamic_scheduler=False,
+                    )
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
         else:

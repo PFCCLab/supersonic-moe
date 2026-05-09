@@ -1,6 +1,6 @@
 # WS1-WS4 综合结果报告 (Fresh Data, 2026-05-06)
 
-> 硬件: NVIDIA B30Z (sm_103, 148 SMs, 2032 MHz, 268 GiB HBM3e)
+> 硬件: NVIDIA Target GPU (SM100, 148 SMs, 2032 MHz, 268 GiB HBM3e)
 > 分支: race-fix-paddle | 方法: nsys GPU-projection (BENCH NVTX range)
 > node.step() 在 BENCH 循环外 (匹配多 microbatch 稳态)
 

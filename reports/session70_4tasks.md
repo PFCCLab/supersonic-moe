@@ -1,7 +1,7 @@
 # Session 70 — 4-Task Investigation Report
 
 Date: 2026-04-28
-Hardware: NVIDIA B30Z (GB300-class), HBM3e ~3996 MHz × 8192-bit ≈ 7.65 TB/s peak
+Hardware: NVIDIA Target GPU (SM100-class), HBM3e ~3996 MHz × 8192-bit ≈ 7.65 TB/s peak
 Toolchain: ncu 2025.3.1.0, eb_venv (USE_QUACK_GEMM=1)
 
 ---
@@ -110,9 +110,9 @@ Shape:   M=32768, K=3072 (per-iter ERNIE up-proj input)
 Command: `ncu --set full --kernel-name "_quantize_and_pack_kernel" --launch-skip 4 --launch-count 1`
 Report:  `/tmp/s70/qpk_full.csv` (and `.ncu-rep` available on request)
 
-### Bench across shapes (50-iter avg, B30Z, USE_QUACK_GEMM=1)
+### Bench across shapes (50-iter avg, Target GPU, USE_QUACK_GEMM=1)
 
-| M | K | avg µs | effective B/W (TB/s, 3.03 B/elt) | % of B30Z 7.65 TB/s peak |
+| M | K | avg µs | effective B/W (TB/s, 3.03 B/elt) | % of Target GPU 7.65 TB/s peak |
 |---:|---:|---:|---:|---:|
 | 4096  | 1024 | 31.1 | 0.41 | 5.3% (launch-bound) |
 | 32768 | 1024 | 30.9 | 3.29 | 43% |

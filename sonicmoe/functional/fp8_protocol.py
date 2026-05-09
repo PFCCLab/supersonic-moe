@@ -96,7 +96,7 @@ def validate_fp8_protocol(protocol: FP8Protocol) -> FP8Protocol:
         raise ValueError("Only 1x32 and 1x128 scale granularities are supported in the current FP8 protocol")
 
     if protocol.backend is not FP8Backend.BLACKWELL:
-        raise ValueError("The current FP8 protocol is Blackwell-only")
+        raise ValueError("The current FP8 protocol requires SM100+")
 
     return protocol
 
@@ -115,12 +115,12 @@ def validate_fp8_runtime_support(
         device = torch.device("cuda", torch.cuda.current_device())
 
     if not is_blackwell_device(device):
-        raise RuntimeError("The current FP8 protocol only supports Blackwell GPUs")
+        raise RuntimeError("The current FP8 protocol only supports SM100+ GPUs")
 
     if quack_enabled is None:
         quack_enabled = is_using_quack_gemm()
 
     if protocol.requires_quack_gemm and not quack_enabled:
-        raise RuntimeError("The current FP8 protocol requires the QuACK GEMM path on Blackwell")
+        raise RuntimeError("The current FP8 protocol requires the QuACK GEMM path on SM100")
 
     return protocol

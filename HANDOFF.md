@@ -1,4 +1,4 @@
-# HANDOFF — SonicMoE FP8 Frontier (clean state, 2026-05-07)
+# HANDOFF — SonicMoE FP8 Frontier (clean state, 2026-05-09)
 
 > **Branch**: `race-fix-paddle`
 >
@@ -12,7 +12,7 @@
 
 ## 1. Project state in one paragraph
 
-SonicMoE is a Blackwell/Hopper Mixture-of-Experts expert-MLP engine. The active production path on Blackwell uses DeepEP topk metadata, route-level padding, blockscaled FP8 E4M3 + UE8M0 scales, CuTe/CUTLASS/QuACK GEMMs, zero-materialization `A_idx` gather, fused gated up-projection (`GEMM + SwiGLU + z FP8 epilogue quant`), FP8 down-projection, FP8-C-load `GemmDGated` backward, iso32 dz dual quant, and TMA reduce-add wgrad directly into ERNIE/Paddle `main_grad`. The Paddle integration entrypoint is `sonicmoe.ernie_compat.SonicMoEMlpNode`; `node.step()` must run before `optimizer.step()` to flush native CUTLASS wgrad layout into ERNIE layout.
+SonicMoE is a SM100/Hopper Mixture-of-Experts expert-MLP engine. The active production path on SM100 uses DeepEP topk metadata, route-level padding, blockscaled FP8 E4M3 + UE8M0 scales, CuTe/CUTLASS/QuACK GEMMs, zero-materialization `A_idx` gather, fused gated up-projection (`GEMM + SwiGLU + z FP8 epilogue quant`), FP8 down-projection, FP8-C-load `GemmDGated` backward, iso32 dz dual quant, and TMA reduce-add wgrad directly into ERNIE/Paddle `main_grad`. The Paddle integration entrypoint is `sonicmoe.ernie_compat.SonicMoEMlpNode`; `node.step()` must run before `optimizer.step()` to flush native CUTLASS wgrad layout into ERNIE layout.
 
 ---
 
@@ -20,7 +20,7 @@ SonicMoE is a Blackwell/Hopper Mixture-of-Experts expert-MLP engine. The active 
 
 ### 2.1 Latest single-GPU training performance
 
-Hardware/method: B30Z Blackwell (`sm_103`, 148 SMs, HBM3e), nsys GPU-projection over BENCH NVTX range, `USE_QUACK_GEMM=1`, `SONIC_MOE_FP8_MODE=perf`, `SONIC_MOE_FP8_WGRAD=1`.
+Hardware/method: Target GPU SM100 (`SM100`, 148 SMs, HBM3e), nsys GPU-projection over BENCH NVTX range, `USE_QUACK_GEMM=1`, `SONIC_MOE_FP8_MODE=perf`, `SONIC_MOE_FP8_WGRAD=1`.
 
 | Shape | FP8 busy | MFU vs 4500 TFLOPS | TFLOPS | Source |
 |---|---:|---:|---:|---|
@@ -35,9 +35,10 @@ Hardware/method: B30Z Blackwell (`sm_103`, 148 SMs, HBM3e), nsys GPU-projection 
 
 Baseline caveat:
 
-- **FP8 vs current QuACK BF16**: Ernie shape is `2659.8 µs` vs `2942.5 µs` = **1.11x**. This is the fair in-repo current comparison.
-- **FP8 vs historical S53 cuBLAS/PyTorch BF16**: Ernie shape was `3644 µs` vs `2659.8 µs` = **~1.37x**. Do not mix this with QuACK BF16.
-- **Small batches**: FP8 is slower at `T=1024/2048` because quant/scale/metadata overhead is not amortized. Crossover is around `T=3000-4000`.
+- **FP8 vs true BF16** (nsys GPU-projection, same codebase): Ernie shape `2660 µs` (FP8) vs `4346 µs` (BF16, CuTe DSL GemmGatedSm100/GemmDGatedSm100, zero FP8 kernels) = **1.63x speedup**.
+- **BF16 vs S53 official PyTorch**: Current BF16 is `4346 µs` vs S53's `3644 µs` (ratio 1.19x). The 19% gap comes from Paddle proxy dispatch overhead (~10%) plus FP8-infrastructure-loaded branch cost (~9%, documented in S53 engineering log Lesson 50). This is expected and NOT a regression.
+- **True BF16 mode**: Set `SONIC_MOE_FP8_MODE=""` before import. `SonicMoEMlpNode` now respects this setting and dispatches to CuTe DSL BF16 GEMMs (GemmGatedSm100 + GemmDGatedSm100). No quantization kernels, no FP8 C-load.
+- **Small batches**: FP8 crossover is around `T=3000-4000`.
 
 ### 2.2 Kernel breakdown at Ernie shape
 
@@ -290,7 +291,7 @@ Current application: `GemmDGatedFP8CLoadSm100ZeroMat` is a fission candidate bec
 
 ## 7. Lessons learned / pitfalls
 
-1. **Do not claim “FP8 is 2x faster.”** Current fair in-repo speedup at Ernie shape is 1.11x vs QuACK BF16; historical 1.37x is vs an older cuBLAS/PyTorch BF16 baseline.
+1. **FP8 真实加速比是 1.63x（vs 真 BF16）。** 之前报告的 “1.11x” 是由于 BF16 baseline 被 FP8 kernel 污染（SonicMoEMlpNode 强制 enable_fp8(True)），已在本次 session 修复。正确数据：FP8 2660 µs vs 真 BF16 4346 µs = 1.63x。历史 S53 cuBLAS BF16 = 3644 µs（当前 BF16 比 S53 慢 19%，原因是 Paddle proxy overhead + FP8 infra branch cost）。
 2. **Do not try to directly add dz quant loops to GemmDGated epilogue.** NCU shows 168 regs/thread × 384 threads = 64512/65536 regs, leaving effectively no register headroom.
 3. **compute-sanitizer can mask register-limit crashes.** Use it for memory safety, not as proof that a high-register kernel is production-safe.
 4. **TMA reduce-add is performance, not higher precision.** It avoids C-load/register pressure; determinism must still be tested.
@@ -300,6 +301,10 @@ Current application: `GemmDGatedFP8CLoadSm100ZeroMat` is a fission candidate bec
 8. **nsys and ncu answer different questions.** End-to-end busy/MFU uses nsys GPU-projection; kernel resource bottlenecks use ncu SoL/register/L2/DRAM. Do not compare their durations directly unless clock/replay policy matches.
 9. **`node.step()` order is non-negotiable.** It must precede `optimizer.step()`.
 10. **Use whitelisted env for paddlejob launch.** Denylist cleanup is unsafe; cluster env vars can silently force multi-node rendezvous.
+11. **Never use `.numel()` or `.element_size()` in hot-path Paddle proxy code.** These trigger implicit cudaMemcpy D2H (GPU stream sync). Use `.size` (int property) and `.itemsize` instead. Gated by `tests/test_no_memcpy_sync.py`. See PR#22.
+12. **SonicMoEMlpNode 现在支持真 BF16 模式。** 设置 `SONIC_MOE_FP8_MODE=""` 即可。BF16 路径使用 GemmGatedSm100 + GemmDGatedSm100（CuTe DSL BF16 GEMM），wgrad 通过 gemm_add() 累加到 main_grad，与 FP8 路径共享 zero-materialization 和 varlen 基础设施。
+13. **MXFP8 128 行对齐浪费是硅片硬约束，kernel 层面无解。** 详细分析见 `/panzhaowu/bkup/mxfp8_alignment_waste_analysis.pdf`。TC:CUDA core 吞吐比 = 58.5:1，CUDA core 并发 tail 不可行（tail 必须 < 0.67% 才能隐藏）。系统级解法：token rounding（已实现未上线）或跨 microbatch buffer（可行，改善 = grad_acc_steps 倍）。
+14. **Token Rounding 已实现但未进入生产。** 代码在 `forward_token_choice_rounding(Mtile=128)`，但因路由扰动对训练收敛的影响未验证，生产环境仍用 route-level padding。
 
 ---
 

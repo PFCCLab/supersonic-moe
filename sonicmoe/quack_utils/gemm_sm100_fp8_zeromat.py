@@ -1,5 +1,5 @@
 # ********************************************************************************
-# Zero-materialization FP8 blockscaled GemmGated / GemmDGated for Blackwell.
+# Zero-materialization FP8 blockscaled GemmGated / GemmDGated for SM100 architecture.
 #
 # Self-contained subclass of GemmSm100 that fixes SFA layout derivation for
 # gather_A + blockscaled. All other behavior inherited unchanged.
@@ -497,7 +497,7 @@ def gemm_gated_zeromat(
             info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
 
     device_cap = get_device_capacity(A.device)
-    assert device_cap[0] == 10, "Zero-mat kernel requires SM100 (Blackwell)"
+    assert device_cap[0] == 10, "Zero-mat kernel requires SM100"
     GemmCls = GemmGatedSm100ZeroMat
 
     tile_M, tile_N = 128, 128
@@ -622,7 +622,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
             info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
 
     device_cap = get_device_capacity(A.device)
-    assert device_cap[0] == 10, "Zero-mat quant-only kernel requires SM100 (Blackwell)"
+    assert device_cap[0] == 10, "Zero-mat quant-only kernel requires SM100"
     GemmCls = GemmSm100ZeroMatBlockscaledQuant
 
     tile_M, tile_N = 128, 128

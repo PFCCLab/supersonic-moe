@@ -40,10 +40,13 @@ for i, arg in enumerate(sys.argv):
         _mode = sys.argv[i + 1]
 
 if _mode == "bf16":
-    # BF16 baseline: completely disable FP8
+    # True BF16 path: SonicMoEMlpNode now respects SONIC_MOE_FP8_MODE.
+    # When empty/unset, the node dispatches to CuTe DSL BF16 GEMMs with
+    # zero-materialization gather, varlen, and wgrad accumulator — NO FP8
+    # quantization, no blockscaled scales, no FP8 C-load.
     os.environ["SONIC_MOE_FP8_MODE"] = ""
     os.environ["SONIC_MOE_FP8_WGRAD"] = "0"
-    os.environ.setdefault("USE_QUACK_GEMM", "1")  # QuACK still needed for CuTe BF16 GEMMs
+    os.environ.setdefault("USE_QUACK_GEMM", "1")
     os.environ.pop("SONIC_MOE_FP8_ASSUME_ALIGNED", None)
 else:
     # FP8 frontier

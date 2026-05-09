@@ -2,7 +2,7 @@
   "session": 62,
   "branch": "session60-ds-fix",
   "date": "2026-04-24",
-  "device": "B30Z",
+  "device": "Target GPU",
   "methodology": "nsys GPU-projection, 12 iters after 8 warmup, --resolve-symbols=false, subprocess isolation per shape",
   "path": "SonicMoEMlpNode (Paddle compat, topk dispatch)",
   "note": "Session 53 baseline used native PyTorch MoE module. Paddle autograd/proxy overhead adds ~10-20% to measured latency.",

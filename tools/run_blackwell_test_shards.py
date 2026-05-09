@@ -18,11 +18,11 @@ _SHARDS = [
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Blackwell test shards on separate GPUs.")
+    parser = argparse.ArgumentParser(description="Run SM100 test shards on separate GPUs.")
     parser.add_argument(
         "--gpus",
         default="0,1,2",
-        help="Comma-separated GPU ids to use. The first three entries are mapped to the three Blackwell test shards.",
+        help="Comma-separated GPU ids to use. The first three entries are mapped to the three SM100 test shards.",
     )
     parser.add_argument(
         "--dry-run",

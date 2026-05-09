@@ -33,7 +33,7 @@ static constexpr int MAX_TOPK = 16;
 //  No inter-block synchronization — safe for arbitrarily large grids.
 //  Phase B (prefix sums) runs as a separate kernel launch on the same stream,
 //  giving an implicit grid barrier.  This avoids the ad-hoc grid spin-wait
-//  that deadlocks once `scatter_blocks` exceeds device occupancy (B30Z hangs
+//  that deadlocks once `scatter_blocks` exceeds device occupancy (Target GPU hangs
 //  at scatter_blocks ≈ 1358, observed via cuda-gdb on the legacy combined
 //  kernel at kernel.cu:121).
 // ============================================================================

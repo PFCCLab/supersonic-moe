@@ -1713,7 +1713,7 @@
       "E": 8,
       "K": 8
     },
-    "device": "NVIDIA B30Z",
+    "device": "NVIDIA Target GPU",
     "gpu_index": 0,
     "torch_version": "2.11.0+cu130",
     "mode": "nsys",

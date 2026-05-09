@@ -29,7 +29,7 @@ class FP8LargeProjectContractTest(TestCommons):
             self.skipTest("CUDA is required")
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
     def _make_moe(self) -> MoE:
         return MoE(
@@ -385,7 +385,7 @@ class FP8AlignedContractTest(TestCommons):
             self.skipTest("CUDA is required")
         major, _ = torch.cuda.get_device_capability()
         if major < 10:
-            self.skipTest("Blackwell-only test requires SM100+")
+            self.skipTest("SM100-only test requires SM100+")
 
     def _reset_fp8_state(self) -> None:
         """Reset all FP8 global state to prevent cross-test pollution."""

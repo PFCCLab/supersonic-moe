@@ -6,8 +6,8 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 540.0,
-    "mfu": 0.5726623061333334,
+    "busy_us": 602.2,
+    "mfu": 0.5135131938093657,
     "TK": 8192,
     "error": null
   },
@@ -18,10 +18,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 847.7,
-    "mfu": 0.7295921795729621,
+    "busy_us": null,
+    "mfu": null,
     "TK": 16384,
-    "error": null
+    "error": "PROFILE FAILED:  719\n\n\u001b[94m\ud83d\udd0d Additional Context:\u001b[0m \n- \u001b[1mError name: CUDA_ERROR_LAUNCH_FAILED\n- Error code: 719\n- CUDA_TOOLKIT_PATH: not set\n- Target SM ARCH: not set\u001b[0m\n\n\u001b[94m\ud83d\udcca GPU Information:\u001b[0m\n\u001b[1m- CUDA devices available: 1 (current: <CUdevice 0>)\n- Architecture: \u001b[94mUnknown\u001b[0m (\u001b[92msm_103\u001b[0m)\n- Compatible SM archs: \u001b[92msm_103\u001b[0m\n- Total Memory: \u001b[94m267.69 GB\u001b[0m\n\n\u001b[1mCompatibility Check:\u001b[0m\n\u001b[91m\u274c Error: Target SM ARCH unknown is not compatible\n\ud83d\udca1 Please use one of SM ARCHs: \u001b[92msm_103\u001b[0m\n\n"
   },
   {
     "T": 4096,
@@ -30,10 +30,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 1533.4,
-    "mfu": 0.8066718281257336,
+    "busy_us": null,
+    "mfu": null,
     "TK": 32768,
-    "error": null
+    "error": "PROFILE FAILED:  719\n\n\u001b[94m\ud83d\udd0d Additional Context:\u001b[0m \n- \u001b[1mError name: CUDA_ERROR_LAUNCH_FAILED\n- Error code: 719\n- CUDA_TOOLKIT_PATH: not set\n- Target SM ARCH: not set\u001b[0m\n\n\u001b[94m\ud83d\udcca GPU Information:\u001b[0m\n\u001b[1m- CUDA devices available: 1 (current: <CUdevice 0>)\n- Architecture: \u001b[94mUnknown\u001b[0m (\u001b[92msm_103\u001b[0m)\n- Compatible SM archs: \u001b[92msm_103\u001b[0m\n- Total Memory: \u001b[94m267.69 GB\u001b[0m\n\n\u001b[1mCompatibility Check:\u001b[0m\n\u001b[91m\u274c Error: Target SM ARCH unknown is not compatible\n\ud83d\udca1 Please use one of SM ARCHs: \u001b[92msm_103\u001b[0m\n\n"
   },
   {
     "T": 4096,
@@ -42,10 +42,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 2488.0,
-    "mfu": 0.8838517908167203,
+    "busy_us": null,
+    "mfu": null,
     "TK": 32768,
-    "error": null
+    "error": "PROFILE FAILED:  'cudaErrorDevicesUnavailable'. This indicates that all CUDA devices are busy or unavailable at the current time. Devices are often busy/unavailable due touse of cudaComputeModeExclusive, cudaComputeModeProhibited or when long running CUDA kernels have filled up the GPU and are blocking new work from starting. They can also be unavailabledue to memory constraints on a device that already has active CUDA work being performed.] (at /workspace/Paddle/paddle/phi/backends/gpu/cuda/cuda_info.cc:259)\n\n"
   },
   {
     "T": 8192,
@@ -54,10 +54,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 2942.5,
-    "mfu": 0.84074805862226,
+    "busy_us": null,
+    "mfu": null,
     "TK": 65536,
-    "error": null
+    "error": "PROFILE FAILED:  'cudaErrorDevicesUnavailable'. This indicates that all CUDA devices are busy or unavailable at the current time. Devices are often busy/unavailable due touse of cudaComputeModeExclusive, cudaComputeModeProhibited or when long running CUDA kernels have filled up the GPU and are blocking new work from starting. They can also be unavailabledue to memory constraints on a device that already has active CUDA work being performed.] (at /workspace/Paddle/paddle/phi/backends/gpu/cuda/cuda_info.cc:259)\n\n"
   },
   {
     "T": 8192,
@@ -66,10 +66,10 @@
     "E": 16,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 3074.1,
-    "mfu": 0.8047562416629257,
+    "busy_us": null,
+    "mfu": null,
     "TK": 65536,
-    "error": null
+    "error": "PROFILE FAILED:  719\n\n\u001b[94m\ud83d\udd0d Additional Context:\u001b[0m \n- \u001b[1mError name: CUDA_ERROR_LAUNCH_FAILED\n- Error code: 719\n- CUDA_TOOLKIT_PATH: not set\n- Target SM ARCH: not set\u001b[0m\n\n\u001b[94m\ud83d\udcca GPU Information:\u001b[0m\n\u001b[1m- CUDA devices available: 1 (current: <CUdevice 0>)\n- Architecture: \u001b[94mUnknown\u001b[0m (\u001b[92msm_103\u001b[0m)\n- Compatible SM archs: \u001b[92msm_103\u001b[0m\n- Total Memory: \u001b[94m267.69 GB\u001b[0m\n\n\u001b[1mCompatibility Check:\u001b[0m\n\u001b[91m\u274c Error: Target SM ARCH unknown is not compatible\n\ud83d\udca1 Please use one of SM ARCHs: \u001b[92msm_103\u001b[0m\n\n"
   },
   {
     "T": 8192,
@@ -78,10 +78,10 @@
     "E": 32,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 3218.4,
-    "mfu": 0.7686742364205816,
+    "busy_us": null,
+    "mfu": null,
     "TK": 65536,
-    "error": null
+    "error": "PROFILE FAILED:  719\n\n\u001b[94m\ud83d\udd0d Additional Context:\u001b[0m \n- \u001b[1mError name: CUDA_ERROR_LAUNCH_FAILED\n- Error code: 719\n- CUDA_TOOLKIT_PATH: not set\n- Target SM ARCH: not set\u001b[0m\n\n\u001b[94m\ud83d\udcca GPU Information:\u001b[0m\n\u001b[1m- CUDA devices available: 1 (current: <CUdevice 0>)\n- Architecture: \u001b[94mUnknown\u001b[0m (\u001b[92msm_103\u001b[0m)\n- Compatible SM archs: \u001b[92msm_103\u001b[0m\n- Total Memory: \u001b[94m267.69 GB\u001b[0m\n\n\u001b[1mCompatibility Check:\u001b[0m\n\u001b[91m\u274c Error: Target SM ARCH unknown is not compatible\n\ud83d\udca1 Please use one of SM ARCHs: \u001b[92msm_103\u001b[0m\n\n"
   },
   {
     "T": 8192,
@@ -90,10 +90,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 5037.9,
-    "mfu": 0.8729920226888187,
+    "busy_us": null,
+    "mfu": null,
     "TK": 65536,
-    "error": null
+    "error": "PROFILE FAILED:  'cudaErrorDevicesUnavailable'. This indicates that all CUDA devices are busy or unavailable at the current time. Devices are often busy/unavailable due touse of cudaComputeModeExclusive, cudaComputeModeProhibited or when long running CUDA kernels have filled up the GPU and are blocking new work from starting. They can also be unavailabledue to memory constraints on a device that already has active CUDA work being performed.] (at /workspace/Paddle/paddle/phi/backends/gpu/cuda/cuda_info.cc:259)\n\n"
   },
   {
     "T": 8192,
@@ -102,10 +102,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 10894.7,
-    "mfu": 0.8073735873597254,
+    "busy_us": null,
+    "mfu": null,
     "TK": 65536,
-    "error": null
+    "error": "PROFILE FAILED:  'cudaErrorDevicesUnavailable'. This indicates that all CUDA devices are busy or unavailable at the current time. Devices are often busy/unavailable due touse of cudaComputeModeExclusive, cudaComputeModeProhibited or when long running CUDA kernels have filled up the GPU and are blocking new work from starting. They can also be unavailabledue to memory constraints on a device that already has active CUDA work being performed.] (at /workspace/Paddle/paddle/phi/backends/gpu/cuda/cuda_info.cc:259)\n\n"
   },
   {
     "T": 8192,
@@ -114,10 +114,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 7691.2,
-    "mfu": 0.857742584597462,
+    "busy_us": null,
+    "mfu": null,
     "TK": 65536,
-    "error": null
+    "error": "PROFILE FAILED:  'cudaErrorDevicesUnavailable'. This indicates that all CUDA devices are busy or unavailable at the current time. Devices are often busy/unavailable due touse of cudaComputeModeExclusive, cudaComputeModeProhibited or when long running CUDA kernels have filled up the GPU and are blocking new work from starting. They can also be unavailabledue to memory constraints on a device that already has active CUDA work being performed.] (at /workspace/Paddle/paddle/phi/backends/gpu/cuda/cuda_info.cc:259)\n\n"
   },
   {
     "T": 16384,
@@ -126,10 +126,10 @@
     "E": 8,
     "K": 8,
     "mode": "bf16",
-    "busy_us": 6022.1,
-    "mfu": 0.8216074666631241,
+    "busy_us": null,
+    "mfu": null,
     "TK": 131072,
-    "error": null
+    "error": "PROFILE FAILED:  719\n\n\u001b[94m\ud83d\udd0d Additional Context:\u001b[0m \n- \u001b[1mError name: CUDA_ERROR_LAUNCH_FAILED\n- Error code: 719\n- CUDA_TOOLKIT_PATH: not set\n- Target SM ARCH: not set\u001b[0m\n\n\u001b[94m\ud83d\udcca GPU Information:\u001b[0m\n\u001b[1m- CUDA devices available: 1 (current: <CUdevice 0>)\n- Architecture: \u001b[94mUnknown\u001b[0m (\u001b[92msm_103\u001b[0m)\n- Compatible SM archs: \u001b[92msm_103\u001b[0m\n- Total Memory: \u001b[94m267.69 GB\u001b[0m\n\n\u001b[1mCompatibility Check:\u001b[0m\n\u001b[91m\u274c Error: Target SM ARCH unknown is not compatible\n\ud83d\udca1 Please use one of SM ARCHs: \u001b[92msm_103\u001b[0m\n\n"
   },
   {
     "T": 1024,
@@ -138,8 +138,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 566.0,
-    "mfu": 0.27317813190106005,
+    "busy_us": 568.8,
+    "mfu": 0.271833373164557,
     "TK": 8192,
     "error": null
   },
@@ -150,8 +150,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 870.1,
-    "mfu": 0.3554047182071026,
+    "busy_us": 870.2,
+    "mfu": 0.35536387647897033,
     "TK": 16384,
     "error": null
   },
@@ -162,8 +162,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 1459.1,
-    "mfu": 0.42387450525940656,
+    "busy_us": 1454.6,
+    "mfu": 0.4251858178358312,
     "TK": 32768,
     "error": null
   },
@@ -174,8 +174,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 2239.8,
-    "mfu": 0.4908972353674435,
+    "busy_us": 2276.5,
+    "mfu": 0.4829833638374698,
     "TK": 32768,
     "error": null
   },
@@ -186,8 +186,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 2659.8,
-    "mfu": 0.4650539819715768,
+    "busy_us": 2721.3,
+    "mfu": 0.45454399781281013,
     "TK": 65536,
     "error": null
   },
@@ -198,8 +198,8 @@
     "E": 16,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 2800.7,
-    "mfu": 0.44165765031884885,
+    "busy_us": 2821.7,
+    "mfu": 0.4383706918694404,
     "TK": 65536,
     "error": null
   },
@@ -210,8 +210,8 @@
     "E": 32,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 3187.5,
-    "mfu": 0.388062927450353,
+    "busy_us": 3177.0,
+    "mfu": 0.3893454772577904,
     "TK": 65536,
     "error": null
   },
@@ -222,8 +222,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 4267.3,
-    "mfu": 0.5153195827694328,
+    "busy_us": 4627.7,
+    "mfu": 0.4751870811746656,
     "TK": 65536,
     "error": null
   },
@@ -234,8 +234,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 8521.7,
-    "mfu": 0.5160996645157656,
+    "busy_us": 9232.7,
+    "mfu": 0.4763554010315509,
     "TK": 65536,
     "error": null
   },
@@ -246,8 +246,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 6568.4,
-    "mfu": 0.5021824010912856,
+    "busy_us": 7073.1,
+    "mfu": 0.4663492504457734,
     "TK": 65536,
     "error": null
   },
@@ -258,8 +258,8 @@
     "E": 8,
     "K": 8,
     "mode": "fp8",
-    "busy_us": 5224.9,
-    "mfu": 0.47348296857279565,
+    "busy_us": 5827.9,
+    "mfu": 0.4244927267962731,
     "TK": 131072,
     "error": null
   }
