@@ -174,6 +174,7 @@ def deepep_topk_to_sonic_metadata(
     """
     N_recv = dispatched_indices.shape[0]
     topk = dispatched_indices.shape[1]
+    device = _normalize_device(device)
 
     if "int32" not in str(dispatched_indices.dtype):
         raise ValueError(f"dispatched_indices: expected int32, got {dispatched_indices.dtype}")
@@ -296,6 +297,35 @@ def deepep_topk_to_sonic_metadata(
 
 # ── CUDA topk implementation ─────────────────────────────────────────────────
 
+_INITIALIZED_PADDLE_DEVICES: set[int] = set()
+
+
+def _selected_cuda_device() -> int:
+    selected = os.environ.get("FLAGS_selected_gpus")
+    if selected:
+        return int(selected.split(",")[0])
+    return int(os.environ.get("PADDLE_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")))
+
+
+def _ensure_paddle_device_context(device_id: int) -> None:
+    if device_id in _INITIALIZED_PADDLE_DEVICES:
+        return
+    try:
+        import paddle
+
+        paddle.device.set_device(f"gpu:{device_id}")
+        warm = paddle.empty([1], dtype="float32")
+        del warm
+        _INITIALIZED_PADDLE_DEVICES.add(device_id)
+    except Exception:
+        pass
+    try:
+        import torch as _torch
+
+        _torch.cuda.set_device(device_id)
+    except Exception:
+        pass
+
 
 def _normalize_device(device):
     """Normalize torch.device / paddle Place / str → 'cuda:N' string.
@@ -305,15 +335,27 @@ def _normalize_device(device):
     Pre-normalizing here keeps callers (mlp_node_v2 passing `x.device`)
     proxy-agnostic.
     """
-    if device is None or isinstance(device, str):
+    if device is None:
+        device_id = _selected_cuda_device()
+        _ensure_paddle_device_context(device_id)
+        return f"cuda:{device_id}"
+    if isinstance(device, str):
+        if device == "cuda":
+            device_id = _selected_cuda_device()
+            _ensure_paddle_device_context(device_id)
+            return f"cuda:{device_id}"
+        if device.startswith("cuda:"):
+            _ensure_paddle_device_context(int(device.split(":", 1)[1]))
         return device
     idx = getattr(device, "index", None)
     if idx is None:
         try:
             idx = device.gpu_device_id()
         except Exception:
-            idx = 0
-    return f"cuda:{int(idx) if idx is not None else 0}"
+            idx = _selected_cuda_device()
+    device_id = int(idx) if idx is not None else _selected_cuda_device()
+    _ensure_paddle_device_context(device_id)
+    return f"cuda:{device_id}"
 
 
 def _copy_tpe_h2d_async(tpe_list, device):
@@ -551,6 +593,7 @@ def deepep_to_sonic_metadata(
     total_pad_rows : int
         Number of padding slots added (for reference; x is NOT padded).
     """
+    device = _normalize_device(device)
     if _HAS_CUDA_KERNEL:
         return _deepep_to_sonic_metadata_cuda(tokens_per_expert, T, E, device, block)
     return _deepep_to_sonic_metadata_python(tokens_per_expert, T, E, device, block)
