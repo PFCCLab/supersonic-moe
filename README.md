@@ -32,8 +32,8 @@ Latest Ernie-shape benchmark (`T=8192,H=3072,I=1536,E=8,K=8`, Target GPU, nsys G
 | FP8 busy time | **2659.8 µs/iter** | `reports/fresh_benchmark_ws1/` |
 | MFU | **46.51%** | denominator: 4500 TFLOPS FP8 peak |
 | Peak measured MFU | **51.61%** | `T8192-H4096-I4096-E8-K8` |
-| Speedup vs current QuACK BF16 | **1.11x** | `2659.8` vs `2942.5 µs`; fair in-repo baseline |
-| Speedup vs historical cuBLAS/PyTorch BF16 | **~1.37x** | useful historical reference only |
+| Speedup vs true BF16 (same codebase) | **1.63x** | `2659.8` vs `4346 µs`; BF16 verified zero FP8 kernels |
+| Speedup vs historical S53 cuBLAS BF16 | **~1.84x** | S53 `3644 µs` is PyTorch-native, no Paddle proxy |
 | Precision | cos >= 0.997, RRMSE < 7.6% | output/dx/ds/dw1/dw2 suites |
 | Determinism | bit-exact repeated fwd/bwd | `tests/fp8_frontier_determinism_test.py` hard gate |
 
@@ -323,7 +323,7 @@ See `HANDOFF.md` for full kernel breakdown, memory notes, and next-step prioriti
 | 7 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log only; current-state correction block at top |
 | 8 | **Environment** | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
 
-> **Project state (clean handoff, 2026-05-07)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest Ernie-shape FP8 busy time is **2659.8 µs/iter** and **46.51% MFU**. Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization (live-range shortening / fission), not direct dz-quant epilogue fusion.
+> **Project state (clean handoff, 2026-05-09)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest Ernie-shape FP8 busy time is **2659.8 µs/iter** (**46.51% MFU**, **1.63x vs true BF16**). BF16 baseline (4346 µs) now verified clean via nsys (zero FP8 kernels). Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization (live-range shortening / fission), NOT direct dz-quant epilogue fusion. MXFP8 128-row alignment waste analysis completed — see `/panzhaowu/bkup/mxfp8_alignment_waste_analysis.pdf`.
 
 **Quick-validate the frontier before resuming work**:
 ```bash
