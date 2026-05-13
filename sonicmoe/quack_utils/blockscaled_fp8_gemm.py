@@ -134,6 +134,26 @@ def _div_up(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _safe_wgrad_config(device: torch.device, num_experts: int):
+    """Get GEMM config for wgrad, with sm_103 2CTA workaround for large E.
+
+    On sm_103 (B30Z Blackwell), the 2CTA instruction path (tile_m=256, cluster_m=2)
+    triggers CUDA_ERROR_ILLEGAL_ADDRESS when num_experts > 8 with large per-expert K.
+    This is a hardware/compiler limitation in the tcgen05.mma CtaGroup.TWO path.
+    Fall back to a conservative 1-CTA config (tile_m=128) for large expert counts.
+    """
+    config = default_config(device)
+    if num_experts > 8 and config.cluster_m >= 2:
+        cap = get_device_capacity(device)
+        if cap[0] == 10 and cap[1] >= 3:  # sm_103, sm_103a, etc.
+            from quack.gemm_interface import GemmConfig
+            config = GemmConfig(
+                tile_m=128, tile_n=128, cluster_m=1, cluster_n=1,
+                pingpong=False, is_dynamic_persistent=True,
+            )
+    return config
+
+
 def _get_blockscaled_expert_capacity() -> int:
     value = os.getenv("SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY")
     if value is None:
@@ -426,77 +446,10 @@ def prefetch_blockscaled_w2_fp8(
 
 
 # ---------------------------------------------------------------------------
-# Fast fused blockscaled quantization kernel for flat 2D activations
+# Fast fused blockscaled quantization kernel for flat 2D activations (v2)
 # ---------------------------------------------------------------------------
 # Single-pass: read bf16 -> compute per-32 amax -> E8M0 scale -> quantize -> write fp8 + scales
-# Replaces the Python quantize_activation_blockwise which does ~8 separate kernel launches.
-
-@wrap_triton_kernel
-@triton.jit
-def _quantize_flat_blockscaled_kernel(
-    src_ptr,
-    dst_fp8_ptr,
-    dst_scale_ptr,
-    rows,
-    cols,
-    src_stride_row,
-    src_stride_col,
-    dst_stride_row,
-    dst_stride_col,
-    scale_stride_row,
-    scale_stride_col,
-    fp8_max: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    GROUPS_PER_BLOCK: tl.constexpr,
-):
-    """Quantize a flat (M, K) bf16 tensor to blockscaled FP8 with 1×GROUP_SIZE scales.
-
-    Each program processes BLOCK_ROWS × GROUPS_PER_BLOCK groups.
-    """
-    row_base = tl.program_id(0) * BLOCK_ROWS
-    group_base = tl.program_id(1) * GROUPS_PER_BLOCK
-
-    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
-    row_mask_1d = row_ids < rows
-
-    for g in range(GROUPS_PER_BLOCK):
-        group_id = group_base + g
-        col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-
-        col_mask = col_offsets[None, :] < cols
-        mask = row_mask_1d[:, None] & col_mask
-
-        src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
-        values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
-
-        block_amax = tl.max(tl.abs(values), axis=1)
-
-        # Pure-integer E8M0 computation (matches CUTLASS/sgl convention):
-        # E8M0 = biased_exponent(amax) - 8 + carry
-        # where carry = 1 iff mantissa(amax) > mantissa(fp8_max=448=1.75*2^8)
-        # This avoids all log2/ceil/exp2 float precision issues.
-        amax_bits = block_amax.to(tl.int32, bitcast=True)
-        biased_exp = (amax_bits >> 23) & 0xFF
-        mantissa_bits = amax_bits & 0x7FFFFF
-        # fp8_max = 448 = 1.75 * 2^8; mantissa of 1.75 in IEEE754 = 0x600000
-        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
-        e8m0_i32 = biased_exp - 8 + carry
-        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
-        e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
-
-        # Quant scale = 2^(127 - e8m0) = 1 / dequant_scale
-        # Construct exact power-of-2 float via bit manipulation.
-        quant_biased_exp = 254 - e8m0_i32
-        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
-        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-
-        quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
-        dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
-        tl.store(dst_ptrs, quantized, mask=mask)
-        scale_ptrs = dst_scale_ptr + row_ids * scale_stride_row + group_id * scale_stride_col
-        tl.store(scale_ptrs, e8m0_byte, mask=row_mask_1d)
-
+# High-BW version with large tiles and vectorized access patterns.
 
 @wrap_triton_kernel
 @triton.jit
@@ -510,6 +463,7 @@ def _quantize_flat_v2_kernel(
     GROUP_SIZE: tl.constexpr,       # 32
     TILE_ROWS: tl.constexpr,        # 128
     TILE_COLS: tl.constexpr,        # 256
+    SAFE_INT64: tl.constexpr = False,
 ):
     """High-BW blockscaled quantize: large tiles, vectorized, pipelined.
 
@@ -529,6 +483,8 @@ def _quantize_flat_v2_kernel(
 
     row_offs = row_base + tl.arange(0, TILE_ROWS)
     row_mask = row_offs < rows
+    if SAFE_INT64:
+        row_offs = row_offs.to(tl.int64)
 
     for g in tl.range(0, GROUPS_PER_TILE):
         col_offs = col_base + g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
@@ -581,6 +537,9 @@ def quantize_activation_blockscaled_fast(
 
     TILE_ROWS = 128  # Larger tile: fewer CTAs, better wave occupancy
     TILE_COLS = min(K, 256)
+    # INT32 overflow guard
+    _max_stride = max(x.stride(0), fp8_out.stride(0))
+    _needs_int64 = int((M - 1) * _max_stride > 2**31 - 1)
     grid = (_div_up(M, TILE_ROWS), _div_up(K, TILE_COLS))
     _quantize_flat_v2_kernel[grid](
         x,
@@ -598,6 +557,7 @@ def quantize_activation_blockscaled_fast(
         GROUP_SIZE=group_size,
         TILE_ROWS=TILE_ROWS,
         TILE_COLS=TILE_COLS,
+        SAFE_INT64=_needs_int64,
     )
     return fp8_out, scale_out
 
@@ -1585,7 +1545,7 @@ def _colwise_quantize_and_pack_kernel(
         quant_scale = ((254 - e8m0_i32).to(tl.int32) << 23).to(tl.float32, bitcast=True)
         quantized = (values * quant_scale[None, :]).to(tl.float8e4nv)
 
-        dst_ptrs = dst_fp8_ptr + k_offs[:, None] * dst_stride_row + dim_offs[None, :] * dst_stride_col
+        dst_ptrs = dst_fp8_ptr + k_offs[:, None].to(tl.int64) * dst_stride_row + dim_offs[None, :].to(tl.int64) * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
 
         k_tiles_idx = pid_group // groups_per_k_tile
@@ -2399,6 +2359,16 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
     assert accumulator.dtype == torch.float32
     assert accumulator.shape == (num_experts, M, N)
     assert accumulator.is_contiguous()
+    # ISA-packed colwise scales (shape (1, flat)) cannot be sliced along K.
+    # Correct chunking requires per-chunk colwise_quantize_and_pack (expensive).
+    # CuTe DSL uses 64-bit addressing — verified up to 2.4 GiB on sm_103.
+    _accum_bytes = num_experts * M * N * 4
+    if _accum_bytes > 8 * (1 << 30):
+        raise RuntimeError(
+            f"Wgrad accumulator {_accum_bytes / (1 << 30):.1f} GiB exceeds 8 GiB limit "
+            f"(E={num_experts}, M={M}, N={N}). Implement per-chunk "
+            f"colwise_quantize_and_pack + independent GEMM calls."
+        )
 
     a_logical = a_fp8.T
     b_logical = b_fp8.T
@@ -2556,6 +2526,13 @@ def _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
     assert accumulator.dtype == torch.float32
     assert accumulator.shape == (num_experts, M, N)
     assert accumulator.is_contiguous()
+    _accum_bytes = num_experts * M * N * 4
+    if _accum_bytes > 8 * (1 << 30):
+        raise RuntimeError(
+            f"Wgrad accumulator {_accum_bytes / (1 << 30):.1f} GiB exceeds 8 GiB limit "
+            f"(E={num_experts}, M={M}, N={N}). Implement per-chunk "
+            f"colwise_quantize_and_pack + independent GEMM calls."
+        )
 
     a_logical = a_fp8.T
     b_logical = b_fp8.T

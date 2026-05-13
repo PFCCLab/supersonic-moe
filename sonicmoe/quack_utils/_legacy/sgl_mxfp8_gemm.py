@@ -1,7 +1,7 @@
 """sgl-kernel MXFP8 blockscaled grouped GEMM for varlen MoE.
 
 Uses ``es_sm100_mxfp8_blockscaled_grouped_mm`` from sgl-kernel for
-hardware-native MXFP8 blockscaled GEMM on SM100 GPUs.
+hardware-native MXFP8 blockscaled GEMM on Blackwell SM100 GPUs.
 
 Scale layout
 ------------
@@ -49,8 +49,7 @@ from sonicmoe.functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity
 from sonicmoe.quack_utils.blockscaled_fp8_gemm import quantize_activation_blockscaled_fast
 
 # ──────────────────────────────────────────────────────────────────────
-# Weight FP8 cache (keyed by (data_ptr, version, shape) for correctness
-# after optimizer in-place updates)
+# Weight FP8 cache (keyed by (data_ptr, shape) to survive ptr reuse)
 # ──────────────────────────────────────────────────────────────────────
 _SGL_WEIGHT_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -128,8 +127,7 @@ def precompute_weight_fp8_sgl(
     w_scales_tiled : ``(E, dim0, dim1//32)`` uint8
         ScaleFactorTileLayout applied per-expert.
     """
-    _ver = w._inplace_version() if callable(getattr(w, '_inplace_version', None)) else getattr(w, '_version', 0)
-    key = (w.data_ptr(), _ver, tuple(w.shape))
+    key = (w.data_ptr(), tuple(w.shape))
     if key in _SGL_WEIGHT_CACHE:
         return _SGL_WEIGHT_CACHE[key]
 

@@ -27,10 +27,30 @@ from ..quack_utils import (
     quantize_and_pack_activation,
 )
 from quack.gemm_interface import default_config, gemm, gemm_add
+from quack.cute_dsl_utils import get_device_capacity
 from ..quack_utils.gemm_dgated import gemm_dgated as gemm_dgated_kernel
 from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
 
 apply_fp8_quack_patch()
+
+
+def _safe_dgated_config(device, num_experts: int):
+    """Safe tile config for GemmDGated/GemmGated on sm_103 with large E.
+
+    2CTA instructions (tile_m=256, cluster_m=2) crash on sm_103 when
+    num_experts > 8 due to CuTe TMA descriptor limits for the L dimension.
+    """
+    config = default_config(device)
+    if num_experts > 8 and config.cluster_m >= 2:
+        cap = get_device_capacity(device)
+        if cap[0] == 10 and cap[1] >= 3:
+            from quack.gemm_interface import GemmConfig
+            config = GemmConfig(
+                tile_m=128, tile_n=128, cluster_m=1, cluster_n=1,
+                pingpong=False, is_dynamic_persistent=True,
+            )
+    return config
+
 
 from .backward import (
     _softmax_topk_bwd,
@@ -74,11 +94,6 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 # columns 1,3,5,...=up.
 
 from ..quack_utils.swiglu_triton import (
-    swiglu_forward_triton,
-    swiglu_backward_triton,
-    swiglu_forward_quant_pack_triton,
-    swiglu_backward_quant_pack_triton,
-    swiglu_backward_from_fp8_triton,
     dequantize_blockscaled_fp8,
 )
 from ..quack_utils.blockscaled_fp8_gemm import (
@@ -513,6 +528,7 @@ def _use_fused_swiglu_quant() -> bool:
     cfg = get_active_config()
     if cfg is not None and cfg.fused_swiglu_quant is not None:
         return cfg.fused_swiglu_quant
+    return os.getenv("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_wgrad_beta_accum() -> bool:
@@ -526,7 +542,6 @@ def _use_wgrad_beta_accum() -> bool:
     epilogue (86 regs, epi_c_stage=2).
     """
     return os.getenv("SONIC_MOE_FP8_WGRAD_BETA_ACCUM", "").lower() in {"1", "true", "yes", "on"}
-    return os.getenv("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fused_zy1_quant() -> bool:

@@ -40,6 +40,26 @@ echo "--- [CORE] ops/test_gemm_gated.py (fused gated GEMM) ---"
 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/ops/test_gemm_gated.py -v --tb=short 2>&1 || true
 
+# FP8 frontier stress test — HARD failure for precision regression.
+echo ""
+echo "--- fp8_frontier_stress_test.py (17 tests, routing stress) ---"
+USE_QUACK_GEMM=1 python -m pytest tests/fp8_frontier_stress_test.py -v --tb=short 2>&1
+
+# Precision audit (6 shapes including E=32@small-N)
+echo ""
+echo "--- test_mlpnode_precision.py (6-shape precision audit) ---"
+USE_QUACK_GEMM=1 python tests/ops/test_mlpnode_precision.py 2>&1
+
+# Large-shape correctness (SEQ=16K, TK=131072)
+echo ""
+echo "--- test_mlpnode_correctness_large.py ---"
+USE_QUACK_GEMM=1 python -m pytest tests/ops/test_mlpnode_correctness_large.py -v --tb=short 2>&1
+
+# Extreme memory stress test (TK up to 786K, int32 boundary crossing)
+echo ""
+echo "--- test_frontier_stress_sanitizer.py (extreme shapes, HARD-fail) ---"
+USE_QUACK_GEMM=1 python tests/ops/test_frontier_stress_sanitizer.py 2>&1
+
 echo ""
 echo "--- [CORE] ops/test_gemm_dgated.py (dGated backward) ---"
 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \

@@ -50,5 +50,5 @@ from .blockscaled_fp8_gemm import (
     quantize_and_pack_activation,
 )
 from .gemm_interface import gemm_dgated, gemm_gated
-from .sgl_mxfp8_gemm import clear_sgl_weight_cache
+from ._legacy.sgl_mxfp8_gemm import clear_sgl_weight_cache
 from .triton_blockscaled_gemm import clear_raw_weight_cache
