@@ -39,13 +39,14 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 # Re-use the rank-aware tile_atom_to_shape_SF from our monkey-patch
 from .blockscaled_fp8_gemm import _tile_atom_to_shape_SF_rank_aware
 
-# Import mixins for GemmGated/GemmDGated from our local files
-from .gemm_gated import (
+# Import mixins for GemmGated/GemmDGated from the leaf epilogues module
+from ._gated_epilogues import (
     GemmGatedMixin,
     GemmGatedBlockscaledQuantMixin,
     BlockscaledQuantOnlyMixin,
+    GemmDGatedMixin,
+    GemmDGatedFP8CLoadMixin,
 )
-from .gemm_dgated import GemmDGatedMixin, GemmDGatedFP8CLoadMixin
 
 from cutlass.utils import LayoutEnum
 
