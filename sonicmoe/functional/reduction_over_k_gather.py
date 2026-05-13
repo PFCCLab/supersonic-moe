@@ -73,15 +73,23 @@ def token_gather_sum_kernel(
     BLOCK_K: tl.constexpr,
     w_is_None: tl.constexpr,
     is_varlen_K: tl.constexpr,
+    SAFE_INT64: tl.constexpr = False,
 ):
     # 1D tiling over T only
     pid_t = tl.program_id(axis=0)
-    t_idx = pid_t.to(tl.uint32)
+    if SAFE_INT64:
+        t_idx = pid_t.to(tl.int64)
+    else:
+        t_idx = pid_t.to(tl.uint32)
 
     # Load segment starts and ends for this token
     if is_varlen_K:
-        Ms = tl.load(M_offset_ptr + t_idx).to(tl.uint32)
-        Me = tl.load(M_offset_ptr + t_idx + 1).to(tl.uint32)
+        if SAFE_INT64:
+            Ms = tl.load(M_offset_ptr + t_idx).to(tl.int64)
+            Me = tl.load(M_offset_ptr + t_idx + 1).to(tl.int64)
+        else:
+            Ms = tl.load(M_offset_ptr + t_idx).to(tl.uint32)
+            Me = tl.load(M_offset_ptr + t_idx + 1).to(tl.uint32)
         K_this_token = Me - Ms  # actual K for this token
     else:
         Ms = MAX_K * t_idx
@@ -89,7 +97,10 @@ def token_gather_sum_kernel(
 
     # Outer loop over H tiles
     for h_tile in tl.static_range(triton.cdiv(H, BLOCK_H)):
-        h_idx = (h_tile * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.uint32)  # [BLOCK_H]
+        if SAFE_INT64:
+            h_idx = (h_tile * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.int64)
+        else:
+            h_idx = (h_tile * BLOCK_H + tl.arange(0, BLOCK_H)).to(tl.uint32)  # [BLOCK_H]
         m_h = h_idx < H
 
         # Initialize accumulator for this H tile
@@ -99,7 +110,10 @@ def token_gather_sum_kernel(
         for k_tile in tl.range(tl.cdiv(K_this_token, BLOCK_K)):
             k_offset = k_tile * BLOCK_K
 
-            k_idx = (k_offset + tl.arange(0, BLOCK_K)).to(tl.uint32)  # [BLOCK_K]
+            if SAFE_INT64:
+                k_idx = (k_offset + tl.arange(0, BLOCK_K)).to(tl.int64)
+            else:
+                k_idx = (k_offset + tl.arange(0, BLOCK_K)).to(tl.uint32)  # [BLOCK_K]
 
             # Mask for valid K indices
             m_k = k_idx < K_this_token  # [BLOCK_K]
@@ -108,7 +122,10 @@ def token_gather_sum_kernel(
             m_abs = Ms + k_idx  # [BLOCK_K]
 
             # Gather permuted indices
-            perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.uint32)  # [BLOCK_K]
+            if SAFE_INT64:
+                perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.int64)
+            else:
+                perm_idx = tl.load(M_perm_ptr + m_abs, mask=m_k, other=0).to(tl.uint32)  # [BLOCK_K]
 
             # Load x values: [BLOCK_K, BLOCK_H]
             x_ptrs = x_ptr + perm_idx[:, None] * stride_xM + h_idx[None, :] * stride_xH
@@ -146,6 +163,10 @@ def token_gather_and_sum_varlen_K_triton(
 
     where K[i] = M_offset[i+1] - M_offset[i] can vary per token.
     """
+    # INT32/UINT32 overflow guard: perm_idx * stride_xM or t_idx * stride_outT
+    _max_x_offset = (x.shape[0] - 1) * x.stride(0)
+    _max_out_offset = (T - 1) * out.stride(0)
+    _needs_int64 = int(max(_max_x_offset, _max_out_offset) > 2**32 - 1)
 
     # 1D grid over T only
     token_gather_sum_kernel[(T,)](
@@ -163,4 +184,5 @@ def token_gather_and_sum_varlen_K_triton(
         stride_outH=out.stride(1),
         w_is_None=(w is None),
         is_varlen_K=is_varlen_K,
+        SAFE_INT64=_needs_int64,
     )
