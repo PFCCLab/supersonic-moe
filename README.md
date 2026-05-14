@@ -93,6 +93,13 @@ $$\mathrm{MFU} = \frac{18\,H\,I}{\;P\!\left[\,\alpha\,H\,I + \beta\,D\,\ln\!\big
 | H=4096 I=4096 | **52.4%** @33K | 49.1% | 43.6% | 41.0% |
 | H=6144 I=3072 | **52.9%** @33K | 50.5% | 44.3% | 44.6% |
 
+<p align="center">
+<img src="reports/mfu_model_nsys.png" width="100%" alt="MFU model curves and contours"/>
+</p>
+
+*Left column*: MFU vs TK with model curves (solid) and nsys-measured points (markers). Dashed line = steady-state.  
+*Right column*: MFU contour in (log₁₀TK, E) space; red curve = TK* (peak MFU trajectory).
+
 Read first:
 
 | Priority | Document | Purpose |
