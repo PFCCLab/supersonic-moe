@@ -53,36 +53,36 @@ Ernie:
 
 ### Performance Model
 
-$$T_{\text{proj}}(\mathrm{TK}, H, I, E) \;=\; \underbrace{\alpha \,\mathrm{TK}\, H\, I}_{\text{compute}} \;+\; \underbrace{\beta \,\mathrm{TK}\, D\, \ln\!\left(1 + \frac{\mathrm{TK}}{\mathrm{TK}_0}\right)}_{\text{L2 miss penalty}} \;+\; \underbrace{\gamma\, E}_{\text{expert setup}}$$
+$$T_{\text{proj}}(\text{TK}, H, I, E) = \underbrace{\alpha \cdot \text{TK} \cdot H \cdot I}\_{\text{compute}} + \underbrace{\beta \cdot \text{TK} \cdot D \cdot \ln\left(1 + \frac{\text{TK}}{\text{TK}\_0}\right)}\_{\text{L2 miss penalty}} + \underbrace{\gamma \cdot E}\_{\text{expert setup}}$$
 
-$$\mathrm{MFU} = \frac{18\,\mathrm{TK}\,H\,I}{P \cdot T_{\text{proj}}}, \quad D = \max(H,\,2I), \quad P = 4500\;\text{TFLOPS (FP8 peak)}$$
+$$\text{MFU} = \frac{18 \cdot \text{TK} \cdot H \cdot I}{P \cdot T_{\text{proj}}}, \quad D = \max(H, 2I), \quad P = 4500 \text{ TFLOPS (FP8 peak)}$$
 
 | Parameter | Value | Derivation |
 |-----------|-------|------------|
-| $\alpha$ | $7.494\times10^{-9}$ | $=18/(P\,\eta_{\mathrm{tc}})$, &ensp; $\eta_{\mathrm{tc}}=53.4\%$ |
-| $\beta$ | $9.934\times10^{-7}$ | L2 miss penalty per (access $\times$ refetch-width) |
-| $\mathrm{TK}_0$ | 45 710 | $\approx \frac{L_2/E}{\mathrm{tile}_M\,\mathrm{tile}_N\,b_{\mathrm{elem}}} \cdot \mathrm{tile}_M = \frac{96\text{MB}/8}{64\text{KB}}\cdot256 \approx 49\text{K}$ |
-| $\gamma$ | 21.75 µs | Per-expert TMA descriptor + metadata |
+| α | 7.494 × 10⁻⁹ | = 18/(P · η\_tc), η\_tc = 53.4% |
+| β | 9.934 × 10⁻⁷ | L2 miss penalty per (access × refetch-width) |
+| TK₀ | 45 710 | ≈ (L2/E) / (tile\_M · tile\_N · b\_elem) · tile\_M = (96MB/8) / 64KB · 256 ≈ 49K |
+| γ | 21.75 µs | Per-expert TMA descriptor + metadata |
 
-Fit: MAPE = 3.95%, MFU MAE = 1.55%, $N=94$ (uniform $4E\times4HI\times6\text{TK}$ grid + 16 large-TK).
+Fit: MAPE = 3.95%, MFU MAE = 1.55%, N = 94 (uniform 4E × 4HI × 6TK grid + 16 large-TK).
 
 #### Term semantics
 
 | # | Term | Physical origin | Why this functional form |
 |---|------|----------------|--------------------------|
-| 1 | $\alpha\,\mathrm{TK}\,H\,I$ | 6 CUTLASS GEMMs totalling $18\,\mathrm{TK}\,H\,I$ FLOPs. $\eta_{\mathrm{tc}}<1$ due to persistent-scheduler per-tile overhead and DGated epilogue register pressure (168 regs → 1 block/SM occupancy). | $\propto F/P$ at constant $\eta_{\mathrm{tc}}$. Shape-invariant: same tile config (256², cluster 2×1) across all $(H,I)$. |
-| 2 | $\beta\,\mathrm{TK}\,D\,\ln(1{+}\mathrm{TK}/\mathrm{TK}_0)$ | Weight-tile L2 reuse breakdown. Scheduler cycles TK/tile$_M$ tiles; when this exceeds L2 capacity per expert ($\sim$192 sets), multi-stream SM contention drives miss rate $\propto\ln(\mathrm{TK}/\mathrm{TK}_0)$. Each miss refetches $D$ bytes (widest tile dimension). | **$D=\max(H,2I)$**: max column-width among the 6 GEMMs' B-tensors.  **$\mathrm{TK}$**: total L2 accesses ∝ token count.  **$\ln(1{+}x)$**: smooth onset (≈0 for $\mathrm{TK}\ll\mathrm{TK}_0$; $\approx\ln x$ for $\mathrm{TK}\gg\mathrm{TK}_0$); empirical consensus for shared-cache thrashing under randomized multi-tenant load. |
-| 3 | $\gamma\,E$ | Per-expert one-time: TMA descriptor, weight-cache version check, routing histogram. $O(1)$ per expert, independent of TK, $H$, $I$. | At $E{=}8$: 174 µs ($<7\%$); at $E{=}128$: 2784 µs (dominant only when TK$<$50K). |
+| 1 | α · TK · H · I | 6 CUTLASS GEMMs totalling 18 · TK · H · I FLOPs. η\_tc < 1 due to persistent-scheduler per-tile overhead and DGated epilogue register pressure (168 regs → 1 block/SM). | Proportional to F/P at constant η\_tc. Shape-invariant: same tile config (256², cluster 2×1) across all (H, I). |
+| 2 | β · TK · D · ln(1 + TK/TK₀) | Weight-tile L2 reuse breakdown. Scheduler cycles TK/tile\_M tiles; when this exceeds L2 capacity per expert (~192 sets), multi-stream SM contention drives miss rate proportional to ln(TK/TK₀). Each miss refetches D bytes. | **D = max(H, 2I)**: widest tile dimension among the 6 GEMMs' B-tensors. **TK**: total L2 accesses ∝ token count. **ln(1+x)**: smooth onset; empirical consensus for shared-cache thrashing under randomized multi-tenant load. |
+| 3 | γ · E | Per-expert one-time: TMA descriptor, weight-cache version check, routing histogram. O(1) per expert, independent of TK, H, I. | E=8: 174 µs (< 7%); E=128: 2784 µs (dominant only when TK < 50K). |
 
 #### MFU phase diagram
 
-$$\mathrm{MFU} = \frac{18\,H\,I}{\;P\!\left[\,\alpha\,H\,I + \beta\,D\,\ln\!\bigl(1{+}\tfrac{\mathrm{TK}}{\mathrm{TK}_0}\bigr) + \tfrac{\gamma E}{\mathrm{TK}}\,\right]}$$
+$$\text{MFU}(\text{TK}) = \frac{18 \cdot H \cdot I}{P \left[ \alpha \cdot H \cdot I + \beta \cdot D \cdot \ln\left(1 + \frac{\text{TK}}{\text{TK}\_0}\right) + \frac{\gamma \cdot E}{\text{TK}} \right]}$$
 
 | Phase | Regime | Limiting behavior |
 |-------|--------|-------------------|
-| Rise | $\mathrm{TK} \ll \mathrm{TK}_0$ | $\mathrm{MFU} \approx 18\,H\,I\,\mathrm{TK}\;/\;(P\,\gamma E)$ &ensp; (linear ↑) |
-| Peak | $\mathrm{TK} \sim \mathrm{TK}_0$ | Maximum; $\partial\mathrm{MFU}/\partial\mathrm{TK}=0$ |
-| Decay | $\mathrm{TK} \gg \mathrm{TK}_0$ | $\mathrm{MFU} \propto 1/\ln\mathrm{TK}$ &ensp; (logarithmic ↓) |
+| Rise | TK ≪ TK₀ | MFU ≈ 18 · H · I · TK / (P · γ · E), linear ↑ |
+| Peak | TK ~ TK₀ | Maximum, ∂MFU/∂TK = 0 |
+| Decay | TK ≫ TK₀ | MFU ∝ 1/ln(TK), logarithmic ↓ |
 
 #### Validation (E = 8)
 
