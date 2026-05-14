@@ -51,30 +51,34 @@ Ernie:
   MFU = 46.51%
 ```
 
-Empirical scaling model (nsys GPU-projection, 35-point 8-GPU sweep, 2026-05-14):
+Empirical scaling model (nsys GPU-projection, 78-point 8-GPU uniform grid, 2026-05-14):
 
 ```text
-gpu_proj_us =
-  18*TK*H*I / (4500e6 * 0.589100)
-  + 3593.58 * TK * max(H, 2*I) * 1e-9
-  + 16.63 * E
-  + -41
+gpu_proj_us = 8.619e-9 * TK * H * I + 25.4 * E - 279
 
-MFU = 18*TK*H*I / (4500e6 * gpu_proj_us)
+MFU = 18*TK*H*I / (4500e6 * gpu_proj_us) * 100%
+    = η / (1 + (25.4*E - 279) / (8.619e-9 * TK * H * I))
 
 Parameters:
-  η = 0.5891  TC utilization (CUTLASS persistent scheduler ceiling)
-  β = 3593.6  memory-bound overhead (FP8 quant + tile scheduler)
-  γ = 16.6 µs per-expert fixed cost (weight cache + metadata)
-  δ = -41 µs  constant
+  α = 8.619e-9 µs/(TK·H·I)  per-FLOP GPU cost (compute + quant)
+  γ = 25.4 µs/expert         per-expert fixed (weight cache + metadata)
+  δ = -279 µs                constant (valid only for TK > 32K)
+  η = 46.4%                  asymptotic MFU (TK→∞, all shapes converge)
 
-Asymptotic MFU (TK → ∞, independent of E):
-  Ernie  (H=3072, I=1536): 43.8%
-  Qwen3  (H=4096, I=2048): 46.8%
-  70B    (H=6144, I=3072): 50.3%
+Key properties:
+  • MFU∞ = η = 46.4% (universal ceiling, indep. of H, I, E)
+  • Larger H×I reaches η faster (fixed overhead amortized sooner)
+  • E only affects convergence SPEED to η, not the ceiling
+  • Model valid for: TK∈[32K,2M], E∈[8,128], H∈[3072,6144]
+  • MAPE = 5.9% across 78 uniformly sampled shapes
 
-Ernie verification:
-  E=8, TK=65536: model=2898us, nsys=2715us (MFU=45.6%)
+Half-MFU TK (where MFU = η/2 ≈ 23%):
+  E=8:   always above η/2 for TK>32K (startup negligible)
+  E=128: TK_half ≈ 73K (H=3072) / 18K (H=6144)
+
+Limitation: model predicts FLAT MFU at large TK. Empirically,
+MFU drops ~2-3% per TK decade above TK=200K due to L2 cache
+thrashing (measured in 10-point deep E=8 sweep to TK=6.3M).
 ```
 
 Read first:
