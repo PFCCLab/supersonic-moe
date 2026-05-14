@@ -15,21 +15,21 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_CSV = os.path.join(_REPO, "reports", "perf_sweep_nsys_8gpu.csv")
 OUT_DIR = os.path.join(_REPO, "reports")
 
-# ═══ MODEL PARAMETERS (steady-state anchored, 94-point fit) ═══
-# gpu_proj_us = α·TK·H·I + β·TK·max(H,2I) + γ·E + δ
-ALPHA = 7.392397e-9    # per-FLOP cost (compute + quant)
-BETA = 4.092055e-6     # HBM bandwidth overhead (per data-volume unit)
-GAMMA = 23.6           # per-expert fixed (µs)
-DELTA = -598.0         # constant startup (µs)
+# ═══ MODEL PARAMETERS (5-param constrained fit, 94 points, MAPE=4.0%) ═══
+# gpu_proj_us = α·TK·H·I + β·TK·max(H,2I)·ln(1+TK/TK₀) + γ·E + δ
+ALPHA = 7.693471e-9    # per-FLOP cost (compute + L2-warm quant)
+BETA = 1.097838e-6     # L2 miss penalty coefficient
+TK0 = 93072.0          # L2 transition scale (TK where L2 misses become significant)
+GAMMA = 21.61          # per-expert fixed (µs)
+DELTA = 0.0            # constant startup (µs) — zero by constraint
 PEAK_TFLOPS = 4500     # B30Z FP8 peak (TFLOPS)
-
-# Derived: MFU∞(H,I) = 18HI / (4500e6 × (ALPHA·HI + BETA·max(H,2I)))
-ETA = None  # No single η — asymptote is shape-dependent
 
 
 def gpu_proj_us(TK, H, I, E):
     """Predict GPU-projection time (µs) for fwd+bwd."""
-    return ALPHA * TK * H * I + BETA * TK * max(H, 2*I) + GAMMA * E + DELTA
+    return (ALPHA * TK * H * I
+            + BETA * TK * max(H, 2*I) * np.log(1.0 + TK / TK0)
+            + GAMMA * E + DELTA)
 
 
 def mfu_pct(TK, H, I, E):
@@ -41,8 +41,8 @@ def mfu_pct(TK, H, I, E):
 
 
 def mfu_inf(H, I):
-    """Shape-dependent MFU steady-state (TK→∞)."""
-    return 18.0 * H * I / (PEAK_TFLOPS * 1e6 * (ALPHA * H * I + BETA * max(H, 2*I))) * 100.0
+    """Approximate steady-state MFU at TK=4M (practical ∞)."""
+    return mfu_pct(4194304, H, I, 8)
 
 
 def load_data():
@@ -209,20 +209,21 @@ def main():
         max_mfu_curve = max(np.max(m) for m in all_mfus)
         ax.set_ylim(0, min(max_mfu_curve + 8, 75))
 
-        # MFU∞ asymptote line + real peak annotation (inside axes)
+        # MFU∞ asymptote line + measured peak annotation
         e8_pts = [d for d in data if d['E']==8 and d['H']==H_val and d['I']==I_val]
         if e8_pts:
             real_peak = max(e8_pts, key=lambda d: d['mfu'])
-            mfu_asymp = mfu_inf(H_val, I_val)
-            ax.axhline(y=mfu_asymp, color='gray', linestyle=':', lw=1.5, alpha=0.7, zorder=2)
-            ax.text(4e6, mfu_asymp - 3, f'MFU∞={mfu_asymp:.1f}%', fontsize=8,
+            mfu_steady = mfu_pct(4000000, H_val, I_val, 8)
+            ax.axhline(y=mfu_steady, color='gray', linestyle=':', lw=1.5, alpha=0.7, zorder=2)
+            ax.text(4e6, mfu_steady + 1.5, f'steady≈{mfu_steady:.0f}%', fontsize=8,
                    color='gray', style='italic', ha='right')
-            # Peak info box in lower-right
-            ylim = ax.get_ylim()
-            ax.text(0.97, 0.05, f'Peak: {real_peak["mfu"]:.1f}% @ TK={real_peak["TK"]/1000:.0f}K\nMFU∞={mfu_asymp:.1f}%',
-                   fontsize=9, color='#2c3e50', fontweight='bold', transform=ax.transAxes,
-                   ha='right', va='bottom',
-                   bbox=dict(boxstyle='round', facecolor='#ecf0f1', alpha=0.85))
+            # Peak info in lower-left (axes coords, no overlap with curves)
+            ax.text(0.03, 0.05,
+                    f'Measured peak: {real_peak["mfu"]:.1f}% @ TK={real_peak["TK"]/1000:.0f}K\n'
+                    f'Steady state: ≈{mfu_steady:.0f}% (TK>2M)',
+                    fontsize=9, color='#2c3e50',
+                    transform=ax.transAxes, ha='left', va='bottom',
+                    bbox=dict(boxstyle='round', facecolor='#f8f9fa', edgecolor='#bdc3c7', alpha=0.9))
 
         ax.set_xlabel('TK (token-expert pairs)', fontsize=11)
         ax.set_ylabel('MFU (%)', fontsize=11)

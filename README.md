@@ -51,39 +51,34 @@ Ernie:
   MFU = 46.51%
 ```
 
-Empirical scaling model (nsys GPU-projection, 94-point 8-GPU uniform grid, 2026-05-14):
+Empirical scaling model (nsys GPU-projection, 94 points, 8-GPU, 2026-05-14):
 
 ```text
-gpu_proj_us = 7.392e-9·TK·H·I + 4.092e-6·TK·max(H,2I) + 23.6·E - 598
+gpu_proj_us = α·TK·H·I + β·TK·max(H,2I)·ln(1 + TK/TK₀) + γ·E
+
+Parameters:
+  α  = 7.693e-9     per-FLOP cost (GEMM compute + L2-warm quant)
+  β  = 1.098e-6     L2 cache miss penalty coefficient  
+  TK₀= 93,072       L2 transition scale (working set exceeds L2 cache)
+  γ  = 21.6 µs      per-expert fixed cost (weight cache + metadata)
 
 MFU = 18·TK·H·I / (4500e6 · gpu_proj_us) × 100%
 
-Term 1: GEMM compute + per-token quant overhead (∝ FLOPs)
-Term 2: HBM bandwidth-limited ops (∝ data volume per token)
-Term 3: Per-expert fixed cost (weight cache + metadata)
-Term 4: Constant startup
+BEHAVIOR: RISE → PEAK → DECLINE → SLOW DECAY (ln)
+  Small TK: MFU↑ as γ·E startup is amortized
+  Peak TK*: where compute and L2 penalty balance (~65K for Ernie)
+  Large TK: MFU↓ slowly as β·ln(1+TK/TK₀) grows
+  TK → ∞:  MFU → 0 logarithmically (never truly flat, but very slow)
 
-MFU∞ (TK→∞, shape-dependent steady state):
-  = 18·H·I / (4500e6·(7.392e-9·H·I + 4.092e-6·max(H,2I)))
-  H=3072 I=1536 (Ernie):  MFU∞ = 39.8%  (measured@4M: 38.3%)
-  H=4096 I=2048 (Qwen3):  MFU∞ = 42.6%  (measured@4M: 40.6%)
-  H=4096 I=4096 (peak):   MFU∞ = 42.6%  (measured@4M: 43.6%)
-  H=6144 I=3072 (70B):    MFU∞ = 45.8%  (measured@4M: 44.3%)
+Measured peaks (E=8, from 94 nsys data points):
+  H=3072 I=1536: 45.7% at TK=65K   (steady@4M: 38.3%)
+  H=4096 I=2048: 50.5% at TK=65K   (steady@4M: 40.6%)
+  H=4096 I=4096: 52.4% at TK=33K   (steady@4M: 43.6%)
+  H=6144 I=3072: 52.9% at TK=33K   (steady@4M: 44.3%)
 
-Measured PEAK MFU (from 94 nsys data points):
-  H=3072 I=1536 E=8: 45.7% at TK=65K
-  H=4096 I=2048 E=8: 50.5% at TK=65K
-  H=4096 I=4096 E=8: 52.4% at TK=33K
-  H=6144 I=3072 E=8: 52.9% at TK=33K
-
-MFU behavior: RISE → PEAK → DECLINE → STEADY STATE
-  Small TK: MFU↑ (amortizing per-expert startup)
-  Peak TK*: ~33K–65K (shape-dependent, E=8)
-  Decline: L2 thrashing (working set > L2, 2-3%/decade)
-  Steady TK>2M: converges to MFU∞ (shape-dependent constant)
-
-Fit: MAPE=2.4% on steady-state (TK≥1M), 7.1% overall (94 pts)
-     TK∈[32K,4.2M], E∈[8,128], H∈[3072,6144], I∈[1536,4096]
+Fit quality: MAPE=4.0% across 94 uniformly sampled shapes
+  E∈[8,128], H∈[3072,6144], I∈[1536,4096], TK∈[32K,4.2M]
+  All parameters ≥ 0 (physically self-consistent)
 ```
 
 Read first:
