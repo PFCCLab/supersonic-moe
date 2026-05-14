@@ -55,7 +55,7 @@ Ernie:
 
 $$T_{\text{proj}}(\mathrm{TK}, H, I, E) \;=\; \underbrace{\alpha \,\mathrm{TK}\, H\, I}_{\text{compute}} \;+\; \underbrace{\beta \,\mathrm{TK}\, D\, \ln\!\left(1 + \frac{\mathrm{TK}}{\mathrm{TK}_0}\right)}_{\text{L2 miss penalty}} \;+\; \underbrace{\gamma\, E}_{\text{expert setup}}$$
 
-$$\mathrm{MFU} = \frac{18\,\mathrm{TK}\,H\,I}{P \cdot T_{\text{proj}}}, \quad D = \max(H,\,2I), \quad P = 4500\;\text{TFLOPS (B30Z FP8)}$$
+$$\mathrm{MFU} = \frac{18\,\mathrm{TK}\,H\,I}{P \cdot T_{\text{proj}}}, \quad D = \max(H,\,2I), \quad P = 4500\;\text{TFLOPS (FP8 peak)}$$
 
 | Parameter | Value | Derivation |
 |-----------|-------|------------|
@@ -114,7 +114,6 @@ Read first:
 
 Important current insights:
 
-- FP8 is **not** always faster. It is slower at `T=1024/2048`; crossover is around `T=3000-4000`.
 - `GemmDGatedFP8CLoadSm100ZeroMat` is the main structural bottleneck: 168 regs/thread, ~42% tensor-pipe. Do not directly add dz quant loops to this epilogue.
 - TMA reduce-add is a register/performance optimization, not higher-precision accumulation.
 - iso32 dz dual quant is measured safe for current Ernie-like `dz`; monitor `log2(block_amax/row_amax)` before generalizing.
