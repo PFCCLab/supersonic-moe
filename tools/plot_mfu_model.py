@@ -174,14 +174,15 @@ def main():
     mfu_ernie = mfu_pct(65536, 3072, 1536, 8)
     print(f"Model check (Ernie): proj={proj_ernie:.0f}µs, MFU={mfu_ernie:.1f}% (measured: 2715µs, 45.6%)")
 
-    # ═══ Figure: 2×2 grid ═══
+    # ═══ Figure: 3×2 grid ═══
     # Top row: Ernie shape (H=3072, I=1536) — curve + contour
-    # Bottom row: Max-MFU shape (H=6144, I=3072) — curve + contour
-    fig, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
+    # Middle/Bottom rows: other HI configs
+    fig, axes = plt.subplots(3, 2, figsize=(16, 18))
 
     HI_configs = [
-        (3072, 1536, "Ernie (H=3072, I=1536)"),
-        (6144, 3072, "70B-scale (H=6144, I=3072)"),
+        (3072, 1536, r"$H{=}3072,\; I{=}1536$ (reference)"),
+        (4096, 2048, r"$H{=}4096,\; I{=}2048$"),
+        (4096, 4096, r"$H{=}4096,\; I{=}4096$"),
     ]
 
     for row, (H_val, I_val, title_prefix) in enumerate(HI_configs):
@@ -283,7 +284,27 @@ def main():
         ax.set_ylabel('E (experts)', fontsize=11)
         ax.set_title(f'{title_prefix}\nMFU Contour + TK* Curve', fontsize=11)
         ax.set_yticks([8, 16, 32, 64, 128])
-        ax.legend(loc='upper left', fontsize=9)
+        ax.legend(loc='upper left', fontsize=8)
+
+    # Layout: ample spacing to prevent any title/formula overlap
+    plt.subplots_adjust(top=0.94, bottom=0.10, hspace=0.32, wspace=0.28)
+
+    # Short descriptive title at top (no overlap risk with 3 rows)
+    fig.suptitle('GPU-Projection Performance Model: MFU vs TK and Expert Count',
+                 fontsize=13, y=0.98, va='top', weight='bold')
+
+    # Full formula as footer caption (no competition with subplot titles)
+    fig.text(0.50, 0.005,
+             r'$T_{\rm proj} = \alpha\cdot TK\cdot H\cdot I'
+             r' + \beta\cdot TK\cdot \max(H,2I)\cdot \ln\!\left(1+\frac{TK}{TK_0}\right)'
+             r' + \gamma\cdot E$'
+             r'$\qquad|\qquad$'
+             r'$\alpha=$' + f'{ALPHA:.3e}' + r'$, \beta=$' + f'{BETA:.3e}'
+             + r'$, TK_0=$' + f'{TK0:.0f}' + r'$, \gamma=$' + f'{GAMMA:.1f}' + r'$\mu s$'
+             r'$\qquad|\qquad$'
+             r'MAPE = 3.79%, N = 104',
+             fontsize=8.5, ha='center', va='bottom',
+             bbox=dict(boxstyle='round,pad=0.4', facecolor='#f5f6fa', edgecolor='#bdc3c7', alpha=0.9))
 
     path1 = os.path.join(OUT_DIR, "mfu_model_nsys.png")
     plt.savefig(path1, dpi=150, bbox_inches='tight')
