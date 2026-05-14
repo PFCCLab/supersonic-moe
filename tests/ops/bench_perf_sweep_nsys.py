@@ -25,12 +25,19 @@ TOPK = 8
 N_WARMUP = 12
 N_BENCH_ITERS = 8
 
-# (E, N_recv, H, I) — UNIFORM Cartesian product grid
-import itertools as _it
-_E_vals = [8, 32, 64, 128]
-_HI_vals = [(3072, 1536), (4096, 2048), (4096, 4096), (6144, 3072)]
-_N_vals = [4096, 8192, 16384, 32768, 65536, 131072]
-SWEEP_SHAPES = [(E, N, H, I) for E in _E_vals for H, I in _HI_vals for N in _N_vals]
+# (E, N_recv, H, I) — SUPPLEMENTARY: large TK to observe decline/stabilize
+SWEEP_SHAPES = [
+    (8, 262144, 3072, 1536),   (8, 524288, 3072, 1536),
+    (32, 262144, 3072, 1536),  (32, 524288, 3072, 1536),
+    (8, 262144, 4096, 2048),   (8, 524288, 4096, 2048),
+    (32, 262144, 4096, 2048),  (32, 524288, 4096, 2048),
+    (8, 262144, 4096, 4096),   (8, 524288, 4096, 4096),
+    (32, 262144, 4096, 4096),  (32, 524288, 4096, 4096),
+    (8, 262144, 6144, 3072),   (8, 524288, 6144, 3072),
+    (32, 262144, 6144, 3072),  (32, 524288, 6144, 3072),
+]
+
+# INCREMENTAL MODE: append new results to existing CSV (never overwrite valid data)
 
 
 def write_bench_script(path, E, N_recv_adj, H, I, tok_per_expert, gpu_id):
@@ -227,17 +234,34 @@ def main():
             if line.strip():
                 print(f"  {line}")
 
-    # Merge CSVs
+    # INCREMENTAL merge: read existing CSV, append new results, deduplicate
     csv_path = os.path.join(_REPO, "reports", "perf_sweep_nsys_8gpu.csv")
+    existing_lines = set()
+    if os.path.exists(csv_path):
+        with open(csv_path) as f:
+            header = next(f)
+            for line in f:
+                existing_lines.add(line.strip())
+        print(f"  Existing data: {len(existing_lines)} rows")
+
+    new_lines = set()
+    for gpu_id in range(n_gpus):
+        part = os.path.join(output_dir, f"results_gpu{gpu_id}.csv")
+        if os.path.exists(part):
+            with open(part) as f:
+                next(f)  # skip header
+                for line in f:
+                    line = line.strip()
+                    if line and ",OK" in line:
+                        new_lines.add(line)
+
+    all_lines = existing_lines | new_lines
     with open(csv_path, "w") as out_f:
         out_f.write("E,TK,N_recv,H,I,gpu_projection_us,status\n")
-        for gpu_id in range(n_gpus):
-            part = os.path.join(output_dir, f"results_gpu{gpu_id}.csv")
-            if os.path.exists(part):
-                with open(part) as f:
-                    next(f)
-                    out_f.write(f.read())
-    print(f"\nCSV saved: {csv_path}")
+        for line in sorted(all_lines):
+            out_f.write(line + "\n")
+    print(f"  New: {len(new_lines)}, Total: {len(all_lines)}")
+    print(f"CSV saved: {csv_path}")
 
 
 if __name__ == "__main__":

@@ -15,20 +15,21 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_CSV = os.path.join(_REPO, "reports", "perf_sweep_nsys_8gpu.csv")
 OUT_DIR = os.path.join(_REPO, "reports")
 
-# ═══ MODEL PARAMETERS (from uniform 78-point fit) ═══
-# M1: gpu_proj_us = α·TK·H·I + γ·E + δ
-ALPHA = 8.618805e-9   # µs per (TK·H·I)
-GAMMA = 25.44          # µs per expert
-DELTA = -279.0         # µs constant
+# ═══ MODEL PARAMETERS (steady-state anchored, 94-point fit) ═══
+# gpu_proj_us = α·TK·H·I + β·TK·max(H,2I) + γ·E + δ
+ALPHA = 7.392397e-9    # per-FLOP cost (compute + quant)
+BETA = 4.092055e-6     # HBM bandwidth overhead (per data-volume unit)
+GAMMA = 23.6           # per-expert fixed (µs)
+DELTA = -598.0         # constant startup (µs)
 PEAK_TFLOPS = 4500     # B30Z FP8 peak (TFLOPS)
 
-# Derived
-ETA = 18.0 / (PEAK_TFLOPS * 1e6 * ALPHA)  # ≈ 0.464
+# Derived: MFU∞(H,I) = 18HI / (4500e6 × (ALPHA·HI + BETA·max(H,2I)))
+ETA = None  # No single η — asymptote is shape-dependent
 
 
 def gpu_proj_us(TK, H, I, E):
     """Predict GPU-projection time (µs) for fwd+bwd."""
-    return ALPHA * TK * H * I + GAMMA * E + DELTA
+    return ALPHA * TK * H * I + BETA * TK * max(H, 2*I) + GAMMA * E + DELTA
 
 
 def mfu_pct(TK, H, I, E):
@@ -37,6 +38,11 @@ def mfu_pct(TK, H, I, E):
     if proj <= 0:
         return 0.0
     return 18.0 * TK * H * I / (PEAK_TFLOPS * 1e6 * proj) * 100.0
+
+
+def mfu_inf(H, I):
+    """Shape-dependent MFU steady-state (TK→∞)."""
+    return 18.0 * H * I / (PEAK_TFLOPS * 1e6 * (ALPHA * H * I + BETA * max(H, 2*I))) * 100.0
 
 
 def load_data():
@@ -167,7 +173,7 @@ def main():
     # ═══ Figure: 2×2 grid ═══
     # Top row: Ernie shape (H=3072, I=1536) — curve + contour
     # Bottom row: Max-MFU shape (H=6144, I=3072) — curve + contour
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
 
     HI_configs = [
         (3072, 1536, "Ernie (H=3072, I=1536)"),
@@ -203,22 +209,20 @@ def main():
         max_mfu_curve = max(np.max(m) for m in all_mfus)
         ax.set_ylim(0, min(max_mfu_curve + 8, 75))
 
-        # Peak annotation — positioned below the curve to avoid overlap
-        mfu_e8 = all_mfus[0]
-        pk_idx = np.argmax(mfu_e8)
-        pk_mfu = mfu_e8[pk_idx]
-        pk_tk = TK_line[pk_idx]
-
-        # Optimal zone shading (around E=8 peak ± factor)
-        zone_lo = pk_tk / 2
-        zone_hi = pk_tk * 4
-        ax.axvspan(zone_lo, zone_hi, alpha=0.06, color='#2ecc71', zorder=1)
-
-        # Annotation positioned in lower-left to avoid curve overlap
-        ax.text(1.5e4, max_mfu_curve * 0.15,
-                f'E=8 peak: {pk_mfu:.1f}%\nTK*≈{pk_tk/1000:.0f}K\nη∞={ETA*100:.1f}%',
-                fontsize=9, color='#2c3e50', fontweight='bold',
-                bbox=dict(boxstyle='round', facecolor='#ecf0f1', alpha=0.8))
+        # MFU∞ asymptote line + real peak annotation (inside axes)
+        e8_pts = [d for d in data if d['E']==8 and d['H']==H_val and d['I']==I_val]
+        if e8_pts:
+            real_peak = max(e8_pts, key=lambda d: d['mfu'])
+            mfu_asymp = mfu_inf(H_val, I_val)
+            ax.axhline(y=mfu_asymp, color='gray', linestyle=':', lw=1.5, alpha=0.7, zorder=2)
+            ax.text(4e6, mfu_asymp - 3, f'MFU∞={mfu_asymp:.1f}%', fontsize=8,
+                   color='gray', style='italic', ha='right')
+            # Peak info box in lower-right
+            ylim = ax.get_ylim()
+            ax.text(0.97, 0.05, f'Peak: {real_peak["mfu"]:.1f}% @ TK={real_peak["TK"]/1000:.0f}K\nMFU∞={mfu_asymp:.1f}%',
+                   fontsize=9, color='#2c3e50', fontweight='bold', transform=ax.transAxes,
+                   ha='right', va='bottom',
+                   bbox=dict(boxstyle='round', facecolor='#ecf0f1', alpha=0.85))
 
         ax.set_xlabel('TK (token-expert pairs)', fontsize=11)
         ax.set_ylabel('MFU (%)', fontsize=11)
@@ -276,7 +280,6 @@ def main():
         ax.set_yticks([8, 16, 32, 64, 128])
         ax.legend(loc='upper left', fontsize=9)
 
-    plt.tight_layout()
     path1 = os.path.join(OUT_DIR, "mfu_model_nsys.png")
     plt.savefig(path1, dpi=150, bbox_inches='tight')
     print(f"Saved: {path1}")

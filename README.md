@@ -51,34 +51,39 @@ Ernie:
   MFU = 46.51%
 ```
 
-Empirical scaling model (nsys GPU-projection, 78-point 8-GPU uniform grid, 2026-05-14):
+Empirical scaling model (nsys GPU-projection, 94-point 8-GPU uniform grid, 2026-05-14):
 
 ```text
-gpu_proj_us = 8.619e-9 * TK * H * I + 25.4 * E - 279
+gpu_proj_us = 7.392e-9·TK·H·I + 4.092e-6·TK·max(H,2I) + 23.6·E - 598
 
-MFU = 18*TK*H*I / (4500e6 * gpu_proj_us) * 100%
-    = η / (1 + (25.4*E - 279) / (8.619e-9 * TK * H * I))
+MFU = 18·TK·H·I / (4500e6 · gpu_proj_us) × 100%
 
-Parameters:
-  α = 8.619e-9 µs/(TK·H·I)  per-FLOP GPU cost (compute + quant)
-  γ = 25.4 µs/expert         per-expert fixed (weight cache + metadata)
-  δ = -279 µs                constant (valid only for TK > 32K)
-  η = 46.4%                  asymptotic MFU (TK→∞, all shapes converge)
+Term 1: GEMM compute + per-token quant overhead (∝ FLOPs)
+Term 2: HBM bandwidth-limited ops (∝ data volume per token)
+Term 3: Per-expert fixed cost (weight cache + metadata)
+Term 4: Constant startup
 
-Key properties:
-  • MFU∞ = η = 46.4% (universal ceiling, indep. of H, I, E)
-  • Larger H×I reaches η faster (fixed overhead amortized sooner)
-  • E only affects convergence SPEED to η, not the ceiling
-  • Model valid for: TK∈[32K,2M], E∈[8,128], H∈[3072,6144]
-  • MAPE = 5.9% across 78 uniformly sampled shapes
+MFU∞ (TK→∞, shape-dependent steady state):
+  = 18·H·I / (4500e6·(7.392e-9·H·I + 4.092e-6·max(H,2I)))
+  H=3072 I=1536 (Ernie):  MFU∞ = 39.8%  (measured@4M: 38.3%)
+  H=4096 I=2048 (Qwen3):  MFU∞ = 42.6%  (measured@4M: 40.6%)
+  H=4096 I=4096 (peak):   MFU∞ = 42.6%  (measured@4M: 43.6%)
+  H=6144 I=3072 (70B):    MFU∞ = 45.8%  (measured@4M: 44.3%)
 
-Half-MFU TK (where MFU = η/2 ≈ 23%):
-  E=8:   always above η/2 for TK>32K (startup negligible)
-  E=128: TK_half ≈ 73K (H=3072) / 18K (H=6144)
+Measured PEAK MFU (from 94 nsys data points):
+  H=3072 I=1536 E=8: 45.7% at TK=65K
+  H=4096 I=2048 E=8: 50.5% at TK=65K
+  H=4096 I=4096 E=8: 52.4% at TK=33K
+  H=6144 I=3072 E=8: 52.9% at TK=33K
 
-Limitation: model predicts FLAT MFU at large TK. Empirically,
-MFU drops ~2-3% per TK decade above TK=200K due to L2 cache
-thrashing (measured in 10-point deep E=8 sweep to TK=6.3M).
+MFU behavior: RISE → PEAK → DECLINE → STEADY STATE
+  Small TK: MFU↑ (amortizing per-expert startup)
+  Peak TK*: ~33K–65K (shape-dependent, E=8)
+  Decline: L2 thrashing (working set > L2, 2-3%/decade)
+  Steady TK>2M: converges to MFU∞ (shape-dependent constant)
+
+Fit: MAPE=2.4% on steady-state (TK≥1M), 7.1% overall (94 pts)
+     TK∈[32K,4.2M], E∈[8,128], H∈[3072,6144], I∈[1536,4096]
 ```
 
 Read first:
