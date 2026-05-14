@@ -259,7 +259,6 @@ class ME:
         s.down_proj.weight.stop_gradient=False
 
 experts=[ME(h,I,e) for e in range(E)]
-tpe=[N*K//E]*E; tpe[-1]+=N*K-sum(tpe)
 paddle.seed(42)
 x=paddle.randn([N,h],dtype="bfloat16")*0.02
 grad_out=paddle.randn([N,h],dtype="bfloat16")*0.01
@@ -270,6 +269,7 @@ probs=paddle.ones([N,K],dtype="float32")/K
 import torch as th
 di=th.from_dlpack(indices.detach())
 dp=th.from_dlpack(probs.detach())
+tpe=[int((di==e).sum().item()) for e in range(E)]
 
 invalidate_weight_caches()
 functional.clear_all_fp8_weight_caches()
@@ -412,6 +412,107 @@ def main():
     det_pass = bool(out_eq) and bool(dx_eq)
     print(f"{'PASS' if det_pass else 'FAIL'} (out={'exact' if out_eq else 'DIFF'}, dx={'exact' if dx_eq else 'DIFF'})")
 
+    # ── Phase 4: DeepEP-style extreme imbalance (E=32, large T) ──
+    print("\n" + "=" * 72)
+    print("  PHASE 4: DEEPEP EXTREME IMBALANCE (E=32, skewed routing)")
+    print("=" * 72)
+
+    deepep_pass = True
+
+    def _build_imbalanced_routing(N_recv, E, topk, skew="zipf", seed=77):
+        """Build DeepEP-style imbalanced routing.
+
+        skew="zipf": Zipf(s=1.2) expert popularity -> hot experts get ~20x cold
+        skew="cliff": 4 experts get 80% of tokens, rest share 20%
+        skew="dropout": 25% of experts get zero tokens (simulates expert dropout)
+        """
+        torch.manual_seed(seed)
+        device = "cuda"
+
+        if skew == "zipf":
+            ranks = torch.arange(1, E + 1, dtype=torch.float32, device=device)
+            weights = 1.0 / ranks.pow(1.2)
+            weights = weights / weights.sum()
+        elif skew == "cliff":
+            weights = torch.ones(E, dtype=torch.float32, device=device) * 0.2 / max(E - 4, 1)
+            weights[:4] = 0.8 / 4
+        elif skew == "dropout":
+            weights = torch.ones(E, dtype=torch.float32, device=device)
+            n_dead = E // 4
+            perm = torch.randperm(E, device=device)
+            weights[perm[:n_dead]] = 0.0
+            weights = weights / weights.sum()
+        else:
+            weights = torch.ones(E, dtype=torch.float32, device=device) / E
+
+        indices = torch.zeros(N_recv, topk, dtype=torch.int32, device=device)
+        for i in range(N_recv):
+            chosen = torch.multinomial(weights, topk, replacement=False)
+            indices[i] = chosen.int()
+
+        probs = torch.rand(N_recv, topk, device=device) * 0.5 + 0.5
+        probs = (probs / probs.sum(dim=1, keepdim=True)).float()
+
+        tpe = [int((indices == e).sum().item()) for e in range(E)]
+        return indices, probs, tpe
+
+    E_deepep = 32
+    K_deepep = 8
+    I_deepep = 1536
+
+    for skew_type, N_recv_deepep in [
+        ("zipf",    16384),
+        ("cliff",   32768),
+        ("dropout", 16384),
+    ]:
+        label = f"N={N_recv_deepep} E={E_deepep} skew={skew_type}"
+        print(f"\n  {label}: ", end="", flush=True)
+
+        try:
+            di_dp, dp_dp, tpe_dp = _build_imbalanced_routing(
+                N_recv_deepep, E_deepep, K_deepep, skew=skew_type
+            )
+            tpe_min, tpe_max = min(tpe_dp), max(tpe_dp)
+            tpe_zero = sum(1 for t in tpe_dp if t == 0)
+            ratio = tpe_max / max(tpe_min, 1)
+            print(f"tpe=[{tpe_min}..{tpe_max}] ratio={ratio:.0f}x dead={tpe_zero} ", end="", flush=True)
+
+            experts_dp = [MockExpert(H, I_deepep, e) for e in range(E_deepep)]
+
+            paddle.seed(42)
+            x_p = paddle.randn([N_recv_deepep, H], dtype="bfloat16") * 0.02
+            grad_p = paddle.randn([N_recv_deepep, H], dtype="bfloat16") * 0.01
+            x_dp = torch.from_dlpack(x_p.detach()).to(device="cuda")
+            grad_dp = torch.from_dlpack(grad_p.detach()).to(device="cuda")
+
+            t0 = time.time()
+            out_fp8, dx_fp8, dw1_fp8, dw2_fp8 = _fp8_topk(
+                experts_dp, x_dp, di_dp, dp_dp, tpe_dp, grad_dp, E_deepep, I_deepep)
+            out_gold, dx_gold, dw1_gold, dw2_gold = _gold_topk(
+                x_dp, experts_dp, di_dp, dp_dp, grad_dp)
+            elapsed = time.time() - t0
+
+            cos_out, _ = _cosine_rrmse(out_fp8, out_gold)
+            cos_dx, _ = _cosine_rrmse(dx_fp8, dx_gold) if dx_fp8 is not None else (0, 0)
+            dw1_cat = torch.cat([d.flatten() for d in dw1_fp8])
+            dw1_gold_cat = torch.cat([d.flatten() for d in dw1_gold])
+            cos_dw1, _ = _cosine_rrmse(dw1_cat, dw1_gold_cat)
+            dw2_cat = torch.cat([d.flatten() for d in dw2_fp8])
+            dw2_gold_cat = torch.cat([d.flatten() for d in dw2_gold])
+            cos_dw2, _ = _cosine_rrmse(dw2_cat, dw2_gold_cat)
+
+            case_pass = cos_out > 0.99 and cos_dx > 0.99 and cos_dw1 > 0.98 and cos_dw2 > 0.98
+            deepep_pass &= case_pass
+            status = "PASS" if case_pass else "FAIL"
+            print(f"{status} ({elapsed:.1f}s) out={cos_out:.4f} dx={cos_dx:.4f} dw1={cos_dw1:.4f} dw2={cos_dw2:.4f}")
+
+            del experts_dp, x_dp, grad_dp, out_fp8, dx_fp8, out_gold, dx_gold
+            torch.cuda.empty_cache()
+
+        except Exception as e:
+            print(f"ERROR: {str(e)[:200]}")
+            deepep_pass = False
+
     # ══════════════════════════════════════════════════════════════════════
     # FINAL REPORT
     # ══════════════════════════════════════════════════════════════════════
@@ -438,7 +539,9 @@ def main():
 
     print(f"\n  [Phase 3] Determinism: {'PASS' if det_pass else 'FAIL'}")
 
-    overall = all_sani and all_prec and det_pass
+    print(f"\n  [Phase 4] DeepEP extreme imbalance (E=32): {'PASS' if deepep_pass else 'FAIL'}")
+
+    overall = all_sani and all_prec and det_pass and deepep_pass
     print(f"\n  {'='*50}")
     print(f"  OVERALL: {'ALL PASS' if overall else 'FAILURES DETECTED'}")
     print(f"  {'='*50}")
