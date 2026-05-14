@@ -51,14 +51,30 @@ Ernie:
   MFU = 46.51%
 ```
 
-Empirical scaling model fit from the fresh 11-point FP8 sweep:
+Empirical scaling model (nsys GPU-projection, 35-point 8-GPU sweep, 2026-05-14):
 
 ```text
-busy_us =
-  18*TK*H*I / (4500e6 * 0.541569)
-  + 50.0 * TK * max(H,2I) * 1e-9
-  + 328.939 * E * TK * 1e-6
-  + 201.047
+gpu_proj_us =
+  18*TK*H*I / (4500e6 * 0.589100)
+  + 3593.58 * TK * max(H, 2*I) * 1e-9
+  + 16.63 * E
+  + -41
+
+MFU = 18*TK*H*I / (4500e6 * gpu_proj_us)
+
+Parameters:
+  η = 0.5891  TC utilization (CUTLASS persistent scheduler ceiling)
+  β = 3593.6  memory-bound overhead (FP8 quant + tile scheduler)
+  γ = 16.6 µs per-expert fixed cost (weight cache + metadata)
+  δ = -41 µs  constant
+
+Asymptotic MFU (TK → ∞, independent of E):
+  Ernie  (H=3072, I=1536): 43.8%
+  Qwen3  (H=4096, I=2048): 46.8%
+  70B    (H=6144, I=3072): 50.3%
+
+Ernie verification:
+  E=8, TK=65536: model=2898us, nsys=2715us (MFU=45.6%)
 ```
 
 Read first:
