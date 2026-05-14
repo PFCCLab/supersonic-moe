@@ -53,79 +53,45 @@ Ernie:
 
 ### Performance Model
 
-Empirical model of GPU-projection time (94 nsys measurements, 8-GPU uniform grid, MAPE = 3.95%):
+$$T_{\text{proj}}(\mathrm{TK}, H, I, E) \;=\; \underbrace{\alpha \,\mathrm{TK}\, H\, I}_{\text{compute}} \;+\; \underbrace{\beta \,\mathrm{TK}\, D\, \ln\!\left(1 + \frac{\mathrm{TK}}{\mathrm{TK}_0}\right)}_{\text{L2 miss penalty}} \;+\; \underbrace{\gamma\, E}_{\text{expert setup}}$$
 
-$$T_{\text{proj}}(\text{TK}, H, I, E) = \alpha \cdot \text{TK} \cdot H \cdot I \;+\; \beta \cdot \text{TK} \cdot D \cdot \ln\!\left(1 + \frac{\text{TK}}{\text{TK}_0}\right) \;+\; \gamma \cdot E$$
+$$\mathrm{MFU} = \frac{18\,\mathrm{TK}\,H\,I}{P \cdot T_{\text{proj}}}, \quad D = \max(H,\,2I), \quad P = 4500\;\text{TFLOPS (B30Z FP8)}$$
 
-where $D = \max(H,\, 2I)$ and
+| Parameter | Value | Derivation |
+|-----------|-------|------------|
+| $\alpha$ | $7.494\times10^{-9}$ | $=18/(P\,\eta_{\mathrm{tc}})$, &ensp; $\eta_{\mathrm{tc}}=53.4\%$ |
+| $\beta$ | $9.934\times10^{-7}$ | L2 miss penalty per (access $\times$ refetch-width) |
+| $\mathrm{TK}_0$ | 45 710 | $\approx \frac{L_2/E}{\mathrm{tile}_M\,\mathrm{tile}_N\,b_{\mathrm{elem}}} \cdot \mathrm{tile}_M = \frac{96\text{MB}/8}{64\text{KB}}\cdot256 \approx 49\text{K}$ |
+| $\gamma$ | 21.75 µs | Per-expert TMA descriptor + metadata |
 
-| Symbol | Value | Physical meaning |
-|--------|-------|-----------------|
-| $\alpha$ | $7.494 \times 10^{-9}$ | Per-FLOP execution cost. Implies $\eta_{\text{tc}} = 18/(P\alpha) = 53.4\%$ |
-| $\beta$ | $9.934 \times 10^{-7}$ | Per-byte L2 miss penalty coefficient |
-| $\text{TK}_0$ | 45 710 | L2 regime transition scale |
-| $\gamma$ | 21.75 µs | Per-expert fixed cost |
+Fit: MAPE = 3.95%, MFU MAE = 1.55%, $N=94$ (uniform $4E\times4HI\times6\text{TK}$ grid + 16 large-TK).
 
-$$\text{MFU} = \frac{18 \cdot \text{TK} \cdot H \cdot I}{P \cdot T_{\text{proj}}} \times 100\%, \qquad P = 4500 \text{ TFLOPS}$$
+#### Term semantics
 
----
+| # | Term | Physical origin | Why this functional form |
+|---|------|----------------|--------------------------|
+| 1 | $\alpha\,\mathrm{TK}\,H\,I$ | 6 CUTLASS GEMMs totalling $18\,\mathrm{TK}\,H\,I$ FLOPs. $\eta_{\mathrm{tc}}<1$ due to persistent-scheduler per-tile overhead and DGated epilogue register pressure (168 regs → 1 block/SM occupancy). | $\propto F/P$ at constant $\eta_{\mathrm{tc}}$. Shape-invariant: same tile config (256², cluster 2×1) across all $(H,I)$. |
+| 2 | $\beta\,\mathrm{TK}\,D\,\ln(1{+}\mathrm{TK}/\mathrm{TK}_0)$ | Weight-tile L2 reuse breakdown. Scheduler cycles TK/tile$_M$ tiles; when this exceeds L2 capacity per expert ($\sim$192 sets), multi-stream SM contention drives miss rate $\propto\ln(\mathrm{TK}/\mathrm{TK}_0)$. Each miss refetches $D$ bytes (widest tile dimension). | **$D=\max(H,2I)$**: max column-width among the 6 GEMMs' B-tensors.  **$\mathrm{TK}$**: total L2 accesses ∝ token count.  **$\ln(1{+}x)$**: smooth onset (≈0 for $\mathrm{TK}\ll\mathrm{TK}_0$; $\approx\ln x$ for $\mathrm{TK}\gg\mathrm{TK}_0$); empirical consensus for shared-cache thrashing under randomized multi-tenant load. |
+| 3 | $\gamma\,E$ | Per-expert one-time: TMA descriptor, weight-cache version check, routing histogram. $O(1)$ per expert, independent of TK, $H$, $I$. | At $E{=}8$: 174 µs ($<7\%$); at $E{=}128$: 2784 µs (dominant only when TK$<$50K). |
 
-#### Derivation
+#### MFU phase diagram
 
-**Term 1** — $\alpha \cdot \text{TK} \cdot H \cdot I$
+$$\mathrm{MFU} = \frac{18\,H\,I}{\;P\!\left[\,\alpha\,H\,I + \beta\,D\,\ln\!\bigl(1{+}\tfrac{\mathrm{TK}}{\mathrm{TK}_0}\bigr) + \tfrac{\gamma E}{\mathrm{TK}}\,\right]}$$
 
-The six GEMMs (fwd: up + down; bwd: dgated + actgrad + 2 wgrad) total $F = 18 \cdot \text{TK} \cdot H \cdot I$ FLOPs. At peak $P$ with utilization $\eta_{\text{tc}}$, their collective runtime is $F / (P \eta_{\text{tc}}) = \alpha \cdot \text{TK} \cdot H \cdot I$. The sub-unity $\eta_{\text{tc}} = 53.4\%$ originates from the CUTLASS persistent tile scheduler's per-tile atomic + delinearize overhead and the DGated kernel's register-limited occupancy (168 regs → 1 block/SM).
+| Phase | Regime | Limiting behavior |
+|-------|--------|-------------------|
+| Rise | $\mathrm{TK} \ll \mathrm{TK}_0$ | $\mathrm{MFU} \approx 18\,H\,I\,\mathrm{TK}\;/\;(P\,\gamma E)$ &ensp; (linear ↑) |
+| Peak | $\mathrm{TK} \sim \mathrm{TK}_0$ | Maximum; $\partial\mathrm{MFU}/\partial\mathrm{TK}=0$ |
+| Decay | $\mathrm{TK} \gg \mathrm{TK}_0$ | $\mathrm{MFU} \propto 1/\ln\mathrm{TK}$ &ensp; (logarithmic ↓) |
 
-$\alpha$ is approximately shape-invariant because all shapes share the same tile configuration (256×256, cluster 2×1) and the per-tile overhead fraction is geometry-independent.
+#### Validation (E = 8)
 
-**Term 2** — $\beta \cdot \text{TK} \cdot D \cdot \ln(1 + \text{TK}/\text{TK}_0)$
-
-This term captures the *additional* HBM bandwidth consumed when weight-tile reuse in L2 breaks down. Its structure follows from:
-
-1. **$D = \max(H, 2I)$**: The widest tensor dimension that a single tile row must fetch upon a cache miss. For the gated up-projection, the weight tile spans $2I$ columns; for the down-projection, $H$ columns. The costliest miss refetches $\max(H, 2I)$ bytes per tile row.
-
-2. **$\text{TK}$ (outer multiplier)**: Every token in the sequence generates at least one tile access into the weight matrix. Thus total L2 accesses $\propto \text{TK}$.
-
-3. **$\ln(1 + \text{TK}/\text{TK}_0)$ (miss rate)**: The persistent scheduler cycles through $\text{TK}/\text{tile}_M$ M-tiles per GEMM. When this count exceeds the L2 capacity (in tiles), evictions begin. The empirical miss overhead grows logarithmically with the *overshoot ratio* $\text{TK}/\text{TK}_0$.
-
-   *Why logarithmic rather than linear?* In a purely cyclic access pattern, LRU would give a step function (0 below capacity, 1 above). However, the actual access pattern is non-cyclic: six distinct GEMMs with different B-tensor shapes interleave L2 usage across 148 SMs, creating a *randomized multi-stream* contention pattern. Under such conditions, the effective miss rate grows smoothly with the logarithm of the working-set-to-cache ratio — a well-known empirical result in shared-cache architectures (cf. Qureshi & Patt, ISCA'06: utility-based partitioning shows ln-scale thrashing onset).
-
-   The $\ln(1+x)$ form ensures: (a) zero penalty at TK=0, (b) negligible contribution when TK ≪ TK₀, and (c) gradual logarithmic growth for TK ≫ TK₀.
-
-4. **$\text{TK}_0 = 45\,710$ (first-principles validation)**:
-
-$$\text{TK}_0 \approx \frac{L_2 / E}{\text{tile}_M \times \text{tile}_N \times b_{\text{elem}}} \times \text{tile}_M = \frac{96\,\text{MB}\;/\;8}{256 \times 256 \times 1\,\text{B}} \times 256 = 49\,152$$
-
-   Fitted value 45 710 agrees within 7%. The slight underestimate is expected: L2 set-associativity and TMA metadata further reduce effective capacity.
-
-**Term 3** — $\gamma \cdot E$
-
-Per-expert one-time setup: TMA descriptor for weight tiles, FP8 weight-cache version check, routing histogram construction. Independent of TK (amortized over the expert's token segment) and of H, I (O(1) per descriptor). For E = 8 this contributes 174 µs (< 7% of $T_{\text{proj}}$ at TK = 65K); for E = 128 it is 2784 µs (dominant only at TK < 50K).
-
----
-
-#### MFU Phase Behavior
-
-Dividing by TK in the denominator reveals the per-token MFU structure:
-
-$$\text{MFU}(\text{TK}) = \frac{18 H I}{P\!\left[\;\alpha H I \;+\; \beta D \ln\!\left(1+\tfrac{\text{TK}}{\text{TK}_0}\right) \;+\; \frac{\gamma E}{\text{TK}}\;\right]}$$
-
-| Phase | Condition | Dominant denominator term | MFU trend |
-|-------|-----------|---------------------------|-----------|
-| Startup | TK ≪ TK₀ | $\gamma E / \text{TK}$ | MFU ∝ TK (linear rise) |
-| Peak | TK ≈ TK₀ | Balance point | Maximum |
-| Decline | TK ≫ TK₀ | $\beta D \ln(\text{TK}/\text{TK}_0)$ | MFU ∝ 1/ln(TK) (slow decay) |
-
----
-
-#### Measured vs. Model (E = 8)
-
-| Config | Peak MFU | TK* | @TK=4M | Model@peak | Model@4M |
-|--------|:--------:|:---:|:------:|:----------:|:--------:|
-| H=3072 I=1536 | **45.7%** | 65K | 38.3% | 46.3% | 38.3% |
-| H=4096 I=2048 | **50.5%** | 65K | 40.6% | 48.5% | 41.0% |
-| H=4096 I=4096 | **52.4%** | 33K | 43.6% | 49.1% | 41.0% |
-| H=6144 I=3072 | **52.9%** | 33K | 44.3% | 50.5% | 44.6% |
+| Shape | Measured peak | Model@peak | Measured @4M | Model@4M |
+|-------|:---:|:---:|:---:|:---:|
+| H=3072 I=1536 | **45.7%** @65K | 46.3% | 38.3% | 38.3% |
+| H=4096 I=2048 | **50.5%** @65K | 48.5% | 40.6% | 41.0% |
+| H=4096 I=4096 | **52.4%** @33K | 49.1% | 43.6% | 41.0% |
+| H=6144 I=3072 | **52.9%** @33K | 50.5% | 44.3% | 44.6% |
 
 Read first:
 
