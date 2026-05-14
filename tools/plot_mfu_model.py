@@ -15,21 +15,25 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_CSV = os.path.join(_REPO, "reports", "perf_sweep_nsys_8gpu.csv")
 OUT_DIR = os.path.join(_REPO, "reports")
 
-# ═══ MODEL PARAMETERS (5-param constrained fit, 94 points, MAPE=4.0%) ═══
-# gpu_proj_us = α·TK·H·I + β·TK·max(H,2I)·ln(1+TK/TK₀) + γ·E + δ
-ALPHA = 7.693471e-9    # per-FLOP cost (compute + L2-warm quant)
-BETA = 1.097838e-6     # L2 miss penalty coefficient
-TK0 = 93072.0          # L2 transition scale (TK where L2 misses become significant)
-GAMMA = 21.61          # per-expert fixed (µs)
-DELTA = 0.0            # constant startup (µs) — zero by constraint
+# ═══ MODEL PARAMETERS (global DE optimization, 94 points, MAPE=3.95%) ═══
+# gpu_proj_us = α·TK·H·I + β·TK·max(H,2I)·ln(1+TK/TK₀) + γ·E
+#
+# Physical basis:
+#   α: per-FLOP GPU time (TC compute + L2-warm quant), η_tc = 53.4%
+#   β: L2 cache miss penalty per byte of working set when TK > TK₀
+#   TK₀: L2 transition scale (≈ L2_per_expert / tile_bytes × tile_M)
+#   γ: per-expert fixed cost (weight TMA descriptor + metadata kernel)
+ALPHA = 7.494097e-9    # µs per TK·H·I (η_tc = 53.4%)
+BETA = 9.933881e-7     # L2 miss penalty coefficient
+TK0 = 45710.0          # L2 transition scale
+GAMMA = 21.75          # per-expert fixed (µs)
 PEAK_TFLOPS = 4500     # B30Z FP8 peak (TFLOPS)
 
 
 def gpu_proj_us(TK, H, I, E):
     """Predict GPU-projection time (µs) for fwd+bwd."""
-    return (ALPHA * TK * H * I
-            + BETA * TK * max(H, 2*I) * np.log(1.0 + TK / TK0)
-            + GAMMA * E + DELTA)
+    maxHI = max(H, 2*I)
+    return ALPHA * TK * H * I + BETA * TK * maxHI * np.log(1.0 + TK / TK0) + GAMMA * E
 
 
 def mfu_pct(TK, H, I, E):
@@ -41,7 +45,7 @@ def mfu_pct(TK, H, I, E):
 
 
 def mfu_inf(H, I):
-    """Approximate steady-state MFU at TK=4M (practical ∞)."""
+    """Approximate steady-state MFU at TK=4M."""
     return mfu_pct(4194304, H, I, 8)
 
 
