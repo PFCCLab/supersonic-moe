@@ -23,11 +23,11 @@ OUT_DIR = os.path.join(_REPO, "reports")
 #   β: L2 cache miss penalty per byte of working set when TK > TK₀
 #   TK₀: L2 transition scale (≈ L2_per_expert / tile_bytes × tile_M)
 #   γ: per-expert fixed cost (weight TMA descriptor + metadata kernel)
-ALPHA = 7.494097e-9    # µs per TK·H·I (η_tc = 53.4%)
-BETA = 9.933881e-7     # L2 miss penalty coefficient
-TK0 = 45710.0          # L2 transition scale
-GAMMA = 21.75          # per-expert fixed (µs)
-PEAK_TFLOPS = 4500     # B30Z FP8 peak (TFLOPS)
+ALPHA = 7.491431e-9    # µs per TK·H·I (η_tc = 53.4%)
+BETA = 9.519563e-7     # L2 miss penalty coefficient
+TK0 = 39747.0          # L2 transition scale
+GAMMA = 21.72          # per-expert fixed (µs)
+PEAK_TFLOPS = 4500     # FP8 peak (TFLOPS)
 
 
 def gpu_proj_us(TK, H, I, E):

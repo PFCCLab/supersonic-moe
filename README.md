@@ -59,12 +59,12 @@ $$\text{MFU} = \frac{18 \cdot \text{TK} \cdot H \cdot I}{P \cdot T_{\text{proj}}
 
 | Parameter | Value | Derivation |
 |-----------|-------|------------|
-| α | 7.494 × 10⁻⁹ | = 18/(P · η\_tc), η\_tc = 53.4% |
-| β | 9.934 × 10⁻⁷ | L2 miss penalty per (access × refetch-width) |
-| TK₀ | 45 710 | ≈ (L2/E) / (tile\_M · tile\_N · b\_elem) · tile\_M = (96MB/8) / 64KB · 256 ≈ 49K |
-| γ | 21.75 µs | Per-expert TMA descriptor + metadata |
+| α | 7.491 × 10⁻⁹ | = 18/(P · η\_tc), η\_tc = 53.4% |
+| β | 9.520 × 10⁻⁷ | L2 miss penalty per (access × refetch-width) |
+| TK₀ | 39 747 | ≈ (L2/E) / (tile\_M · tile\_N · b\_elem) · tile\_M = (96MB/8) / 64KB · 256 ≈ 49K (fitted: 40K) |
+| γ | 21.72 µs | Per-expert TMA descriptor + metadata |
 
-Fit: MAPE = 3.95%, MFU MAE = 1.55%, N = 94 (uniform 4E × 4HI × 6TK grid + 16 large-TK).
+Fit: MAPE = 3.79%, MFU MAE = 1.49%, N = 104 (uniform 4E × 4HI × 6TK grid + 16 large-TK).
 
 #### Term semantics
 
