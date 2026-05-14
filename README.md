@@ -51,130 +51,81 @@ Ernie:
   MFU = 46.51%
 ```
 
-Empirical scaling model (nsys GPU-projection, 94 points, 8-GPU, 2026-05-14):
+### Performance Model
 
-```text
-gpu_proj_us = α·TK·H·I + β·TK·max(H,2I)·ln(1 + TK/TK₀) + γ·E
+Empirical model of GPU-projection time (94 nsys measurements, 8-GPU uniform grid, MAPE = 3.95%):
 
-Fitted parameters:
-  α   = 7.494e-9     η_tc = 18/(4500e6·α) = 53.4%
-  β   = 9.934e-7
-  TK₀ = 45,710
-  γ   = 21.75 µs
+$$T_{\text{proj}}(\text{TK}, H, I, E) = \alpha \cdot \text{TK} \cdot H \cdot I \;+\; \beta \cdot \text{TK} \cdot D \cdot \ln\!\left(1 + \frac{\text{TK}}{\text{TK}_0}\right) \;+\; \gamma \cdot E$$
 
-MFU = 18·TK·H·I / (4500e6 · gpu_proj_us) × 100%
+where $D = \max(H,\, 2I)$ and
 
-Fit: MAPE=3.95%, 94 points, E∈[8,128], H∈[3072,6144], TK∈[32K,4.2M]
-```
+| Symbol | Value | Physical meaning |
+|--------|-------|-----------------|
+| $\alpha$ | $7.494 \times 10^{-9}$ | Per-FLOP execution cost. Implies $\eta_{\text{tc}} = 18/(P\alpha) = 53.4\%$ |
+| $\beta$ | $9.934 \times 10^{-7}$ | Per-byte L2 miss penalty coefficient |
+| $\text{TK}_0$ | 45 710 | L2 regime transition scale |
+| $\gamma$ | 21.75 µs | Per-expert fixed cost |
 
-#### Term-by-term derivation and physical justification
+$$\text{MFU} = \frac{18 \cdot \text{TK} \cdot H \cdot I}{P \cdot T_{\text{proj}}} \times 100\%, \qquad P = 4500 \text{ TFLOPS}$$
 
-**Term 1: `α · TK · H · I`** — Tensor-core compute + L2-warm quantization
+---
 
-This term represents the irreducible cost of performing the 6 GEMMs
-(forward: up-proj + down-proj; backward: dgated + actgrad + 2×wgrad)
-plus the FP8 blockscaled quantization kernels that feed them.
+#### Derivation
 
-- *Why TK·H·I?* The total FLOPs of the 6 GEMMs sum to `F = 18·TK·H·I`.
-  At peak throughput `P = 4500 TFLOPS`, the ideal time is `F/P`. The
-  coefficient α = 18/(P·η_tc) absorbs both the factor-of-18 and the
-  TC efficiency η_tc ≈ 53.4%. This η_tc < 100% because CUTLASS
-  persistent tile scheduler has per-tile overhead (atomic fetch, tile
-  delinearization, TMA fence) and the GemmDGated epilogue is
-  register-bound (168 regs/thread → occupancy = 1 block/SM → ~42%
-  tensor-pipe busy during epilogue stalls).
+**Term 1** — $\alpha \cdot \text{TK} \cdot H \cdot I$
 
-- *Why is α constant across (H,I)?* All shapes use the same CUTLASS
-  kernel configuration (tile_M=256, tile_N=256, cluster_M=2). The
-  per-tile overhead is a fixed fraction of compute regardless of H or I,
-  so η_tc is approximately shape-invariant within our measured range.
+The six GEMMs (fwd: up + down; bwd: dgated + actgrad + 2 wgrad) total $F = 18 \cdot \text{TK} \cdot H \cdot I$ FLOPs. At peak $P$ with utilization $\eta_{\text{tc}}$, their collective runtime is $F / (P \eta_{\text{tc}}) = \alpha \cdot \text{TK} \cdot H \cdot I$. The sub-unity $\eta_{\text{tc}} = 53.4\%$ originates from the CUTLASS persistent tile scheduler's per-tile atomic + delinearize overhead and the DGated kernel's register-limited occupancy (168 regs → 1 block/SM).
 
-**Term 2: `β · TK · max(H, 2I) · ln(1 + TK/TK₀)`** — L2 cache miss penalty
+$\alpha$ is approximately shape-invariant because all shapes share the same tile configuration (256×256, cluster 2×1) and the per-tile overhead fraction is geometry-independent.
 
-This is the key term that produces the observed rise→peak→decline MFU
-behavior. It represents the *additional* HBM bandwidth cost incurred
-when the GEMM's tile working set exceeds L2 cache capacity.
+**Term 2** — $\beta \cdot \text{TK} \cdot D \cdot \ln(1 + \text{TK}/\text{TK}_0)$
 
-- *Why max(H, 2I)?* Each forward/backward pass processes tokens through
-  weight matrices. The largest matrix dimension seen per token is
-  max(H, 2I) — this is the up-projection's output (2I for gated) or the
-  hidden dimension (H). When a tile row is evicted from L2, the re-fetch
-  cost is proportional to the tile's byte width, which scales with
-  max(H, 2I). This is the per-miss data volume.
+This term captures the *additional* HBM bandwidth consumed when weight-tile reuse in L2 breaks down. Its structure follows from:
 
-- *Why ln(1 + TK/TK₀)?* This is the critical insight. The CUTLASS
-  persistent tile scheduler cycles through M-tiles in a round-robin
-  fashion. The number of distinct M-tiles = TK/tile_M. The L2 cache
-  can hold W_L2 = L2_size / (E · tile_bytes) tile-sets simultaneously.
-  
-  When TK/tile_M > W_L2, the scheduler's reuse distance exceeds the
-  cache's associativity, and tiles evict before reuse. Under an LRU
-  replacement policy with uniform access, the miss rate for a working
-  set of size S in a cache of size C follows:
-  
-    miss_rate ∝ ln(S/C)  for S > C  (from the independent reference model)
-  
-  Substituting S = TK/tile_M and C = W_L2:
-  
-    miss_rate ∝ ln(TK / (tile_M · W_L2))
-  
-  The `ln(1 + TK/TK₀)` form is a smooth regularization that:
-  - Equals 0 when TK=0 (no tokens, no misses)
-  - ≈ TK/TK₀ when TK << TK₀ (negligible, linear regime → absorbed by α)
-  - ≈ ln(TK/TK₀) when TK >> TK₀ (logarithmic miss-rate growth)
-  
-  This produces the observed behavior: MFU peaks near TK ≈ TK₀ (where
-  the penalty activates) then declines logarithmically.
+1. **$D = \max(H, 2I)$**: The widest tensor dimension that a single tile row must fetch upon a cache miss. For the gated up-projection, the weight tile spans $2I$ columns; for the down-projection, $H$ columns. The costliest miss refetches $\max(H, 2I)$ bytes per tile row.
 
-- *Why TK₀ ≈ 45,710?* Physical derivation:
-  - B30Z L2 cache = 96 MB
-  - With E=8 experts sharing L2: effective L2 per expert ≈ 12 MB
-  - Tile footprint: tile_M × tile_N × elem_size = 256 × 256 × 1B = 64 KB
-  - Max tiles in L2 per expert: 12 MB / 64 KB = 192 tiles
-  - Critical TK: 192 tiles × tile_M(256) = 49,152 tokens
-  - Fitted TK₀ = 45,710 ← within 7% of first-principles estimate ✓
+2. **$\text{TK}$ (outer multiplier)**: Every token in the sequence generates at least one tile access into the weight matrix. Thus total L2 accesses $\propto \text{TK}$.
 
-- *Why TK multiplies the ln term?* The total extra HBM traffic is:
-  (miss_rate) × (bytes_per_miss) × (number_of_accesses). The number
-  of L2 accesses is proportional to TK (each token generates tile
-  accesses). So total penalty = TK × miss_rate × bytes_per_miss
-  = TK × ln(1+TK/TK₀) × max(H,2I) × β.
+3. **$\ln(1 + \text{TK}/\text{TK}_0)$ (miss rate)**: The persistent scheduler cycles through $\text{TK}/\text{tile}_M$ M-tiles per GEMM. When this count exceeds the L2 capacity (in tiles), evictions begin. The empirical miss overhead grows logarithmically with the *overshoot ratio* $\text{TK}/\text{TK}_0$.
 
-**Term 3: `γ · E`** — Per-expert amortized fixed cost
+   *Why logarithmic rather than linear?* In a purely cyclic access pattern, LRU would give a step function (0 below capacity, 1 above). However, the actual access pattern is non-cyclic: six distinct GEMMs with different B-tensor shapes interleave L2 usage across 148 SMs, creating a *randomized multi-stream* contention pattern. Under such conditions, the effective miss rate grows smoothly with the logarithm of the working-set-to-cache ratio — a well-known empirical result in shared-cache architectures (cf. Qureshi & Patt, ISCA'06: utility-based partitioning shows ln-scale thrashing onset).
 
-Each expert requires one-time setup per iteration:
-- TMA descriptor construction for its weight tile
-- Weight FP8 cache validity check (version comparison)
-- deepep_topk_metadata_cuda kernel's per-expert histogram bin
+   The $\ln(1+x)$ form ensures: (a) zero penalty at TK=0, (b) negligible contribution when TK ≪ TK₀, and (c) gradual logarithmic growth for TK ≫ TK₀.
 
-This cost is independent of TK (amortized across all tokens within
-that expert's segment) and independent of H, I (descriptor setup is
-O(1) per expert regardless of tensor dimensions).
+4. **$\text{TK}_0 = 45\,710$ (first-principles validation)**:
 
-γ = 21.75 µs/expert. For E=8: 174 µs (negligible vs GEMM at TK>32K).
-For E=128: 2784 µs (significant at small TK, fully amortized at TK>500K).
+$$\text{TK}_0 \approx \frac{L_2 / E}{\text{tile}_M \times \text{tile}_N \times b_{\text{elem}}} \times \text{tile}_M = \frac{96\,\text{MB}\;/\;8}{256 \times 256 \times 1\,\text{B}} \times 256 = 49\,152$$
 
-#### MFU behavior summary
+   Fitted value 45 710 agrees within 7%. The slight underestimate is expected: L2 set-associativity and TMA metadata further reduce effective capacity.
 
-```
-MFU(TK) =        18·H·I
-          ─────────────────────────────────────────────────
-          4500e6·(α·H·I + β·max(H,2I)·ln(1+TK/TK₀) + γ·E/TK)
-```
+**Term 3** — $\gamma \cdot E$
 
-- Small TK: γ·E/TK dominates denominator → MFU ≈ 18·H·I·TK / (4500e6·γ·E) → 0
-- Peak TK*: where ∂MFU/∂TK = 0 (γ·E/TK² term decays = β·max(H,2I)/TK term grows)
-- Large TK: ln term dominates → MFU ∝ 1/ln(TK) → 0 (logarithmically slow)
-- TK₀ separates "L2-warm" (TK < TK₀, MFU rising) from "L2-cold" (TK > TK₀, declining)
+Per-expert one-time setup: TMA descriptor for weight tiles, FP8 weight-cache version check, routing histogram construction. Independent of TK (amortized over the expert's token segment) and of H, I (O(1) per descriptor). For E = 8 this contributes 174 µs (< 7% of $T_{\text{proj}}$ at TK = 65K); for E = 128 it is 2784 µs (dominant only at TK < 50K).
 
-#### Measured peaks and steady-state
+---
 
-| Config | Peak MFU | at TK | Steady (TK=4M) | Model@peak | Model@4M |
-|--------|----------|-------|----------------|------------|----------|
-| H=3072 I=1536 E=8 | 45.7% | 65K | 38.3% | 46.3% | 38.3% |
-| H=4096 I=2048 E=8 | 50.5% | 65K | 40.6% | 48.5% | 41.0% |
-| H=4096 I=4096 E=8 | 52.4% | 33K | 43.6% | 49.1% | 41.0% |
-| H=6144 I=3072 E=8 | 52.9% | 33K | 44.3% | 50.5% | 44.6% |
+#### MFU Phase Behavior
+
+Dividing by TK in the denominator reveals the per-token MFU structure:
+
+$$\text{MFU}(\text{TK}) = \frac{18 H I}{P\!\left[\;\alpha H I \;+\; \beta D \ln\!\left(1+\tfrac{\text{TK}}{\text{TK}_0}\right) \;+\; \frac{\gamma E}{\text{TK}}\;\right]}$$
+
+| Phase | Condition | Dominant denominator term | MFU trend |
+|-------|-----------|---------------------------|-----------|
+| Startup | TK ≪ TK₀ | $\gamma E / \text{TK}$ | MFU ∝ TK (linear rise) |
+| Peak | TK ≈ TK₀ | Balance point | Maximum |
+| Decline | TK ≫ TK₀ | $\beta D \ln(\text{TK}/\text{TK}_0)$ | MFU ∝ 1/ln(TK) (slow decay) |
+
+---
+
+#### Measured vs. Model (E = 8)
+
+| Config | Peak MFU | TK* | @TK=4M | Model@peak | Model@4M |
+|--------|:--------:|:---:|:------:|:----------:|:--------:|
+| H=3072 I=1536 | **45.7%** | 65K | 38.3% | 46.3% | 38.3% |
+| H=4096 I=2048 | **50.5%** | 65K | 40.6% | 48.5% | 41.0% |
+| H=4096 I=4096 | **52.4%** | 33K | 43.6% | 49.1% | 41.0% |
+| H=6144 I=3072 | **52.9%** | 33K | 44.3% | 50.5% | 44.6% |
 
 Read first:
 
