@@ -119,3 +119,47 @@ SONIC_MOE_FP8_ISO32_WEIGHT=1 nsys profile --trace=cuda,nvtx --sample=none \
   --backtrace=none --resolve-symbols=false --export=sqlite \
   --output=OUTPUT_PATH python tests/ops/test_e2e_mlpnode.py --nsys
 ```
+
+---
+
+## Kernel Optimization Audit (NCU + Wall-Clock, B30Z SM103)
+
+**Methodology**: NCU `--set full` profiling + standalone wall-clock benchmarks at production
+shape (TK=65536, dim=3072). Reference peak: **8 TB/s** HBM bandwidth.
+
+### Measured Performance (Wall-Clock, N=50 iterations)
+
+| Kernel | Regs | Time | Achieved BW | % of 8 TB/s | Status |
+|--------|------|------|-------------|-------------|--------|
+| `_dual_varlen_iso32_quantize` | 164 | **105 µs** | 5.86 TB/s | **73%** | At ceiling |
+| `_colwise_quantize_and_pack` | 150 | **110 µs** | 5.51 TB/s | **69%** | At ceiling |
+| `_quantize_and_pack` (activation) | 32 | **161 µs** | 3.74 TB/s | **47%** | At ceiling (94% occ) |
+
+### Optimization Attempts & Lessons
+
+| Approach | Result | Lesson |
+|----------|--------|--------|
+| 2-pass decomposition (pass1=quant 63 regs, pass2=ISA-pack 32 regs) | **130 µs (slower)** | SM103 L1 register spill is efficient; high regs ≠ low perf on Blackwell |
+| Looped 32×32 sub-blocks (50 regs, 47% occupancy) | **157 µs (slower)** | Small tile → launch overhead dominates; poor work/CTA ratio |
+| fused_transpose + row-quant (coalesced writes) | **367 µs (3× slower)** | `tl.trans` on small tiles produces scatter stores; worse than strided writes |
+| num_warps sweep (1/2/4/8) | **num_warps=1 optimal** | Extra warps compete for L1 bandwidth on memory-bound kernels |
+
+### Root Cause: Why 73% is the Ceiling
+
+1. **ISA-packed E8M0 scale stores**: Each scale is 1 byte scattered to a complex interleaved
+   tile layout. A 128-byte cache line holds 128 scale bytes, but the ISA layout requires
+   stride-16 interleaving → each store touches a unique cache line → zero write coalescing.
+
+2. **Colwise output stride**: `dst[k, dim]` with stride=H=3072 bytes between k-rows. A warp
+   writing 32 k-rows touches 32 different cache lines simultaneously.
+
+3. **Hardware-mandated format**: The ISA tile layout (`SF_TILE_M=128, SF_TILE_K=128,
+   SF_TILE_STORAGE=512`) is required by CUTLASS TMA descriptors. Cannot change without
+   breaking the GEMM consumer.
+
+### Key Insight for Future Work
+
+NCU reports ~60% BW due to instrumentation overhead (~20% inflation). Always validate with
+wall-clock measurements. On SM103 Blackwell, **register pressure does NOT limit performance
+for memory-bound kernels** — the L1 register-spill path is fast enough that 1-warp occupancy
+(164 regs) still saturates the HBM pipeline for streaming access patterns.
