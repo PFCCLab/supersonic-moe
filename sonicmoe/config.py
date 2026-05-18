@@ -85,6 +85,7 @@ class SonicMoEConfig:
     fused_zy1_quant: Optional[bool] = None
     assume_aligned: Optional[bool] = None
     stagewise_memory: Optional[bool] = None
+    iso32_weight: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -159,6 +160,11 @@ class SonicMoEConfig:
         if self.stagewise_memory is not None:
             return self.stagewise_memory
         return _env_bool("SONIC_MOE_STAGEWISE_MEMORY", False) or False
+
+    def resolve_iso32_weight(self) -> bool:
+        if self.iso32_weight is not None:
+            return self.iso32_weight
+        return _env_bool("SONIC_MOE_FP8_ISO32_WEIGHT", False) or False
 
     # --- Context manager for temporary activation ----------------------------
 
