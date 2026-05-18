@@ -119,6 +119,28 @@ Important current insights:
 - iso32 dz dual quant is measured safe for current reference-shape `dz`; monitor `log2(block_amax/row_amax)` before generalizing.
 - `SonicMoEMlpNode.step()` must run **before** `optimizer.step()` because it flushes native CUTLASS wgrad layout into framework `main_grad`.
 
+### ISO32 Weight Cache Unification
+
+ISO32 (32×32 block) FP8 weight quantization stores **one buffer per weight** instead of two transposed copies by exploiting the byte-identical transpose invariant of isotropic block scaling. Forward and backward GEMM kernels consume the same physical buffer via zero-copy stride views. Controlled by `SONIC_MOE_FP8_ISO32_WEIGHT=1` (default OFF).
+
+**Memory saving**: 48.5% of weight FP8 cache (108 MiB at E=8, H=3072, I=1536).  
+**Precision**: Identical to baseline 1×32 path vs BF16 golden (ratio=1.0000, verified across 9 shapes).  
+**Performance**: −0.5% GPU-projection (1 fewer unique kernel, identical GEMM signatures).
+
+<p align="center">
+<img src="reports/fig_iso32_dataflow_comparison.png" width="100%" alt="ISO32 vs Baseline weight dataflow"/>
+</p>
+
+*Left*: Baseline pair-kernel path (4 separate FP8 weight buffers). *Right*: ISO32 single-buffer path (2 buffers + stride views). Dashed boxes = eliminated allocations.
+
+<p align="center">
+<img src="reports/fig_deepep_fp8_pipeline.png" width="100%" alt="Full DeepEP pipeline dataflow"/>
+</p>
+
+*Full DeepEP pipeline*: Router → All-to-All dispatch → FP8 FFN (with persistent weight cache) → Combine → reverse A2A. Three gradient paths: dx (autograd), ds (router gate), dw (main_grad accumulate).
+
+Validation report: [`reports/iso32_weight_validation_report.md`](./reports/iso32_weight_validation_report.md)
+
 ## Prerequisites
 
 - NVIDIA Hopper GPUs (H100, H200) or SM100 GPUs (Target GPU, Target GPU, Target GPU)
