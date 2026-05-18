@@ -119,6 +119,28 @@ Important current insights:
 - iso32 dz dual quant is measured safe for current reference-shape `dz`; monitor `log2(block_amax/row_amax)` before generalizing.
 - `SonicMoEMlpNode.step()` must run **before** `optimizer.step()` because it flushes native CUTLASS wgrad layout into framework `main_grad`.
 
+### ISO32 Weight Cache Unification
+
+ISO32 (32×32 block) FP8 weight quantization stores **one buffer per weight** instead of two transposed copies by exploiting the byte-identical transpose invariant of isotropic block scaling. Forward and backward GEMM kernels consume the same physical buffer via zero-copy stride views. Controlled by `SONIC_MOE_FP8_ISO32_WEIGHT=1` (default OFF).
+
+**Memory saving**: 48.5% of weight FP8 cache (108 MiB at E=8, H=3072, I=1536).  
+**Precision**: Identical to baseline 1×32 path vs BF16 golden (ratio=1.0000, verified across 9 shapes).  
+**Performance**: −0.5% GPU-projection (1 fewer unique kernel, identical GEMM signatures).
+
+<p align="center">
+<img src="reports/fig_iso32_dataflow_comparison.png" width="100%" alt="ISO32 vs Baseline weight dataflow"/>
+</p>
+
+*Left*: Baseline pair-kernel path (4 separate FP8 weight buffers). *Right*: ISO32 single-buffer path (2 buffers + stride views). Dashed boxes = eliminated allocations.
+
+<p align="center">
+<img src="reports/fig_deepep_fp8_pipeline.png" width="100%" alt="Full DeepEP pipeline dataflow"/>
+</p>
+
+*Full DeepEP pipeline*: Router → All-to-All dispatch → FP8 FFN (with persistent weight cache) → Combine → reverse A2A. Three gradient paths: dx (autograd), ds (router gate), dw (main_grad accumulate).
+
+Validation report: [`reports/iso32_weight_validation_report.md`](./reports/iso32_weight_validation_report.md)
+
 ## Prerequisites
 
 - NVIDIA Hopper GPUs (H100, H200) or SM100 GPUs (Target GPU, Target GPU, Target GPU)
@@ -140,35 +162,49 @@ rm -rf $TORCH_EXTENSIONS_DIR/sonicmoe_deepep_topk_metadata_cuda  # (or matching 
 
 ### FP8 / Frontier flags
 
-| Env flag | Default | Recommended | What it gates |
-|---|:---:|:---:|---|
-| `SONIC_MOE_FP8_MODE` | unset | `perf` (or via `enable_fp8()` ctx) | Master switch. `perf` enables the full FP8 frontier; `mem` enables FP8 with stage-wise memory reuse; unset = BF16 path. |
-| `USE_QUACK_GEMM` | unset | `1` | Required on SM100 (SM100 architecture) to enable the CuTeDSL FP8 GEMMs. Without it the Paddle compat layer falls back to BF16. |
-| `SONIC_MOE_FP8_WGRAD` | unset | `1` | Enable FP8 wgrad (otherwise wgrad runs in BF16). Implied when `fp8_wgrad=True` on the config. |
-| `SONIC_MOE_FP8_FUSED_GATED` | `1` | `1` | Fuse SwiGLU gate + epilogue blockscaled quant inside the up-proj GEMM. |
-| `SONIC_MOE_FP8_EPILOGUE_QUANT` | `1` | `1` | Quantize y2 / z to FP8 inside the GEMM epilogue (vs. a separate quant kernel). |
-| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | `1` | `1` | Fuse SwiGLU activation with the row-wise FP8 quant on the y1 path. |
-| `SONIC_MOE_FP8_SAVE_Z_FP8` | `1` | `1` | Save z_fp8 (post-up-proj activation in FP8) for the down-proj backward, instead of storing y1 in BF16. |
-| `SONIC_MOE_FP8_RECOMPUTE_Z` | `0` | `0` | Skip storing z_fp8 in fwd; rerun up-proj GEMM in down-proj bwd (Option A). Saves ~213 MiB / active layer at reference shape; ~5–15% extra cost per layer. |
-| `SONIC_MOE_FP8_RECOMPUTE_OPT_B` | `0` | `0` | **Do not enable.** Experimental quant-only recompute kernel; produces an `illegal-instruction` fault on non-uniform routing (verified). Kept for research. |
-| `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | `0` | `0` | Fuse z & y1 quant into a single dual kernel. Off by default — activate only after benchmarking; the separated path is currently faster on production shapes. |
-| `SONIC_MOE_FP8_WGRAD_BETA_ACCUM` | `0` | `0` | Fall back to the legacy `D = A@B + 1.0*C` fused beta-accumulation epilogue (86 regs/thread) instead of TMA reduce-add (50 regs/thread). TMA reduce-add is 2–4% faster end-to-end. |
-| `SONIC_MOE_FP8_ASSUME_ALIGNED` | `0` | `0` (eager-mode); `1` (full-graph training) | Skip the runtime padding-check H2D sync; assume `TK % 32 == 0`. Required for zero-sync execution but unsafe if any caller can produce mis-aligned token counts. |
-| `SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY` | unset | unset (use real load) | Override the per-expert capacity used by the blockscaled FP8 GEMM. Only set when comparing fixed-capacity baselines; the default uses the runtime expert load. |
-| `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION` | `fp8-blockscaled` | `fp8-blockscaled` | Output precision of up-proj epilogue. `bf16` = legacy fallback. |
-| `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION` | `fp8-blockscaled` | `fp8-blockscaled` | Mainloop precision of down-proj. |
-| `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION` | `bf16` | `bf16` | Weight precision feeding down-proj. `fp8` requires `..._MAINLOOP_PRECISION=fp8-blockscaled`. |
-| `SONIC_MOE_STAGEWISE_MEMORY` | `0` | `0` (perf); `1` (mem) | Free up-proj activations as soon as down-proj consumes them — tradeoff: ~3–5% extra cost for ~1.0–1.5 GB peak savings at reference shape. |
-| `SONIC_MOE_CACHE_DIR` | `~/.cache/sonicmoe` | (default) | Override the JIT compile-cache directory used by `jit_warmup`. |
+**Active production flags** (set these for training):
 
-Production single-GPU launcher template (matches `tests/single_card_tests/...test_gpt_model_moe_sonic_moe.py`):
+| Env flag | Default | What it gates |
+|---|:---:|---|
+| `SONIC_MOE_FP8_MODE` | unset | Master switch. `perf` = full FP8 frontier; `mem` = FP8 + stage-wise memory reuse; unset = BF16. |
+| `USE_QUACK_GEMM` | unset | **Required** on SM100 for CuTeDSL FP8 GEMMs. |
+| `SONIC_MOE_FP8_WGRAD` | unset | FP8 weight gradients (otherwise BF16 wgrad). Always `1` for production. |
+| `SONIC_MOE_FP8_ASSUME_ALIGNED` | `0` | Skip runtime padding-check H2D sync. Set `1` for zero-sync training (requires aligned token counts). |
+| `SONIC_MOE_FP8_ISO32_WEIGHT` | `0` | ISO32 weight cache unification: stores ONE fp8 buffer per weight (saves 48.5% weight cache memory). |
+| `SONIC_MOE_FP8_RECOMPUTE_Z` | `0` | Skip storing z_fp8 in fwd; rerun up-proj in bwd. Saves ~213 MiB/layer, costs ~5–15% extra time. |
+| `SONIC_MOE_STAGEWISE_MEMORY` | `0` | Free activations eagerly between stages. Saves ~1.0–1.5 GB at reference shape, costs 3–5%. |
+| `SONIC_MOE_CACHE_DIR` | `~/.cache/sonicmoe` | JIT compile-cache directory. |
+
+**Hardcoded defaults** (always-on in the frontier path, no need to set):
+
+| Flag | Value | Notes |
+|---|:---:|---|
+| `SONIC_MOE_FP8_FUSED_GATED` | `1` | Fused SwiGLU+quant in up-proj epilogue. Non-fused path is deprecated. |
+| `SONIC_MOE_FP8_EPILOGUE_QUANT` | `1` | FP8 quant inside GEMM epilogue. Always active when FP8 enabled. |
+| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | `1` | Fused SwiGLU+rowquant on y1 path. Always active. |
+| `SONIC_MOE_FP8_SAVE_Z_FP8` | `1` | Save z as FP8 for backward (vs BF16). Always active. |
+
+**Deprecated / do-not-use:**
+
+| Flag | Reason |
+|---|---|
+| `SONIC_MOE_FP8_RECOMPUTE_OPT_B` | Produces `illegal-instruction` on non-uniform routing. Will be removed. |
+| `SONIC_MOE_FP8_WGRAD_BETA_ACCUM` | Legacy fused-beta epilogue (86 regs). TMA reduce-add (50 regs) is strictly better. |
+| `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION` | Always `fp8-blockscaled`. No other value tested or supported. |
+| `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION` | Always `fp8-blockscaled`. |
+| `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION` | Always `bf16`. FP8 weight not supported in down-proj mainloop. |
+| `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | Experimental dual z+y1 quant kernel. Slower than separated path on production shapes. |
+| `SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY` | Benchmark-only override. Never set in production. |
+
+Production launcher:
 
 ```bash
 USE_QUACK_GEMM=1 \
 SONIC_MOE_FP8_MODE=perf \
 SONIC_MOE_FP8_WGRAD=1 \
+SONIC_MOE_FP8_ASSUME_ALIGNED=1 \
 TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas \
-python -m pytest tests/...
+python train.py
 ```
 
 ## Paddle Integration (PaddleFleet)

@@ -343,6 +343,7 @@ def clear_blockscaled_fp8_weight_cache() -> None:
     _WEIGHT_CACHE.clear()
     _VARLEN_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE.clear()
+    _ISO32_WEIGHT_CACHE.clear()
     _PAD_PLAN_CACHE.clear()
 
 
@@ -374,6 +375,7 @@ def evict_fp8_weight_cache_entry(w: torch.Tensor) -> None:
     _FUSED_WEIGHT_CACHE.pop(key, None)
     _VARLEN_WEIGHT_CACHE.pop(key, None)
     _WEIGHT_CACHE.pop(key, None)
+    _ISO32_WEIGHT_CACHE.pop(key, None)
 
 
 def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
@@ -3731,6 +3733,70 @@ def quantize_and_pack_weight_iso32(
     return fp8_out, packed.view(_E8M0_DTYPE)
 
 
+def iso32_dual_quantize_weight_3d(
+    src_enk: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ISO32 weight quantize: ONE FP8 buffer + dual-layout ISA scales.
+
+    Uses the existing _dual_varlen_iso32_quantize_kernel on each expert slice
+    (exploiting N % SF_TILE_M == 0 to process all experts in a single reshape).
+
+    Parameters
+    ----------
+    src_enk : Tensor (E, N, K) bf16 — expert weight, may be strided.
+
+    Returns
+    -------
+    fp8 : Tensor (E, N, K) float8_e4m3fn — contiguous row-major.
+    row_scales : Tensor packed E8M0 for (E*N, K) layout (scales-along-K).
+    col_scales : Tensor packed E8M0 for (E*K, N) layout (scales-along-N).
+    """
+    E, N, K = src_enk.shape
+    assert N % _SF_VEC_SIZE == 0 and K % _SF_VEC_SIZE == 0, (
+        f"iso32 weight quant requires N({N}) and K({K}) divisible by {_SF_VEC_SIZE}"
+    )
+    src_2d = src_enk.reshape(E * N, K).contiguous()
+    fp8_2d, row_scales, col_scales = iso32_dual_quantize_varlen(src_2d, E * N, K)
+    return fp8_2d.reshape(E, N, K), row_scales, col_scales
+
+
+def _cache_iso32_w1(w1: torch.Tensor) -> None:
+    """ISO32 one-pass quantize w1 (2I, H, E): ONE FP8 + dual scales.
+
+    Populates _ISO32_WEIGHT_CACHE so precompute_weight_fp8_for_fused_gated
+    and precompute_weight_fp8(w1.permute(1,0,2)) hit the iso32 fast path.
+
+    The forward path (fused_gated) receives .mT of the contiguous (E,2I,H) buffer.
+    The backward actgrad path receives .permute(0,2,1) — a zero-copy strided view.
+    Both share the same underlying storage (no second fp8 allocation).
+    """
+    key = (w1.data_ptr(), _tensor_version(w1), tuple(w1.shape), tuple(w1.stride()))
+    if key in _ISO32_WEIGHT_CACHE:
+        return
+    fp8_enk, row_scales, col_scales = iso32_dual_quantize_weight_3d(
+        w1.permute(2, 0, 1)
+    )
+    _ISO32_WEIGHT_CACHE[key] = (fp8_enk, row_scales, col_scales)
+    w1T = w1.permute(1, 0, 2)
+    w1T_key = (w1T.data_ptr(), _tensor_version(w1T), tuple(w1T.shape), tuple(w1T.stride()))
+    _ISO32_WEIGHT_CACHE[w1T_key] = (fp8_enk.permute(0, 2, 1), col_scales, row_scales)
+
+
+def _cache_iso32_w2(w2: torch.Tensor) -> None:
+    """ISO32 one-pass quantize w2 (H, I, E): ONE FP8 + dual scales.
+
+    Forward (varlen) needs (E,H,I) contiguous → use fp8_enk directly.
+    Backward (dgated) needs (E,I,H) contiguous → precompute transposed copy.
+    """
+    key = (w2.data_ptr(), _tensor_version(w2), tuple(w2.shape), tuple(w2.stride()))
+    if key in _ISO32_WEIGHT_CACHE:
+        return
+    fp8_enk, row_scales, col_scales = iso32_dual_quantize_weight_3d(
+        w2.permute(2, 0, 1)
+    )
+    _ISO32_WEIGHT_CACHE[key] = (fp8_enk, row_scales, col_scales)
+
+
 def _quantize_weight_3d_triton(
     w_enk: torch.Tensor,
     *, isotropic: bool = False,
@@ -3803,6 +3869,11 @@ def precompute_weight_fp8(
         tuple(w.shape),
         tuple(w.stride()),
     )
+    if _iso32_weight_enabled():
+        iso_cached = _ISO32_WEIGHT_CACHE.get(key)
+        if iso_cached is not None:
+            fp8_enk, row_scales, _ = iso_cached
+            return (fp8_enk, row_scales)
     cached = _VARLEN_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -3826,6 +3897,20 @@ _FUSED_WEIGHT_CACHE: dict[
     tuple[int, int, tuple[int, ...], tuple[int, ...]],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
+
+_ISO32_WEIGHT_CACHE: dict[
+    tuple[int, int, tuple[int, ...], tuple[int, ...]],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+] = {}
+
+
+def _iso32_weight_enabled() -> bool:
+    """Check if ISO32 weight cache is active. Uses the centralized _FP8Config."""
+    from sonicmoe.functional import _get_fp8_config
+    cfg = _get_fp8_config()
+    if cfg.enabled and hasattr(cfg, 'iso32_weight'):
+        return cfg.iso32_weight
+    return os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
 
 
 def precompute_weight_fp8_for_fused_gated(
@@ -3858,6 +3943,11 @@ def precompute_weight_fp8_for_fused_gated(
         tuple(w.shape),
         tuple(w.stride()),
     )
+    if _iso32_weight_enabled():
+        iso_cached = _ISO32_WEIGHT_CACHE.get(key)
+        if iso_cached is not None:
+            fp8_enk, row_scales, _ = iso_cached
+            return (fp8_enk.mT, row_scales)
     cached = _FUSED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -3902,6 +3992,11 @@ def precompute_weight_fp8_for_fused_dgated(
         tuple(w.shape),
         tuple(w.stride()),
     )
+    if _iso32_weight_enabled():
+        iso_cached = _ISO32_WEIGHT_CACHE.get(key)
+        if iso_cached is not None:
+            fp8_enk, _, col_scales = iso_cached
+            return (fp8_enk, col_scales)
     cached = _FUSED_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -3942,6 +4037,13 @@ def precompute_weight_fp8_for_direct_fused_dgated(
         tuple(w.shape),
         tuple(w.stride()),
     )
+    if _iso32_weight_enabled():
+        iso_cached = _ISO32_WEIGHT_CACHE.get(key)
+        if iso_cached is not None:
+            fp8_enk, _, col_scales = iso_cached
+            # fp8_enk is (E,H,I). dgated needs (E,I,H) = permute view (zero-copy).
+            # CuTe handles strided FP8 via dynamic leading_dim detection.
+            return (fp8_enk.permute(0, 2, 1), col_scales)
     # Check unified fused cache first (shared with precompute_weight_fp8_for_fused_dgated)
     cached = _FUSED_WEIGHT_CACHE.get(key)
     if cached is not None:
@@ -4315,10 +4417,16 @@ def precompute_weight_fp8_warmup(
     for st in streams:
         st.wait_event(fork_ev)
 
-    with torch.cuda.stream(streams[0]):
-        _cache_pair_w1(w1)
-    with torch.cuda.stream(streams[1]):
-        _cache_pair_w2(w2)
+    if _iso32_weight_enabled():
+        with torch.cuda.stream(streams[0]):
+            _cache_iso32_w1(w1)
+        with torch.cuda.stream(streams[1]):
+            _cache_iso32_w2(w2)
+    else:
+        with torch.cuda.stream(streams[0]):
+            _cache_pair_w1(w1)
+        with torch.cuda.stream(streams[1]):
+            _cache_pair_w2(w2)
 
     for st in streams:
         cur.wait_event(st.record_event())
@@ -4514,9 +4622,12 @@ def _run_cutlass_blockscaled_gemm(
         out = torch.empty(total_M, H, dtype=out_dtype, device=device)
         # B permute for varlen_m: (H,K,E) -> (K,E,H)
         w_permuted = w_fp8.permute(1, 2, 0)
-        # Cute tensors — all row-major (leading_dim=1) in production
+        # Detect leading_dim from strides (handles both row-major and col-major B)
+        b_leading_dim = next(
+            (i for i, s in enumerate(w_permuted.stride()) if s == 1), 1
+        )
         a_cute = _make_cute_tensor_dynamic(a_fp8, leading_dim=1)
-        b_cute = _make_cute_tensor_dynamic(w_permuted, leading_dim=1)
+        b_cute = _make_cute_tensor_dynamic(w_permuted, leading_dim=b_leading_dim)
         d_cute = _make_cute_tensor_dynamic(out, leading_dim=1)
         a_sc_cute = _make_cute_tensor_dynamic(a_scales_packed, leading_dim=1)
         b_sc_cute = _make_cute_tensor_dynamic(w_scales_packed, leading_dim=1)
