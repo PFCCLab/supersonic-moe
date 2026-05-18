@@ -17,6 +17,9 @@ os.environ["USE_QUACK_GEMM"] = "1"
 os.environ["SONIC_MOE_FP8_MODE"] = "perf"
 os.environ["SONIC_MOE_FP8_ASSUME_ALIGNED"] = "1"
 
+from sonicmoe.functional import _refresh_fp8_config
+_refresh_fp8_config()
+
 from tests.ops.conftest import (
     requires_blackwell,
     requires_quack,
@@ -219,6 +222,7 @@ class TestIso32MemorySaving:
 
         # --- Measure BASELINE (pair-kernel, iso32 OFF) ---
         os.environ["SONIC_MOE_FP8_ISO32_WEIGHT"] = "0"
+        _refresh_fp8_config()
         clear_blockscaled_fp8_weight_cache()
         gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
         mem_before = torch.cuda.memory_allocated()
@@ -234,6 +238,7 @@ class TestIso32MemorySaving:
 
         # --- Measure ISO32 ---
         os.environ["SONIC_MOE_FP8_ISO32_WEIGHT"] = "1"
+        _refresh_fp8_config()
         clear_blockscaled_fp8_weight_cache()
         gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
         mem_before = torch.cuda.memory_allocated()

@@ -3905,6 +3905,11 @@ _ISO32_WEIGHT_CACHE: dict[
 
 
 def _iso32_weight_enabled() -> bool:
+    """Check if ISO32 weight cache is active. Uses the centralized _FP8Config."""
+    from sonicmoe.functional import _get_fp8_config
+    cfg = _get_fp8_config()
+    if cfg.enabled and hasattr(cfg, 'iso32_weight'):
+        return cfg.iso32_weight
     return os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
 
 

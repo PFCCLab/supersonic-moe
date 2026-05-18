@@ -784,6 +784,7 @@ class _FP8Config:
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
+        "iso32_weight",
     )
 
     def __init__(self) -> None:
@@ -796,6 +797,7 @@ class _FP8Config:
         self._fp8_wgrad_setting = _use_fp8_wgrad()  # True/False/None
         self.fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
         self.alignment_assumed: bool = False
+        self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
 
     # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
     # Session 53 re-benchmarked after cache fix + stash:
@@ -817,6 +819,7 @@ class _FP8Config:
             self.fp8_wgrad = I >= self._WGRAD_FP8_I_THRESHOLD
 
     @staticmethod
+    @staticmethod
     def disabled() -> "_FP8Config":
         """Return a config where everything is off (BF16 path)."""
         cfg = _FP8Config.__new__(_FP8Config)
@@ -829,6 +832,7 @@ class _FP8Config:
         cfg.fp8_wgrad = False
         cfg._fp8_wgrad_setting = False
         cfg.alignment_assumed = False
+        cfg.iso32_weight = False
         return cfg
 
 

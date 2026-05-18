@@ -12,12 +12,6 @@ import pytest
 os.environ.setdefault("USE_QUACK_GEMM", "1")
 os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO not in sys.path:
-    sys.path.insert(0, _REPO)
-
-import paddle
-paddle.enable_compat()
 import torch
 
 
@@ -33,18 +27,12 @@ class TestNodeStepLayout:
         """w1 native [E, 2I, H] -> ERNIE main_grad [E, H, 2I] is exact permute."""
         from sonicmoe.ernie_compat.mlp_node_v2 import _flush_native_grads_for
 
-        # Simulate native wgrad accumulator with known pattern
         native_w1 = torch.arange(
             self.E * 2 * self.I * self.H, device=self.device, dtype=torch.float32
         ).reshape(self.E, 2 * self.I, self.H)
 
-        # Create target main_grad buffer (ERNIE layout [E, H, 2I])
         main_grad_w1 = torch.zeros(self.E, self.H, 2 * self.I, device=self.device, dtype=torch.float32)
-
-        # Manually do what _flush_native_grads_for should do
-        expected = native_w1.permute(0, 2, 1).contiguous()  # [E, H, 2I]
-
-        # Simulate the flush: native_w1[e, 2i, h] -> main_grad[e, h, 2i]
+        expected = native_w1.permute(0, 2, 1).contiguous()
         main_grad_w1.copy_(native_w1.permute(0, 2, 1))
 
         assert (main_grad_w1 == expected).all().item(), (
@@ -57,7 +45,7 @@ class TestNodeStepLayout:
             self.E * self.H * self.I, device=self.device, dtype=torch.float32
         ).reshape(self.E, self.H, self.I)
 
-        expected = native_w2.permute(0, 2, 1).contiguous()  # [E, I, H]
+        expected = native_w2.permute(0, 2, 1).contiguous()
         main_grad_w2 = native_w2.permute(0, 2, 1).contiguous()
 
         assert (main_grad_w2 == expected).all().item()
