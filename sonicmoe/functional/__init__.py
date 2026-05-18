@@ -260,69 +260,21 @@ def _recompute_z_fp8(
 
     Returns (z_fp8, z_raw_scales) ready to plug into the fp8 backward path.
     """
-    import os as _os
-    if _os.environ.get("SONIC_MOE_FP8_RECOMPUTE_OPT_B", "0") != "1":
-        # Default: Option A — rerun gated forward, discard y1, pop z_fp8 from cache.
-        cfg = _get_fp8_config()
-        saved_epi_q = cfg.epilogue_quant
-        saved_recompute = cfg.recompute_z
-        cfg.epilogue_quant = True
-        cfg.recompute_z = False
-        try:
-            _PREQUANTIZED_SCALES.pop("z_fp8", None)
-            _z_ph, _y1 = _fused_blockscaled_gated_forward(
-                x, w1, expert_frequency_offset, x_gather_idx,
-            )
-            z_fp8, z_raw_scales = _PREQUANTIZED_SCALES.pop("z_fp8")
-        finally:
-            cfg.epilogue_quant = saved_epi_q
-            cfg.recompute_z = saved_recompute
-        return z_fp8, z_raw_scales
-
-    # Opt-in Option B path (research / future-work; broken on non-uniform routing).
-    from ..quack_utils.blockscaled_fp8_gemm import (
-        _gather_isa_packed_scales_kernel,
-        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
-        _storage_per_batch,
-        precompute_weight_fp8_for_fused_gated,
-        quantize_and_pack_activation,
-    )
-    from ..quack_utils.gemm_sm100_fp8_zeromat import blockscaled_fp8_gemm_zeromat_quant
-
-    if "w1_fused" in _STASHED_FP8_WEIGHTS:
-        w1_fp8, w1_scales = _STASHED_FP8_WEIGHTS["w1_fused"]
-    else:
-        w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
-
-    x_fp8, x_scales_t = quantize_and_pack_activation(x)
-
-    TK = x_gather_idx.shape[0]
-    K = x.shape[1]
-    k_tiles = _div_up(K, _SF_TILE_K)
-    per_batch_tk = _storage_per_batch(TK, K)
-    x_scales_tk = (
-        torch.empty((1, per_batch_tk), dtype=torch.uint8, device=x.device)
-        if (TK % _SF_TILE_M == 0 and K % _SF_TILE_K == 0)
-        else torch.full((1, per_batch_tk), 127, dtype=torch.uint8, device=x.device)
-    )
-    BLOCK_ROWS = 128
-    _gather_isa_packed_scales_kernel[(_div_up(TK, BLOCK_ROWS), k_tiles)](
-        x_scales_t.view(torch.uint8), x_gather_idx, x_scales_tk, TK,
-        src_k_tiles=k_tiles, dst_k_tiles=k_tiles,
-        SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
-        BLOCK_ROWS=BLOCK_ROWS, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
-    )
-    x_scales_tk_e8m0 = x_scales_tk.view(_E8M0_DTYPE)
-    del x_scales_t
-
-    z_fp8, z_scale_uint8 = blockscaled_fp8_gemm_zeromat_quant(
-        x_fp8, w1_fp8,
-        cu_seqlens_m=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        a_scales=x_scales_tk_e8m0,
-        b_scales=w1_scales,
-    )
-    z_raw_scales = z_scale_uint8.view(_E8M0_DTYPE)
+    # Option A: rerun gated forward, discard y1, pop z_fp8 from epilogue cache.
+    cfg = _get_fp8_config()
+    saved_epi_q = cfg.epilogue_quant
+    saved_recompute = cfg.recompute_z
+    cfg.epilogue_quant = True
+    cfg.recompute_z = False
+    try:
+        _PREQUANTIZED_SCALES.pop("z_fp8", None)
+        _z_ph, _y1 = _fused_blockscaled_gated_forward(
+            x, w1, expert_frequency_offset, x_gather_idx,
+        )
+        z_fp8, z_raw_scales = _PREQUANTIZED_SCALES.pop("z_fp8")
+    finally:
+        cfg.epilogue_quant = saved_epi_q
+        cfg.recompute_z = saved_recompute
     return z_fp8, z_raw_scales
 
 
