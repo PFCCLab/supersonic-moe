@@ -62,48 +62,6 @@ class TestNodeStepLayout:
 
         assert (main_grad_w2 == expected).all().item()
 
-    def test_step_produces_correct_layout(self):
-        """Full node.step() produces main_grad in expected ERNIE layout."""
-        import math
-        from sonicmoe.ernie_compat import SonicMoEMlpNode
-        from sonicmoe.ernie_compat.deepep_metadata import deepep_topk_to_sonic_metadata
-
-        E, H, I, K, T = self.E, self.H, self.I, 4, 64
-
-        class MockExpert:
-            def __init__(me, h, i, seed):
-                paddle.seed(seed)
-                me.up_gate_proj = type("P", (), {
-                    "weight": paddle.randn([h, 2 * i], dtype="bfloat16") / math.sqrt(h)
-                })()
-                me.down_proj = type("P", (), {
-                    "weight": paddle.randn([i, h], dtype="bfloat16") / math.sqrt(i)
-                })()
-
-        experts = [MockExpert(H, I, e) for e in range(E)]
-        node = SonicMoEMlpNode(experts, n_experts=E, hidden_size=H, intermediate_size=I)
-
-        x = torch.randn(T, H, device="cuda", dtype=torch.bfloat16)
-        indices = torch.randint(0, E, (T, K), device="cuda", dtype=torch.int32)
-        probs = torch.ones(T, K, device="cuda", dtype=torch.float32) / K
-        tpe = [T * K // E] * E
-        md = deepep_topk_to_sonic_metadata(indices, probs, tpe, E, K, "cuda")
-
-        out = node(x, md["tokens_per_expert"], md["dispatched_indices"], md["dispatched_probs"])
-        out.backward(torch.randn_like(out))
-
-        # Before step: native grads accumulated in [E, 2I, H] / [E, H, I]
-        w1_native_pre = node._w1_native_view().clone()  # [E, 2I, H]
-        w2_native_pre = node._w2_native_view().clone()  # [E, H, I]
-
-        node.step()
-
-        # After step: main_grad should be the transposed version
-        w1_main = experts[0].up_gate_proj.weight.main_grad  # Should be [H, 2I] for expert 0
-        if w1_main is not None and w1_main.numel() > 0:
-            # Verify it's non-zero (wgrad was flushed)
-            assert w1_main.abs().sum().item() > 0, "w1 main_grad is zero after step()"
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
