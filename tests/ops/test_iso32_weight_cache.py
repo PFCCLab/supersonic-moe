@@ -178,3 +178,92 @@ class TestIso32WeightCache:
         w1.add_(0.1)
         key_after = (w1.data_ptr(), _tensor_version(w1), tuple(w1.shape), tuple(w1.stride()))
         assert key_after not in _ISO32_WEIGHT_CACHE
+
+
+class TestIso32MemorySaving:
+    """End-to-end GPU memory saving verification.
+
+    Methodology:
+    - Use torch.cuda.memory_allocated() to measure ACTUAL GPU memory
+    - Compare pair-kernel path (4 buffers) vs iso32 path (2 buffers)
+    - Verify savings match theoretical expectation (E*2I*H + E*H*I bytes)
+    - Test at production shapes to catch alignment/padding overhead
+    """
+
+    @pytest.mark.parametrize("E,H,I", [
+        pytest.param(8, 3072, 1536, id="production-E8"),
+        pytest.param(8, 256, 128, id="smoke-E8"),
+    ])
+    def test_memory_saving_vs_pair_kernel(self, E, H, I):
+        """ISO32 uses strictly less GPU memory than pair-kernel for weight caches.
+
+        Measured via torch.cuda.memory_allocated delta — the ground truth for
+        actual GPU memory consumption. Verifies:
+        1. ISO32 allocates fewer bytes than pair-kernel
+        2. The byte-level saving matches theory: E*(2I*H + H*I) bytes
+        3. The saving is at least 40% of baseline (guards against hidden copies)
+        """
+        import gc
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            precompute_weight_fp8_warmup,
+            precompute_weight_fp8_for_fused_gated,
+            precompute_weight_fp8,
+            precompute_weight_fp8_for_direct_fused_dgated,
+            clear_blockscaled_fp8_weight_cache,
+            _ISO32_WEIGHT_CACHE,
+        )
+
+        torch.manual_seed(42)
+        w1 = torch.randn(2 * I, H, E, dtype=torch.bfloat16, device="cuda")
+        w2 = torch.randn(H, I, E, dtype=torch.bfloat16, device="cuda")
+
+        # --- Measure BASELINE (pair-kernel, iso32 OFF) ---
+        os.environ["SONIC_MOE_FP8_ISO32_WEIGHT"] = "0"
+        clear_blockscaled_fp8_weight_cache()
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated()
+
+        precompute_weight_fp8_warmup(w1, w2)
+        _ = precompute_weight_fp8_for_fused_gated(w1)
+        _ = precompute_weight_fp8(w1.permute(1, 0, 2))
+        _ = precompute_weight_fp8(w2)
+        _ = precompute_weight_fp8_for_direct_fused_dgated(w2)
+        torch.cuda.synchronize()
+
+        baseline_mem = torch.cuda.memory_allocated() - mem_before
+
+        # --- Measure ISO32 ---
+        os.environ["SONIC_MOE_FP8_ISO32_WEIGHT"] = "1"
+        clear_blockscaled_fp8_weight_cache()
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+        mem_before = torch.cuda.memory_allocated()
+
+        precompute_weight_fp8_warmup(w1, w2)
+        _ = precompute_weight_fp8_for_fused_gated(w1)
+        _ = precompute_weight_fp8(w1.permute(1, 0, 2))
+        _ = precompute_weight_fp8(w2)
+        _ = precompute_weight_fp8_for_direct_fused_dgated(w2)
+        torch.cuda.synchronize()
+
+        iso32_mem = torch.cuda.memory_allocated() - mem_before
+
+        # --- Assertions ---
+        saving_bytes = baseline_mem - iso32_mem
+        saving_pct = saving_bytes / baseline_mem * 100 if baseline_mem > 0 else 0
+        theoretical_saving = E * (2 * I * H + H * I)
+
+        print(f"\n  E={E}, H={H}, I={I}")
+        print(f"  Baseline (pair-kernel): {baseline_mem / 2**20:.2f} MiB")
+        print(f"  ISO32 (single buffer):  {iso32_mem / 2**20:.2f} MiB")
+        print(f"  Saving:   {saving_bytes / 2**20:.2f} MiB ({saving_pct:.1f}%)")
+        print(f"  Theory:   {theoretical_saving / 2**20:.2f} MiB")
+
+        assert saving_pct > 40, (
+            f"Memory saving {saving_pct:.1f}% is less than 40% — "
+            f"possible hidden copy defeating iso32 purpose"
+        )
+        assert saving_bytes >= theoretical_saving * 0.85, (
+            f"Saving {saving_bytes/2**20:.2f} MiB is less than 85% of "
+            f"theoretical minimum {theoretical_saving/2**20:.2f} MiB — "
+            f"possible hidden allocation"
+        )
