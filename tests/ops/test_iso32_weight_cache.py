@@ -83,24 +83,58 @@ class TestIso32WeightCache:
         assert fp8_match > 0.99, f"FP8 byte match rate: {fp8_match:.4f}"
 
     @pytest.mark.parametrize("E,N,K", WEIGHT_SHAPES)
-    def test_iso32_vs_1x32_precision(self, E, N, K, seed):
-        """ISO32 weight quant is close to 1x32 quant (slight precision relaxation)."""
+    def test_iso32_vs_bf16_precision(self, E, N, K, seed):
+        """ISO32 weight quant→dequant fidelity vs BF16 ground truth.
+
+        The gold standard: dequant(quantize(w)) vs w itself.
+        For Gaussian-initialized weights (realistic), iso32 and 1x32 produce
+        identical RRMSE vs BF16 (proven by audit_iso32_numerics.py). We gate
+        at the same tolerance as the production 1x32 path: RRMSE < 0.035,
+        cosine > 0.9995.
+        """
         from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
             iso32_dual_quantize_weight_3d,
-            _quantize_weight_3d_triton,
         )
+        from tests.ops.conftest import gold_dequant, gold_e8m0_iso32_quant
 
-        w = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
-        fp8_iso32, _, _ = iso32_dual_quantize_weight_3d(w)
-        w_contig = w.contiguous()
-        fp8_1x32, _ = _quantize_weight_3d_triton(w_contig)
+        w = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda") * (1.0 / (K ** 0.5))
+        fp8_3d, _, _ = iso32_dual_quantize_weight_3d(w)
 
-        iso32_f32 = fp8_iso32.float()
-        baseline_f32 = fp8_1x32.float()
-        err = rrmse(iso32_f32, baseline_f32)
-        cos = cosine_sim(iso32_f32, baseline_f32)
-        assert err < 0.15, f"ISO32 vs 1x32 RRMSE too high: {err:.4e}"
-        assert cos > 0.98, f"ISO32 vs 1x32 cosine too low: {cos:.6f}"
+        w_2d = w.reshape(E * N, K)
+        _, gold_raw_scales = gold_e8m0_iso32_quant(w_2d)
+        dequant = gold_dequant(fp8_3d.reshape(E * N, K), gold_raw_scales)
+
+        err = rrmse(dequant, w_2d)
+        cos = cosine_sim(dequant, w_2d)
+        assert err < 0.035, f"ISO32 vs BF16 RRMSE: {err:.6e} (must be < 0.035)"
+        assert cos > 0.9995, f"ISO32 vs BF16 cosine: {cos:.8f} (must be > 0.9995)"
+
+    @pytest.mark.parametrize("E,N,K", WEIGHT_SHAPES)
+    def test_iso32_vs_bf16_stress_outlier_weights(self, E, N, K, seed):
+        """Stress: 3% of expert rows scaled 100x (outlier weights).
+
+        Even with heavy-tail distribution, the quant→dequant RRMSE vs BF16
+        must stay within FP8 quantization noise. Gate: RRMSE < 0.04, cos > 0.999.
+        """
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            iso32_dual_quantize_weight_3d,
+        )
+        from tests.ops.conftest import gold_dequant, gold_e8m0_iso32_quant
+
+        w = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda") * (1.0 / (K ** 0.5))
+        outlier_idx = torch.randperm(E * N, device="cuda")[: (E * N) // 32]
+        w_flat = w.reshape(-1, K)
+        w_flat[outlier_idx] *= 100.0
+
+        fp8_3d, _, _ = iso32_dual_quantize_weight_3d(w)
+        w_2d = w.reshape(E * N, K)
+        _, gold_raw_scales = gold_e8m0_iso32_quant(w_2d)
+        dequant = gold_dequant(fp8_3d.reshape(E * N, K), gold_raw_scales)
+
+        err = rrmse(dequant, w_2d)
+        cos = cosine_sim(dequant, w_2d)
+        assert err < 0.04, f"ISO32 outlier stress RRMSE: {err:.6e}"
+        assert cos > 0.999, f"ISO32 outlier stress cosine: {cos:.8f}"
 
     @pytest.mark.parametrize("E,N,K", WEIGHT_SHAPES)
     def test_memory_single_buffer(self, E, N, K, seed):
