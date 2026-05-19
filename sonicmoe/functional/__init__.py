@@ -1191,7 +1191,7 @@ class _UpProjection(torch.autograd.Function):
             ctx._w1_device = w1.device
             # Eagerly lookup w1T fp8 cache — will be used in backward actgrad.
             # This is a cache hit (zero compute) since forward already populated the fused cache.
-            _w1T_fp8, _w1T_scales = _STASHED_FP8_WEIGHTS.get("w1T_varlen", None) or precompute_weight_fp8(w1.permute(1, 0, 2))
+            _w1T_fp8, _w1T_scales = _STASHED_FP8_WEIGHTS.get("w1T_varlen", None) or precompute_weight_fp8(w1, permute=(1, 0, 2))
             ctx._w1T_fp8 = _w1T_fp8
             ctx._w1T_scales = _w1T_scales
             ctx.save_for_backward(
@@ -1293,7 +1293,7 @@ class _UpProjection(torch.autograd.Function):
                     w1T_fp8 = ctx._w1T_fp8
                     w1T_scales = ctx._w1T_scales
                 else:
-                    w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
+                    w1T_fp8, w1T_scales = precompute_weight_fp8(w1, permute=(1, 0, 2))
                 prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
                 if ctx._fp8_cfg.fp8_wgrad:
                     # FP8 wgrad: dz_bf16 was already freed in DownProj via dual-quant.
@@ -1878,28 +1878,6 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if ctx._fp8_enabled_flag and ctx._alignment_assumed_flag:
-                # ── Early eviction: free forward-only FP8 weight caches ──
-                # Clears w2_varlen (~37 MiB freeable, forward down-proj only)
-                # and w1_fused dict entries at backward entry.
-                # At I=1536 this doesn't reduce peak (wgrad dominates), but
-                # at larger shapes where dgated peak exceeds wgrad peak,
-                # this saves ~37 MiB.
-                # Backward-needed caches survive via ctx references:
-                #   w2_dgated  -> ctx._w2_dgated_fp8 (DownProj dgated)
-                #   w1T_varlen -> UpProj ctx._w1T_fp8 (actgrad)
-                #
-                # NOTE: keep _VARLEN_WEIGHT_CACHE alive — it is keyed by
-                # (data_ptr, _version) so stale entries auto-invalidate at
-                # optimizer step, and keeping it avoids ~300µs/iter weight
-                # re-quantize overhead on the next forward pass.
-                from ..quack_utils.blockscaled_fp8_gemm import (
-                    _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE,
-                )
-                # Keep ALL weight caches alive by default (max performance).
-                # Cache eviction is available via SonicMoEConfig(memopt=True)
-                # for memory-constrained scenarios (saves ~1755 MiB at E=128,
-                # costs ~500µs/iter re-quantization).
-
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
                     # Zero-materialization FP8 dgated: T-quant + scale_gather + A_idx
@@ -1995,7 +1973,7 @@ class _DownProjection(torch.autograd.Function):
                     # w1_fused and w2_varlen were already freed at backward entry
                     # (early eviction). Only w2_dgated remains to clean up here.
                     # NOTE: do NOT free ctx._w2_dgated_fp8 storage — it's shared
-                    # with _FUSED_WEIGHT_CACHE. Freeing it corrupts the cache and
+                    # with fp8_weight_cache[fused]. Freeing it corrupts the cache and
                     # causes "storage of size 0" errors on the next forward.
                     # The cache is version-keyed and auto-invalidates at optimizer step.
                     _w2d_stash = _STASHED_FP8_WEIGHTS.pop("w2_dgated", None)
@@ -2134,7 +2112,7 @@ class _DownProjection(torch.autograd.Function):
                     ds = ds[s_reverse_scatter_idx]
                 else:
                     w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
-                    w2_fp8, w2_scales = precompute_weight_fp8(w2_actgrad)
+                    w2_fp8, w2_scales = precompute_weight_fp8(w2, permute=(1, 0, 2))
 
                     dout_fp8, dout_scales = fast_gather_quantize_and_pack_activation(
                         dout, x_gather_idx
@@ -2607,14 +2585,6 @@ def moe_TC_softmax_topk_layer(
             )
         _log_stage_memory("forward:fp8-boundary")
 
-    # ── Memory optimization: eagerly release forward transients ──────────
-    # z bf16 and y1 bf16 storage was already freed inside _UpProjection
-    # via untyped_storage().resize_(0).  Keep ALL weight caches (version-keyed,
-    # auto-invalidate at optimizer step).  Session 53 analysis: clearing FUSED
-    # cache saved ~74 MiB but cost ~980µs/iter at E=128 from weight re-quant.
-    # if _get_fp8_config().enabled:
-    #     clear_fused_weight_cache()
-
     _reset_stage_memory_probe()
     o = _DownProjection.apply(
         y1,
@@ -2697,14 +2667,6 @@ def moe_general_routing_inputs(
         is_inference_mode_enabled,
         False,  # use_low_precision_postact_buffer
     )
-
-    # ── Eagerly release forward transients (same as moe_TC_softmax_topk_layer) ──
-    # z/y1 bf16 storage freed inside _UpProjection.
-    # NOTE: keep FUSED weight cache alive (version-keyed, auto-invalidates at
-    # optimizer step). Clearing it saved ~74 MiB but cost ~980µs/iter at E=128
-    # from weight re-quantization.
-    # if _fp8_enabled() and _ALIGNMENT_ASSUMED:
-    #     clear_fused_weight_cache()
 
     o = _DownProjection.apply(
         y1,

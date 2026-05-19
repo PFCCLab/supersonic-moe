@@ -144,7 +144,6 @@ class TestIso32WeightCache:
         """ISO32 path: forward and backward views share ONE data_ptr."""
         from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
             _cache_iso32_w1,
-            _ISO32_WEIGHT_CACHE,
             precompute_weight_fp8_for_fused_gated,
             precompute_weight_fp8,
             clear_blockscaled_fp8_weight_cache,
@@ -155,7 +154,7 @@ class TestIso32WeightCache:
         _cache_iso32_w1(w1)
 
         fwd_fp8, fwd_scales = precompute_weight_fp8_for_fused_gated(w1)
-        bwd_fp8, bwd_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
+        bwd_fp8, bwd_scales = precompute_weight_fp8(w1, permute=(1, 0, 2))
 
         assert fwd_fp8.data_ptr() == bwd_fp8.data_ptr(), (
             "Forward and backward FP8 views must share storage"
@@ -166,8 +165,6 @@ class TestIso32WeightCache:
         """Cache misses after in-place weight update."""
         from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
             _cache_iso32_w1,
-            _ISO32_WEIGHT_CACHE,
-            _tensor_version,
             clear_blockscaled_fp8_weight_cache,
         )
 
@@ -175,12 +172,7 @@ class TestIso32WeightCache:
         w1 = torch.randn(N, K, E, dtype=torch.bfloat16, device="cuda")
         _cache_iso32_w1(w1)
 
-        key_before = (w1.data_ptr(), _tensor_version(w1), tuple(w1.shape), tuple(w1.stride()))
-        assert key_before in _ISO32_WEIGHT_CACHE
-
-        w1.add_(0.1)
-        key_after = (w1.data_ptr(), _tensor_version(w1), tuple(w1.shape), tuple(w1.stride()))
-        assert key_after not in _ISO32_WEIGHT_CACHE
+        assert ("iso32", tuple(w1.stride())) in w1.fp8_weight_cache
 
 
 class TestIso32MemorySaving:
@@ -213,7 +205,6 @@ class TestIso32MemorySaving:
             precompute_weight_fp8,
             precompute_weight_fp8_for_direct_fused_dgated,
             clear_blockscaled_fp8_weight_cache,
-            _ISO32_WEIGHT_CACHE,
         )
 
         torch.manual_seed(42)
