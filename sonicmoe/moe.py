@@ -299,17 +299,17 @@ class MoE(nn.Module):
         precompute_weight_fp8_warmup(w1_perm, w2_perm)
 
         # Cache lookups (zero quantize work — everything was just populated above).
-        # Layout 1: w1 for fused_gated forward — reads _FUSED_WEIGHT_CACHE
+        # Layout 1: w1 for fused_gated forward — reads fp8_weight_cache[fused]
         self._fp8_w1_fused = precompute_weight_fp8_for_fused_gated(w1_perm)
 
-        # Layout 2: w2 for varlen down-proj forward — reads _VARLEN_WEIGHT_CACHE
+        # Layout 2: w2 for varlen down-proj forward — reads fp8_weight_cache[varlen]
         self._fp8_w2_varlen = precompute_weight_fp8(w2_perm)
 
-        # Layout 3: w2 for direct_fused_dgated backward — reads _FUSED_WEIGHT_CACHE
+        # Layout 3: w2 for direct_fused_dgated backward — reads fp8_weight_cache[fused]
         self._fp8_w2_dgated = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
 
-        # Layout 4: w1T for varlen actgrad backward — reads _VARLEN_WEIGHT_CACHE
-        self._fp8_w1T_varlen = precompute_weight_fp8(w1_perm.permute(1, 0, 2))  # (H, 2I, E)
+        # Layout 4: w1T for varlen actgrad backward — reads fp8_weight_cache[varlen]
+        self._fp8_w1T_varlen = precompute_weight_fp8(w1_perm, permute=(1, 0, 2))  # (H, 2I, E)
 
     @torch.no_grad()
     def has_fp8_shadow_weights(self) -> bool:
@@ -317,8 +317,7 @@ class MoE(nn.Module):
         # Shadow weights live in the runtime caches. If the cache was populated
         # by refresh_fp8_shadow_weights() with the current _version, hits are guaranteed.
         # We can't cheaply verify cache freshness, so just check if caches are non-empty.
-        from .quack_utils.blockscaled_fp8_gemm import _VARLEN_WEIGHT_CACHE, _FUSED_WEIGHT_CACHE
-        return len(_VARLEN_WEIGHT_CACHE) > 0 and len(_FUSED_WEIGHT_CACHE) > 0
+        return hasattr(self, "_fp8_w1_fused")
 
     @torch.no_grad()
     def stash_bf16_to_cpu(self) -> None:

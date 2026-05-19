@@ -643,34 +643,6 @@ print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
             f"FP8+stash bwd peak ({stash_bwd:.0f} MiB) must be < BF16 bwd peak ({bf16_bwd:.0f} MiB)",
         )
 
-    def test_weight_cache_dedup(self) -> None:
-        """Weight cache dedup: direct_fused_dgated reuses fused_dgated cache."""
-        self._require_blackwell()
-        self._reset_fp8_state()
-        self.set_seed(42)
-        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
-            _FUSED_WEIGHT_CACHE,
-            precompute_weight_fp8_for_fused_dgated,
-            precompute_weight_fp8_for_direct_fused_dgated,
-            clear_blockscaled_fp8_weight_cache,
-        )
-        clear_blockscaled_fp8_weight_cache()
-
-        w = torch.randn(self._ALIGNED_H, self._ALIGNED_I, self._ALIGNED_E,
-                        device="cuda", dtype=torch.bfloat16)
-
-        # Call fused_dgated first — populates _FUSED_WEIGHT_CACHE
-        w_view, scales_view = precompute_weight_fp8_for_fused_dgated(w)
-        self.assertEqual(len(_FUSED_WEIGHT_CACHE), 1)
-
-        # Call direct_fused_dgated — should reuse from _FUSED_WEIGHT_CACHE (no new entry)
-        w_cont, scales_cont = precompute_weight_fp8_for_direct_fused_dgated(w)
-        self.assertEqual(len(_FUSED_WEIGHT_CACHE), 1,
-                        "direct_fused_dgated should reuse fused_dgated cache, not create duplicate")
-        # Data must match (same physical storage, different views)
-        self.assertEqual(w_cont.data_ptr(), w_view.data_ptr(),
-                        "direct and fused dgated should share physical storage")
-
     def test_fp8_downproj_prequant_precision(self) -> None:
         """FP8 down-proj with pre-quantized y1 preserves precision at I=1536."""
         self._require_blackwell()
@@ -1278,37 +1250,3 @@ print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
         self.assertLess(rrmse, 0.001, f"Non-aligned FP8 fallback output diverges from BF16: RRMSE={rrmse:.6f}")
         self.assertFalse(torch.isnan(out_fp8).any(), "Output contains NaN")
         self.assertFalse(torch.isnan(dx_fp8).any(), "dx contains NaN")
-
-    def test_weight_cache_eviction_after_downproj(self) -> None:
-        """w2 varlen cache should be evicted after down-proj forward GEMM."""
-        self._require_blackwell()
-        self._reset_fp8_state()
-        self.set_seed(42)
-        moe = self._make_moe()
-        x, _ = self._make_sample()
-
-        from sonicmoe.quack_utils.blockscaled_fp8_gemm import _VARLEN_WEIGHT_CACHE
-
-        # Warmup to populate caches
-        for _ in range(3):
-            with enable_quack_gemm(True), enable_fp8():
-                out, _ = moe(x, use_fp8=True)
-            out.sum().backward()
-            x.grad = None
-            moe.zero_grad(set_to_none=True)
-
-        # Record cache state before forward
-        cache_keys_before = set(_VARLEN_WEIGHT_CACHE.keys())
-
-        with enable_quack_gemm(True), enable_fp8():
-            out, _ = moe(x, use_fp8=True)
-
-        # After forward, w2's varlen cache entry should have been evicted
-        # (by evict_fp8_weight_cache_entry(w2) at __init__.py line 1061).
-        # w1T's entry may still exist from previous backward.
-        cache_keys_after_fwd = set(_VARLEN_WEIGHT_CACHE.keys())
-        # Verify the cache didn't grow unboundedly
-        self.assertLessEqual(
-            len(_VARLEN_WEIGHT_CACHE), 8,
-            f"Varlen cache exceeded LRU limit: {len(_VARLEN_WEIGHT_CACHE)} entries",
-        )
