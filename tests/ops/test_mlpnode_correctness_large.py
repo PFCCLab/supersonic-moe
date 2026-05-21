@@ -81,7 +81,6 @@ def child_run(case_name: str, N_recv: int, topk: int, E: int, I: int, dist: str)
     from sonicmoe.enums import ActivationType
     from sonicmoe.ernie_compat import (
         SonicMoEMlpNode,
-        flush_native_grads,
         invalidate_weight_caches,
     )
     import sonicmoe.functional as functional
@@ -220,7 +219,7 @@ def child_run(case_name: str, N_recv: int, topk: int, E: int, I: int, dist: str)
         dp.stop_gradient = True
         out_w = node.forward(x_w, tpe, dispatched_indices=di, dispatched_probs=dp)
         out_w.backward(_to_paddle(grad_out))
-    flush_native_grads()
+    node.flush_grads()
     _zero_main_grads(experts)
 
     # Measured run with autograd on x and dispatched_probs
@@ -233,7 +232,7 @@ def child_run(case_name: str, N_recv: int, topk: int, E: int, I: int, dist: str)
 
     out = node.forward(x_in, tpe, dispatched_indices=di_in, dispatched_probs=dp_in)
     out.backward(_to_paddle(grad_out))
-    flush_native_grads()
+    node.flush_grads()
 
     out_fp8 = torch.from_dlpack(out.detach()).to(device=device, dtype=x.dtype)
     dx_fp8 = torch.from_dlpack(x_in.grad.detach()).to(device=device, dtype=x.dtype) if x_in.grad is not None else None

@@ -76,9 +76,9 @@ USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/ops/test_wgrad_gemm.py -v --tb=short 2>&1 || true
 
 echo ""
-echo "--- [CORE] ops/test_e2e_mlpnode.py (MlpNode end-to-end) ---"
+echo "--- [CORE] ops/test_e2e_mlpnode.py (MlpNode end-to-end benchmark) ---"
 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/ops/test_e2e_mlpnode.py -v --tb=short 2>&1 || true
+  python tests/ops/test_e2e_mlpnode.py 2>&1 || true
 
 echo ""
 echo "--- [CORE] ops/test_moe_module.py (59 parametrized MoE tests) ---"
