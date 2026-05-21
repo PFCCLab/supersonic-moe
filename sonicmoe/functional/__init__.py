@@ -38,19 +38,21 @@ apply_fp8_quack_patch()
 
 
 def _safe_dgated_config(device, num_experts: int):
-    """Safe tile config for GemmDGated/GemmGated on sm_103 with large E.
-
-    2CTA instructions (tile_m=256, cluster_m=2) crash on sm_103 when
-    num_experts > 8 due to CuTe TMA descriptor limits for the L dimension.
-    """
     config = default_config(device)
     if num_experts > 8 and config.cluster_m >= 2:
         cap = get_device_capacity(device)
         if cap[0] == 10 and cap[1] >= 3:
             from quack.gemm_interface import GemmConfig
+            # MXF8 dgated requires M-mode 128; avoid 2CTA-M varlen gather on SM103.
             config = GemmConfig(
-                tile_m=128, tile_n=128, cluster_m=1, cluster_n=1,
-                pingpong=False, is_dynamic_persistent=True,
+                tile_m=128,
+                tile_n=128,
+                cluster_m=1,
+                cluster_n=1,
+                pingpong=False,
+                is_dynamic_persistent=config.is_dynamic_persistent,
+                max_swizzle_size=config.max_swizzle_size,
+                device_capacity=config.device_capacity,
             )
     return config
 
@@ -1967,7 +1969,7 @@ class _DownProjection(torch.autograd.Function):
                         w2_scales = ctx._w2_dgated_scales
                     else:
                         w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
-                    config = default_config(dout.device)
+                    config = _safe_dgated_config(dout.device, w2_shape[2])
                     total_m = x_gather_idx.shape[0]  # TK (not T — dout_fp8 is T-sized)
                     n = w2_fp8_enk.shape[-2]
                     dz = torch.empty((total_m, n * 2), dtype=torch.bfloat16, device=dout.device)
