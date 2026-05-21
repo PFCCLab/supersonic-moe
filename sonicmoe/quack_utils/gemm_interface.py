@@ -10,7 +10,7 @@ import torch
 from quack.autotuner import AutotuneConfig, autotune
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig, get_all_configs
-from quack.gemm_interface import default_config, prune_invalid_gemm_configs as prune_invalid_gemm_configs_base
+from quack.gemm_interface import default_config as quack_default_config, prune_invalid_gemm_configs as prune_invalid_gemm_configs_base
 from torch import Tensor
 
 
@@ -38,6 +38,23 @@ from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
 
 
 default_device_capacity = get_device_capacity(paddle.device("cuda"))
+
+
+def default_config(device) -> GemmConfig:
+    config = quack_default_config(device)
+    cap = get_device_capacity(device)
+    if cap[0] == 10 and cap[1] >= 3:
+        return GemmConfig(
+            tile_m=128,
+            tile_n=128,
+            cluster_m=1,
+            cluster_n=1,
+            pingpong=False,
+            is_dynamic_persistent=config.is_dynamic_persistent,
+            max_swizzle_size=config.max_swizzle_size,
+            device_capacity=config.device_capacity,
+        )
+    return config
 
 
 def _uses_blockscaled_runtime(a_scales: Optional[Tensor], b_scales: Optional[Tensor]) -> bool:
@@ -76,7 +93,7 @@ def gemm_gated_tuned(
     z_scale_out: Optional[Tensor] = None,  # epilogue quant scale output
 ) -> None:
     if config is None:
-        config = default_config(A.device)
+        config = quack_default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
@@ -359,6 +376,9 @@ def gemm_dgated(
         return dx_out, postact_out
     else:
         return dx_out, postact_out, colvec_reduce_final
+
+
+gemm_dgated.default_config = default_config
 
 
 @_custom_op_or_plain(

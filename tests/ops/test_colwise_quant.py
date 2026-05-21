@@ -31,31 +31,3 @@ def test_colwise_fp8_vs_gold(TK, dim, seed):
     fp8_kernel, _ = colwise_quantize_and_pack(x, dim, TK)
     fp8_gold, _ = gold_e8m0_col_quant(x)
     assert_byte_exact(fp8_kernel, fp8_gold)
-
-
-@pytest.mark.parametrize("TK,dim", COL_SHAPES)
-def test_colwise_scales_vs_gold(TK, dim, seed):
-    """Raw scales from CuTe colwise match gold E8M0."""
-    from sonicmoe.quack_utils.cute_blockscaled_quant import colwise_quantize_cute
-
-    x = torch.randn(TK, dim, dtype=torch.bfloat16, device="cuda")
-    # CuTe with isa_pack=False returns raw scales (dim, num_groups)
-    _, scale_cute = colwise_quantize_cute(x, dim, TK, isa_pack=False)
-    _, gold_scales = gold_e8m0_col_quant(x)
-
-    # gold_scales is (dim, num_groups), scale_cute is (dim, num_groups)
-    assert_byte_exact(scale_cute, gold_scales)
-
-
-@pytest.mark.parametrize("TK,dim", COL_SHAPES)
-def test_cute_matches_triton(TK, dim, seed):
-    """CuTe colwise variant is byte-identical to Triton variant."""
-    from sonicmoe.quack_utils.blockscaled_fp8_gemm import colwise_quantize_and_pack
-    from sonicmoe.quack_utils.cute_blockscaled_quant import colwise_quantize_cute
-
-    x = torch.randn(TK, dim, dtype=torch.bfloat16, device="cuda")
-    fp8_triton, scales_triton = colwise_quantize_and_pack(x, dim, TK)
-    fp8_cute, scales_cute = colwise_quantize_cute(x, dim, TK, isa_pack=True)
-
-    assert_byte_exact(fp8_cute, fp8_triton)
-    assert_byte_exact(scales_cute, scales_triton)

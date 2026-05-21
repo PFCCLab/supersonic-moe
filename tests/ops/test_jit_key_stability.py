@@ -36,6 +36,7 @@ def _all_compile_caches() -> dict[str, int]:
     import importlib
     for mod_name in [
         "sonicmoe.quack_utils.blockscaled_fp8_gemm",
+        "sonicmoe.quack_utils.bf16_wgrad_gemm",
         "sonicmoe.quack_utils.gemm_gated",
         "sonicmoe.quack_utils.gemm_dgated",
         "sonicmoe.quack_utils.gemm_sm100_fp8_zeromat",
