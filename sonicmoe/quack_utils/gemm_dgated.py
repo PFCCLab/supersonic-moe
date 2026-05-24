@@ -65,7 +65,7 @@ class GemmDGatedFP8CLoadSm100(GemmDGatedFP8CLoadMixin, GemmSm100):
 
 
 dgate_fn_map = {
-    "swiglu": quack.activation.dswiglu,
+    "swiglu": quack.activation.dswiglu_precise,
     "swiglu_oai": quack.activation.dswiglu_oai,
     "reglu": quack.activation.dreglu,
     "geglu": quack.activation.dgeglu,
