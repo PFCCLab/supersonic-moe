@@ -1689,7 +1689,10 @@ class _DownProjection(torch.autograd.Function):
         # PyTorch Function.apply() detach behavior) without providing
         # ctx.needs_input_grad.  Defaulting to True is safe: if the caller truly
         # doesn't need ds, the autograd engine simply discards it.
-        ctx._topk_scores_needs_grad = True
+        if not hasattr(topk_scores, "stop_gradient"):
+            ctx._topk_scores_needs_grad = False
+        else:
+            ctx._topk_scores_needs_grad = not topk_scores.stop_gradient
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
         # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 -> ~213MB FP8 = ~171MB saved.
@@ -1927,6 +1930,7 @@ class _DownProjection(torch.autograd.Function):
                     else:
                         w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
                     config = gemm_dgated.default_config(dout.device)
+                    # config = _safe_dgated_config(dout.device, w2_shape[2])
                     total_m = x_gather_idx.shape[0]  # TK (not T — dout_fp8 is T-sized)
                     n = w2_fp8_enk.shape[-2]
                     dz = torch.empty((total_m, n * 2), dtype=torch.bfloat16, device=dout.device)

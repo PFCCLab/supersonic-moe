@@ -67,7 +67,7 @@ class BlockscaledQuantOnlySm100(BlockscaledQuantOnlyMixin, GemmSm100):
 
 
 gate_fn_map = {
-    "swiglu": quack.activation.swiglu,
+    "swiglu": quack.activation.swiglu_precise,
     "swiglu_oai": quack.activation.swiglu_oai,
     "reglu": quack.activation.reglu,
     "geglu": quack.activation.geglu,
