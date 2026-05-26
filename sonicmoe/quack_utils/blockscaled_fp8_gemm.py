@@ -30,6 +30,7 @@ from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 
 from ..functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity, validate_fp8_runtime_support
 from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to_e8m0
+from ..functional.fp8_config import _get_fp8_config
 
 
 # ---------------------------------------------------------------------------
@@ -3873,7 +3874,6 @@ def precompute_weight_fp8(
 
 def _iso32_weight_enabled() -> bool:
     """Check if ISO32 weight cache is active. Uses the centralized _FP8Config."""
-    from sonicmoe.functional import _get_fp8_config
     cfg = _get_fp8_config()
     if cfg.enabled and hasattr(cfg, 'iso32_weight'):
         return cfg.iso32_weight

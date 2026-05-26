@@ -29,6 +29,13 @@ import torch
 
 from ..triton_utils import wrap_triton_kernel
 from ._validate import check_tensor
+from .blockscaled_fp8_gemm import (
+    _dual_varlen_quantize_kernel,
+    _dual_varlen_iso32_quantize_kernel,
+    _colwise_quantize_and_pack_kernel,
+    _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
+    _storage_per_batch,
+)
 
 
 def _iso32_enabled() -> bool:
@@ -72,13 +79,6 @@ def fused_dual_colwise_quantize(
         raise ValueError(f"dz shape {dz.shape} too small for TK={TK} dz_dim={dz_dim}")
     if dout.shape[1] < dout_dim:
         raise ValueError(f"dout shape {dout.shape} too small for dout_dim={dout_dim}")
-    from .blockscaled_fp8_gemm import (
-        _dual_varlen_quantize_kernel,
-        _dual_varlen_iso32_quantize_kernel,
-        _colwise_quantize_and_pack_kernel,
-        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
-        _storage_per_batch,
-    )
     _E8M0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
     device = dz.device

@@ -66,6 +66,24 @@ from .fp8_reference import (
 from .forward import _router_forward, _softmax_topk_fwd
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_fp8, enable_quack_gemm, is_fp8_active, is_using_quack_gemm
+from ..quack_utils.blockscaled_fp8_gemm import (
+    _gather_isa_packed_scales_kernel,
+    _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
+    _storage_per_batch,
+    _get_padding_plan,
+    _run_cutlass_blockscaled_gemm,
+    _run_cutlass_blockscaled_gemm_varlen_k,
+    _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
+    _run_cutlass_blockscaled_gemm_varlen_k_tma_add,
+    colwise_quantize_and_pack,
+    fused_z_save_y1_quant,
+)
+from ..quack_utils import (
+    clear_blockscaled_fp8_weight_cache as _clear_blockscaled_fp8_weight_cache,
+)
+from ..quack_utils.fused_quant_kernels import (
+    fused_dual_colwise_quantize,
+)
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
@@ -80,11 +98,19 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 from ..quack_utils.swiglu_triton import (
     dequantize_blockscaled_fp8,
 )
+try:
+    from ..quack_utils.swiglu_triton import (
+        swiglu_forward_quant_pack_zsave_triton,
+        swiglu_backward_quant_pack_triton,
+    )
+except ImportError:
+    swiglu_forward_quant_pack_zsave_triton = None
+    swiglu_backward_quant_pack_triton = None
 from ..quack_utils.blockscaled_fp8_gemm import (
     pack_blockscaled_1x32_scales,
     quantize_activation_blockscaled_fast,
 )
-
+from ..config import get_active_config
 
 def _swiglu_forward_interleaved(z: torch.Tensor) -> torch.Tensor:
     """Apply SwiGLU on interleaved pre-activation z(TK, 2I) -> y1(TK, I)."""
@@ -124,11 +150,6 @@ def _fused_blockscaled_gated_forward(
         When provided, skips the global cache lookup (used in stash mode
         when the cache key may not match the modified parameter data_ptr).
     """
-    from ..quack_utils.blockscaled_fp8_gemm import (
-        _gather_isa_packed_scales_kernel,
-        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
-        _storage_per_batch,
-    )
 
     if w1_fp8_pre is not None:
         w1_fp8, w1_scales = w1_fp8_pre
@@ -286,8 +307,6 @@ def _pad_routing_metadata(
         (padded_efo, padded_x_gather, padded_s_scatter,
          padded_s_reverse, padded_scores, padded_total, was_padded)
     """
-    from ..quack_utils.blockscaled_fp8_gemm import _get_padding_plan
-
     needs_pad, padded_cu, padded_total, dst_idx = _get_padding_plan(
         expert_frequency_offset, TK
     )
@@ -354,16 +373,6 @@ def _padded_blockscaled_gated_forward(
 
     Padding overhead is ~5-25% extra GEMM rows (typical for MoE routing).
     """
-    from ..quack_utils.blockscaled_fp8_gemm import (
-        _get_padding_plan,
-        _gather_isa_packed_scales_kernel,
-        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
-        _storage_per_batch,
-        quantize_and_pack_activation,
-        precompute_weight_fp8_for_fused_gated,
-    )
-    from ..quack_utils import gemm_gated
-
     TK = x_gather_idx.shape[0]
     needs_pad, padded_cu, padded_total, dst_idx = _get_padding_plan(
         expert_frequency_offset, TK
@@ -438,33 +447,9 @@ def _padded_blockscaled_gated_forward(
     return z, y1
 
 
-def _use_epilogue_quant() -> bool:
-    """Check if epilogue blockscaled quant of z is enabled (default: enabled).
-
-    When enabled, the GemmGated epilogue computes blockscaled FP8 quantization
-    of z in registers (integer+carry E8M0, matching Triton/Paddle reference)
-    AND writes z directly as fp8 to D (out_dtype=float8_e4m3fn).
-
-    Benefits:
-    - Eliminates standalone _quantize_flat_v2_kernel (~141 µs)
-    - Eliminates z.to(fp8) cast (~288 µs)
-    - Never allocates bf16 z (saves 384 MiB allocation + write bandwidth)
-    - Direct fp32->fp8 path is more precise than fp32->bf16->fp8 (one less rounding)
-    """
-    from ..config import get_active_config
-    cfg = get_active_config()
-    if cfg is not None and cfg.epilogue_quant is not None:
-        return cfg.epilogue_quant
-    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "1").lower() in {"1", "true", "yes", "on"}
-
-
-def _use_fused_swiglu_quant() -> bool:
-    """Check if fused SwiGLU+quantize kernels are enabled (default: enabled)."""
-    from ..config import get_active_config
-    cfg = get_active_config()
-    if cfg is not None and cfg.fused_swiglu_quant is not None:
-        return cfg.fused_swiglu_quant
-    return os.getenv("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1").lower() in {"1", "true", "yes", "on"}
+# _use_epilogue_quant, _use_fused_swiglu_quant, _use_fp8_wgrad,
+# _save_z_fp8, _recompute_z, _use_fused_blockscaled_gated are now
+# imported from .fp8_config (see import block below line 676).
 
 
 def _use_wgrad_beta_accum() -> bool:
@@ -478,75 +463,10 @@ def _use_fused_zy1_quant() -> bool:
     in a single fused Triton kernel launch, saving ~3us launch overhead.
     Cost: +96 MiB forward peak (z_fp8 + y1_fp8 coexist during kernel).
     """
-    from ..config import get_active_config
     cfg = get_active_config()
     if cfg is not None and cfg.fused_zy1_quant is not None:
         return cfg.fused_zy1_quant
     return os.getenv("SONIC_MOE_FP8_FUSED_ZY1_QUANT", "").lower() in {"1", "true", "yes", "on"}
-
-
-def _use_fp8_wgrad() -> bool | None:
-    """Check if FP8 weight gradients are enabled.
-
-    Returns True/False if explicitly set (config or env var), None for auto-detect.
-    When None (auto), ``_FP8Config.resolve_wgrad(I)`` applies the shape-based
-    heuristic: ON for I >= 2048, OFF for I < 2048.
-    """
-    from ..config import get_active_config
-    cfg = get_active_config()
-    if cfg is not None and cfg.fp8_wgrad is not None:
-        return cfg.fp8_wgrad
-    val = os.getenv("SONIC_MOE_FP8_WGRAD", "").lower()
-    if val in {"1", "true", "yes", "on"}:
-        return True
-    if val in {"0", "false", "no", "off"}:
-        return False
-    return None  # auto-detect based on I
-
-
-def _save_z_fp8() -> bool:
-    """Check if z tensor should be stored in FP8 format to save memory (default: enabled).
-
-    When enabled, z(TK, 2I) is quantized to blockscaled FP8 at end of forward
-    and dequantized at start of backward, saving ~50% of z's memory footprint.
-    """
-    from ..config import get_active_config
-    cfg = get_active_config()
-    if cfg is not None and cfg.save_z_fp8 is not None:
-        return cfg.save_z_fp8
-    return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "1").lower() in {"1", "true", "yes", "on"}
-
-
-def _recompute_z() -> bool:
-    """Defer z_fp8 materialization to backward (saves ~213 MiB peak per layer).
-
-    When enabled and ``save_z_fp8`` is also enabled, ``_UpProjection.forward``
-    runs the gated GEMM but does NOT populate ``_PREQUANTIZED_SCALES['z_fp8']``;
-    ``_DownProjection.forward`` records a recompute closure on ctx; and
-    ``_DownProjection.backward`` re-runs the up-proj GEMM (discarding the
-    recomputed y1) just before consuming z_fp8.  Costs an extra SwiGLU + PostAct
-    write per layer per backward (~10 ms / iter at 24 layers, ERNIE shape).
-    """
-    from ..config import get_active_config
-    cfg = get_active_config()
-    if cfg is not None and cfg.recompute_z is not None:
-        return cfg.recompute_z
-    return os.getenv("SONIC_MOE_FP8_RECOMPUTE_Z", "0").lower() in {"1", "true", "yes", "on"}
-
-
-def _use_fused_blockscaled_gated() -> bool:
-    """Check if fused gemm_gated + blockscaled FP8 is enabled (default: enabled).
-
-    When enabled, the blockscaled FP8 path uses fused gemm_gated/gemm_dgated
-    (single CUTLASS kernel: GEMM + SwiGLU + blockscaled descale) instead of
-    separate blockscaled_fp8_gemm_varlen + standalone SwiGLU.  This is the
-    best-performing FP8 up-proj path on SM100 and is enabled by default.
-    """
-    from ..config import get_active_config
-    cfg = get_active_config()
-    if cfg is not None and cfg.fused_gated is not None:
-        return cfg.fused_gated
-    return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "1").lower() in {"1", "true", "yes", "on"}
 
 
 # Transfer pre-packed blockscaled scales between autograd Function boundaries.
@@ -605,7 +525,6 @@ _ALIGNMENT_STREAK_THRESHOLD: int = 3
 
 def _is_alignment_assumed() -> bool:
     """Check if alignment is assumed via config, env var, or streak."""
-    from ..config import get_active_config
     cfg = get_active_config()
     if cfg is not None and cfg.assume_aligned is not None:
         return cfg.assume_aligned
@@ -680,103 +599,20 @@ def _use_blockscaled_fp8_downproj() -> bool:
 
 
 
-def _fp8_mode() -> str:
-    """Return FP8 mode: 'off', 'perf' (cache+speed), or 'mem' (no-cache+savings).
-
-    Priority: SonicMoEConfig > enable_fp8() context > SONIC_MOE_FP8_MODE env var.
-    When is_fp8_active() returns False (e.g. enable_fp8(False)), this returns
-    'off' regardless of the env var — the context manager takes precedence.
-    """
-    if not is_fp8_active():
-        return "off"
-    mode = os.getenv("SONIC_MOE_FP8_MODE", "").strip().lower()
-    if mode == "mem":
-        return "mem"
-    return "perf"
-
-
-def _fp8_enabled() -> bool:
-    return _fp8_mode() != "off"
-
-
-# ---------------------------------------------------------------------------
-# FP8 runtime config — resolved once per forward, passed via ctx
-# ---------------------------------------------------------------------------
-class _FP8Config:
-    """Snapshot of all FP8 flags, resolved once at forward entry.
-
-    Resolves from SonicMoEConfig (if active), then env vars, then defaults.
-    Instances are cheap (no tensors), picklable, stored on autograd ctx.
-    """
-    __slots__ = (
-        "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
-        "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
-        "iso32_weight",
-    )
-
-    def __init__(self) -> None:
-        self.enabled: bool = _fp8_enabled()
-        self.fused_gated: bool = _use_fused_blockscaled_gated()
-        self.save_z_fp8: bool = _save_z_fp8()
-        self.recompute_z: bool = _recompute_z()
-        self.fused_swiglu_quant: bool = _use_fused_swiglu_quant()
-        self.epilogue_quant: bool = _use_epilogue_quant()
-        self._fp8_wgrad_setting = _use_fp8_wgrad()  # True/False/None
-        self.fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
-        self.alignment_assumed: bool = False
-        self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
-
-    # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
-    # Session 53 re-benchmarked after cache fix + stash:
-    #   I=1536: 1.300× (aligned), I=2048: 1.35×, I=3072: 1.50×.
-    # Wgrad ON is profitable at all I values when aligned.
-    # For non-aligned shapes, wgrad is disabled (padding overhead + CUTLASS
-    # compat issues make it unprofitable).
-    _WGRAD_FP8_I_THRESHOLD = 0
-
-    def resolve_wgrad(self, I: int) -> None:
-        """Resolve FP8 wgrad based on explicit setting or shape-based heuristic.
-
-        After the Session 53 VARLEN cache fix, FP8 wgrad is profitable at all
-        tested I values (1536, 2048, 3072). Threshold is effectively 0.
-        """
-        if self._fp8_wgrad_setting is not None:
-            self.fp8_wgrad = self._fp8_wgrad_setting
-        else:
-            self.fp8_wgrad = I >= self._WGRAD_FP8_I_THRESHOLD
-
-    @staticmethod
-    @staticmethod
-    def disabled() -> "_FP8Config":
-        """Return a config where everything is off (BF16 path)."""
-        cfg = _FP8Config.__new__(_FP8Config)
-        cfg.enabled = False
-        cfg.fused_gated = False
-        cfg.save_z_fp8 = False
-        cfg.recompute_z = False
-        cfg.fused_swiglu_quant = False
-        cfg.epilogue_quant = False
-        cfg.fp8_wgrad = False
-        cfg._fp8_wgrad_setting = False
-        cfg.alignment_assumed = False
-        cfg.iso32_weight = False
-        return cfg
-
-
-# Module-level singleton, refreshed per forward call.
-_fp8_cfg: _FP8Config = _FP8Config.disabled()
-
-
-def _get_fp8_config() -> _FP8Config:
-    """Return the current FP8 config (resolved at forward entry)."""
-    return _fp8_cfg
-
-
-def _refresh_fp8_config() -> _FP8Config:
-    """Re-read all env vars and return a fresh config. Call at forward entry."""
-    global _fp8_cfg
-    _fp8_cfg = _FP8Config()
-    return _fp8_cfg
+# Import from fp8_config to break circular import with quack_utils
+from .fp8_config import (  # noqa: E402
+    _FP8Config,
+    _fp8_enabled,
+    _fp8_mode,
+    _get_fp8_config,
+    _refresh_fp8_config,
+    _recompute_z,
+    _save_z_fp8,
+    _use_epilogue_quant,
+    _use_fp8_wgrad,
+    _use_fused_blockscaled_gated,
+    _use_fused_swiglu_quant,
+)
 
 
 def _get_blockscaled_protocol() -> FP8Protocol:
@@ -882,8 +718,7 @@ def clear_all_fp8_weight_caches() -> None:
     _FP8_ORIG_CACHE.clear()
     _PER_TENSOR_EVICTED = False
     # Also clear the blockscaled weight cache in blockscaled_fp8_gemm.py
-    from ..quack_utils import clear_blockscaled_fp8_weight_cache as _clear_bs
-    _clear_bs()
+    _clear_blockscaled_fp8_weight_cache()
     # Clear the Triton raw-scale weight cache
     clear_raw_weight_cache()
     # Clear the sgl-kernel weight cache
@@ -906,7 +741,6 @@ def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> No
 
 
 def _stage_memory_debug_enabled() -> bool:
-    from ..config import get_active_config
     cfg = get_active_config()
     if cfg is not None and cfg.stagewise_memory is not None:
         return cfg.stagewise_memory
@@ -1060,7 +894,6 @@ class _UpProjection(torch.autograd.Function):
                             # Fused z+y1 quantization: single kernel launch, ~3µs
                             # less launch overhead, but +96 MiB peak (z_fp8 + y1_fp8
                             # coexist with z_bf16 + y1_bf16 during the kernel).
-                            from ..quack_utils.blockscaled_fp8_gemm import fused_z_save_y1_quant
                             z_fp8, z_raw_scales, y1_fp8, y1_packed_scales = (
                                 fused_z_save_y1_quant(z, y1)
                             )
@@ -1102,7 +935,6 @@ class _UpProjection(torch.autograd.Function):
                     if cfg.fused_swiglu_quant:
                         if cfg.save_z_fp8:
                             # Fused SwiGLU+y1_quant+z_save: read z ONCE
-                            from sonicmoe.quack_utils.swiglu_triton import swiglu_forward_quant_pack_zsave_triton
                             y1_fp8, y1_packed_scales, z_fp8, z_raw_scales = (
                                 swiglu_forward_quant_pack_zsave_triton(z)
                             )
@@ -1285,10 +1117,6 @@ class _UpProjection(torch.autograd.Function):
                     # FP8 wgrad with early dz_bf16 release.
                     # dz_col_fp8 was pre-computed in DownProj via dual_quantize_varlen
                     # (single HBM read of dz produced both row+col fp8).
-                    from ..quack_utils.blockscaled_fp8_gemm import (
-                        colwise_quantize_and_pack,
-                        _run_cutlass_blockscaled_gemm_varlen_k,
-                    )
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
 
                     # Sequential quant pipeline (all on default stream):
@@ -1315,9 +1143,6 @@ class _UpProjection(torch.autograd.Function):
                     _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
                     if _wgrad_accum is not None:
                         if _use_wgrad_beta_accum():
-                            from ..quack_utils.blockscaled_fp8_gemm import (
-                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
-                            )
                             _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
                                 dz_col_fp8, dz_col_scales,
                                 x_col_fp8, x_col_scales,
@@ -1327,9 +1152,6 @@ class _UpProjection(torch.autograd.Function):
                                 accumulator=_wgrad_accum,
                             )
                         else:
-                            from ..quack_utils.blockscaled_fp8_gemm import (
-                                _run_cutlass_blockscaled_gemm_varlen_k_tma_add,
-                            )
                             _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
                                 dz_col_fp8, dz_col_scales,
                                 x_col_fp8, x_col_scales,
@@ -1415,9 +1237,6 @@ class _UpProjection(torch.autograd.Function):
                     if ctx._w1_decoupled:
                         # w1 not in saved_tensors; call low-level GEMM directly
                         # with shape metadata (avoids needing a weight tensor).
-                        from ..quack_utils.blockscaled_fp8_gemm import (
-                            _run_cutlass_blockscaled_gemm,
-                        )
                         dx_expanded = _run_cutlass_blockscaled_gemm(
                             dz_fp8, dz_packed_scales,
                             w1T_fp8, w1T_scales,
@@ -1883,11 +1702,6 @@ class _DownProjection(torch.autograd.Function):
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
                     # Zero-materialization FP8 dgated: T-quant + scale_gather + A_idx
-                    from ..quack_utils.blockscaled_fp8_gemm import (
-                        _gather_isa_packed_scales_kernel,
-                        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE,
-                        _SF_VEC_SIZE, _storage_per_batch,
-                    )
 
                     # --- Phase 3.1: FP8 PreAct eliminates z dequant + 384MB temp ---
                     # When z is fp8 (from ctx), pass directly to GemmDGated.
@@ -1987,13 +1801,6 @@ class _DownProjection(torch.autograd.Function):
                     _reset_stage_memory_probe()
                     TK_wgrad = x_gather_idx.shape[0]
                     if ctx._fp8_cfg.fp8_wgrad:
-                        from ..quack_utils.blockscaled_fp8_gemm import (
-                            colwise_quantize_and_pack,
-                            _run_cutlass_blockscaled_gemm_varlen_k,
-                        )
-                        from ..quack_utils.fused_quant_kernels import (
-                            fused_dual_colwise_quantize,
-                        )
 
                         # Memory-optimized wgrad pipeline (all main stream):
                         # Step 1: colwise(y1s) then del y1s to free 192 MiB
@@ -2017,9 +1824,6 @@ class _DownProjection(torch.autograd.Function):
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
                         if _wgrad_accum_w2 is not None:
                             if _use_wgrad_beta_accum():
-                                from ..quack_utils.blockscaled_fp8_gemm import (
-                                    _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
-                                )
                                 _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
                                     dout_col_fp8, dout_col_sc,
                                     y1s_col_fp8, y1s_col_sc,
@@ -2030,9 +1834,6 @@ class _DownProjection(torch.autograd.Function):
                                     accumulator=_wgrad_accum_w2,
                                 )
                             else:
-                                from ..quack_utils.blockscaled_fp8_gemm import (
-                                    _run_cutlass_blockscaled_gemm_varlen_k_tma_add,
-                                )
                                 _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
                                     dout_col_fp8, dout_col_sc,
                                     y1s_col_fp8, y1s_col_sc,
@@ -2146,9 +1947,6 @@ class _DownProjection(torch.autograd.Function):
                             # 1. Dequant z_fp8 -> z_bf16  (~0.046ms, BLOCK_ROWS=16)
                             # 2. dSwiGLU + quant + ISA-pack + dz_bf16  (~0.36ms, single kernel)
                             # Total ~0.41ms vs fused 0.47ms (12% faster)
-                            from sonicmoe.quack_utils.swiglu_triton import (
-                                swiglu_backward_quant_pack_triton,
-                            )
                             z_bf16 = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
                             dz_fp8, dz_packed_scales, y1s, ds, dz = (
                                 swiglu_backward_quant_pack_triton(
