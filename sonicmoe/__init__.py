@@ -20,6 +20,7 @@ from sonicmoe import _triton_autotune_persist as _triton_autotune_persist  # noq
 # cross-stream sync (perf tax) and producer/consumer race hazards.
 from sonicmoe import _triton_stream_compat as _triton_stream_compat  # noqa: F401
 from sonicmoe import _quack_compat as _quack_compat  # noqa: F401
+from sonicmoe import ernie_compat as ernie_compat  # noqa: F401
 
 # ── Paddle compat shims for missing torch.cuda internals ─────────────────────
 # torch.random.manual_seed() calls torch.cuda._is_in_bad_fork() internally.
