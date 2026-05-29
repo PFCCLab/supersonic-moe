@@ -961,6 +961,7 @@ class _UpProjection(torch.autograd.Function):
                     A_idx=x_gather_idx,
                     postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
                     dynamic_scheduler=False,
+                    tuned=False,
                 )
         else:
             raise RuntimeError(
@@ -1318,6 +1319,7 @@ class _UpProjection(torch.autograd.Function):
                 dx_expanded = gemm(
                     dz, w1.permute(2, 0, 1),
                     cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
+                    tuned=False,
                 )
         else:
             raise RuntimeError(
@@ -1464,7 +1466,12 @@ class _DownProjection(torch.autograd.Function):
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
-                y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                y2 = gemm(
+                    y1,
+                    w2.permute(2, 1, 0),
+                    cu_seqlens_m=expert_frequency_offset,
+                    tuned=False,
+                )
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
         else:
@@ -2012,6 +2019,7 @@ class _DownProjection(torch.autograd.Function):
                     cu_seqlens_m=expert_frequency_offset,
                     A_idx=x_gather_idx,
                     dynamic_scheduler=False,
+                    tuned=False,
                 )
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
