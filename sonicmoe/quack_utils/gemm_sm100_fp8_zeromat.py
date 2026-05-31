@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Type
 
 import cutlass
@@ -31,6 +32,7 @@ import quack.copy_utils as copy_utils
 import cuda.bindings.driver as cuda
 from cutlass import Float32, Int32, const_expr
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.layout_utils import permute_gated_Cregs_b16
 from quack.tile_scheduler import TileSchedulerOptions
@@ -44,8 +46,13 @@ from ._gated_epilogues import (
     GemmGatedMixin,
     GemmGatedBlockscaledQuantMixin,
     BlockscaledQuantOnlyMixin,
+    BlockscaledIsaQuantOnlyMixin,
+    BlockscaledIso32QuantOnlyMixin,
+    BlockscaledColQuantOnlyMixin,
     GemmDGatedMixin,
     GemmDGatedFP8CLoadMixin,
+    GemmDGatedFP8CLoadIso32QuantMixin,
+    GemmDGatedFP8CLoadY1sColQuantMixin,
 )
 
 from cutlass.utils import LayoutEnum
@@ -143,8 +150,9 @@ class _GemmSm100ZeroMatMixin:
             # ============================================================
             if const_expr(self.gather_A):
                 # mA is (T, K) but GEMM logically has TK output rows.
-                # Use (TK, K) = (mD.shape[0], mA.shape[1]) for SFA layout.
-                sfa_logical_shape = (mD.shape[0], mA.shape[1])
+                # Use D when present, otherwise mPostAct; both carry total_M.
+                total_m = mD.shape[0] if const_expr(mD is not None) else epilogue_args.mPostAct.shape[0]
+                sfa_logical_shape = (total_m, mA.shape[1])
                 sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
                     sfa_logical_shape, self.sf_vec_size
                 )
@@ -390,6 +398,39 @@ class GemmSm100ZeroMatBlockscaledQuant(BlockscaledQuantOnlyMixin, _GemmSm100Zero
     pass
 
 
+class GemmSm100ZeroMatBlockscaledIsaQuant(BlockscaledIsaQuantOnlyMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """SM100 GemmDefault + epi blockscaled FP8 quant with ISA-pack scale store.
+
+    Session 1A foundation: parallel to GemmSm100ZeroMatBlockscaledQuant but
+    writes scales in ISA-pack layout (3D `(num_m_tiles, k_tiles, 512)` uint8).
+    Used to validate the EpiOp + Mixin in isolation before wiring into
+    production gemm_gated / gemm_dgated paths.
+    """
+    pass
+
+
+class GemmSm100ZeroMatBlockscaledIso32Quant(BlockscaledIso32QuantOnlyMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """SM100 GemmDefault + epi iso32 (block-amax) FP8 quant with row+col ISA SF.
+
+    Session 1A-ext: validates warp_redux_sync inside epi + dual ISA store.
+    Produces three outputs: z_fp8 (block-quantized), z_row_isa, z_col_isa.
+    iso32 invariant: same e8m0 byte goes to both row-SF and col-SF buffers,
+    at their respective ISA-pack offsets.
+    """
+    pass
+
+
+class GemmSm100ZeroMatBlockscaledColQuant(BlockscaledColQuantOnlyMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """SM100 GemmDefault + epi pure colwise (per-col 32-row-block) FP8 quant
+    with single ISA col-SF store.
+
+    Session 1C: replaces the standalone `_colwise_quantize_and_pack_kernel`
+    (237 us at production T=8192 E=8) by computing per-col amax via 32
+    successive warp_redux_sync calls inside the GEMM epi.
+    """
+    pass
+
+
 class GemmDGatedSm100ZeroMat(GemmDGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
     """SM100 GemmDGated with zero-materialization FP8 SFA fix."""
     pass
@@ -406,6 +447,38 @@ class GemmDGatedFP8CLoadSm100ZeroMat(GemmDGatedFP8CLoadMixin, _GemmSm100ZeroMatM
     pre-gathered scales have TK rows.  cu_seqlens_m offsets then map
     incorrectly — expert 0 works (offset 0) but experts 1-7 get wrong
     scale factors producing garbage dz output.
+    """
+    pass
+
+
+class GemmDGatedFP8CLoadIso32QuantSm100ZeroMat(
+    GemmDGatedFP8CLoadIso32QuantMixin, _GemmSm100ZeroMatMixin, GemmSm100
+):
+    """SM100 GemmDGated FP8-CLoad + side-channel iso32 FP8 dXY quant + ZeroMat.
+
+    Additive over ``GemmDGatedFP8CLoadSm100ZeroMat``: keeps the BF16 D
+    output intact AND optionally writes FP8 dXY + dual ISA SF tensors via
+    per-byte gmem scatter (no smem / TMA expansion needed).
+
+    Wire-up: set ``mDZFp8Iso32_fp8`` / ``mDZFp8Iso32_row`` / ``mDZFp8Iso32_col``
+    in the EpilogueArguments to enable the side-channel.  All-None leaves
+    behaviour byte-identical to the parent.
+    """
+    pass
+
+
+class GemmDGatedFP8CLoadY1sColQuantSm100ZeroMat(
+    GemmDGatedFP8CLoadY1sColQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100
+):
+    """SM100 GemmDGated FP8-CLoad + side-channel FP8 y1s + col-SF quant + ZeroMat.
+
+    Additive over ``GemmDGatedFP8CLoadSm100ZeroMat``: keeps the BF16 postact
+    output intact AND optionally writes FP8 y1s + col-ISA SF tensors via
+    per-element gmem scatter.
+
+    Wire-up: set ``mY1sColQuant_fp8`` / ``mY1sColQuant_col`` in the
+    EpilogueArguments to enable the side-channel.  All-None leaves behaviour
+    byte-identical to the parent.
     """
     pass
 
@@ -626,8 +699,25 @@ def blockscaled_fp8_gemm_zeromat_quant(
     assert device_cap[0] == 10, "Zero-mat quant-only kernel requires SM100"
     GemmCls = GemmSm100ZeroMatBlockscaledQuant
 
-    tile_M, tile_N = 128, 128
-    cluster_M, cluster_N = 1, 1
+    # Tile selection: SONIC_MOE_QONLY_TILE=auto|128|256
+    # 256x256 is faster for dense Ernie-like shapes but under-validated for
+    # many-expert/taily regimes (E>=64, K<=2, small per-expert counts).
+    # Default is conservative 128 until broader stress evidence exists.
+    _tile_env = os.environ.get("SONIC_MOE_QONLY_TILE", "128").lower()
+    E_local = int(cu_seqlens_m.numel()) - 1
+    if _tile_env == "256":
+        tile_M, tile_N, cluster_M, cluster_N = 256, 256, 2, 1
+    elif _tile_env == "auto":
+        # Use 256 only for dense shapes: large N, few experts, no tiny segments.
+        _seqlens = cu_seqlens_m.tolist()
+        _seg_lens = [_seqlens[i+1] - _seqlens[i] for i in range(E_local)]
+        _min_nonzero = min((s for s in _seg_lens if s > 0), default=0)
+        if N >= 2048 and E_local <= 32 and _min_nonzero >= 256:
+            tile_M, tile_N, cluster_M, cluster_N = 256, 256, 2, 1
+        else:
+            tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
+    else:  # "128" or any unrecognized value
+        tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
@@ -653,6 +743,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
         tuple(B.shape), B.dtype,
         z_fp8_out.dtype,
         True,  # blockscaled
+        tile_M, tile_N, cluster_M, cluster_N,
     )
 
     cache = _zeromat_compile_cache
@@ -691,3 +782,519 @@ def blockscaled_fp8_gemm_zeromat_quant(
         b_scale_cute,
     )
     return z_fp8_out, z_scale_out
+
+
+# ---------------------------------------------------------------------------
+# ISA-pack scale variant (Session 1A foundation block)
+# ---------------------------------------------------------------------------
+
+_zeromat_isa_compile_cache = {}
+
+
+def blockscaled_fp8_gemm_zeromat_isa_quant(
+    A: Tensor,
+    B: Tensor,
+    cu_seqlens_m: Tensor,
+    A_idx: Tensor,
+    a_scales: Tensor,
+    b_scales: Tensor,
+    z_fp8_out: Optional[Tensor] = None,
+    z_scale_isa_out: Optional[Tensor] = None,  # (num_m_tiles, k_tiles, 512) uint8
+) -> tuple[Tensor, Tensor]:
+    """Like blockscaled_fp8_gemm_zeromat_quant, but writes scales in ISA-pack.
+
+    Returns (z_fp8, z_scale_isa) where z_scale_isa is a 3D uint8 tensor of
+    shape (num_m_tiles, k_tiles, 512) — byte-equivalent to the 1D packed
+    buffer that `_quantize_and_pack_kernel` writes when fed the same z_bf16.
+
+    Foundation block for Session 1A.  No production wiring yet; validated in
+    isolation against `blockscaled_fp8_gemm_zeromat_quant` (flat scales) +
+    Python-level flat->ISA pack converter.
+    """
+    TK = A_idx.shape[0]
+    N = B.shape[-2]
+    K = A.shape[-1]
+    assert N % 32 == 0, f"N must be divisible by 32, got {N}"
+
+    num_m_tiles = (TK + 127) // 128
+    k_tiles = (N + 127) // 128
+
+    if z_fp8_out is None:
+        z_fp8_out = torch.empty((TK, N), dtype=torch.float8_e4m3fn, device=A.device)
+    if z_scale_isa_out is None:
+        z_scale_isa_out = torch.empty(
+            (num_m_tiles, k_tiles, 512), dtype=torch.uint8, device=A.device
+        )
+
+    assert z_scale_isa_out.dim() == 3 and z_scale_isa_out.shape[2] == 512, (
+        f"z_scale_isa_out must be (num_m_tiles, k_tiles, 512), got {z_scale_isa_out.shape}"
+    )
+    assert z_scale_isa_out.shape[0] == num_m_tiles and z_scale_isa_out.shape[1] == k_tiles, (
+        f"z_scale_isa_out shape mismatch: expected ({num_m_tiles}, {k_tiles}, 512), got {z_scale_isa_out.shape}"
+    )
+
+    L, M, _, _, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, z_fp8_out, None, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
+    major_configs = {
+        "A": ("m", "k", "l"), "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"), "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    for info in tensor_infos.values():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
+
+    device_cap = get_device_capacity(A.device)
+    assert device_cap[0] == 10, "ISA-quant kernel requires SM100"
+    GemmCls = GemmSm100ZeroMatBlockscaledIsaQuant
+
+    tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None and name in major_configs:
+            leading_dim = 1 if info.major == major_configs[name][1] else 0
+            info.cute_tensor = _make_cute(info.tensor, leading_dim)
+
+    # 3D uint8 tensor, innermost dim (512) is contiguous.
+    z_scale_isa_cute = _make_cute(z_scale_isa_out, leading_dim=2)
+    epi_args = GemmCls.EpilogueArguments(mZScaleIsa=z_scale_isa_cute)
+    scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
+    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+    _stream_obj = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(
+        _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
+    )
+
+    a_scale_cute = _make_cute(a_scales, leading_dim=1)
+    b_scale_cute = _make_cute(b_scales, leading_dim=1)
+
+    compile_key = (
+        "zeromat_isa_quant_only",
+        A.shape[-1], A.dtype,
+        tuple(B.shape), B.dtype,
+        z_fp8_out.dtype,
+        True,
+        tile_M, tile_N, cluster_M, cluster_N,
+    )
+
+    cache = _zeromat_isa_compile_cache
+    if compile_key not in cache:
+        gemm_obj = GemmCls(
+            cutlass.Float32,
+            _TORCH_TO_CUTLASS[A.dtype],
+            (tile_M, tile_N),
+            (cluster_M, cluster_N, 1),
+            gather_A=True,
+            sf_vec_size=32,
+        )
+        cache[compile_key] = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            current_stream,
+            a_scale_cute,
+            b_scale_cute,
+        )
+    cache[compile_key](
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        current_stream,
+        a_scale_cute,
+        b_scale_cute,
+    )
+    return z_fp8_out, z_scale_isa_out
+
+
+# ---------------------------------------------------------------------------
+# Iso32 (block-amax) variant with dual row+col ISA SF (Session 1A-ext)
+# ---------------------------------------------------------------------------
+
+_zeromat_iso32_compile_cache = {}
+
+
+def blockscaled_fp8_gemm_zeromat_iso32_quant(
+    A: Tensor,
+    B: Tensor,
+    cu_seqlens_m: Tensor,
+    A_idx: Tensor,
+    a_scales: Tensor,
+    b_scales: Tensor,
+    z_fp8_out: Optional[Tensor] = None,
+    z_scale_isa_row_out: Optional[Tensor] = None,  # (num_m_tiles, k_tiles, 512) u8
+    z_scale_isa_col_out: Optional[Tensor] = None,  # (num_n_tiles, col_k_tiles, 512) u8
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Iso32 epi quant: produces FP8 D + row-ISA SF + col-ISA SF from one GEMM.
+
+    Uses warp_redux_sync MAX inside the epi to obtain the block (32x32) amax,
+    then writes the same e8m0 byte to both row-axis and col-axis ISA-pack SF
+    buffers. Byte-equivalent to applying `_dual_varlen_iso32_quantize_kernel`
+    to the BF16 GEMM output.
+    """
+    TK = A_idx.shape[0]
+    N = B.shape[-2]
+    assert N % 32 == 0, f"N must be divisible by 32, got {N}"
+
+    num_m_tiles = (TK + 127) // 128
+    k_tiles = (N + 127) // 128
+    num_n_tiles = (N + 127) // 128
+    col_k_tiles = (TK + 127) // 128
+
+    if z_fp8_out is None:
+        z_fp8_out = torch.empty((TK, N), dtype=torch.float8_e4m3fn, device=A.device)
+    if z_scale_isa_row_out is None:
+        z_scale_isa_row_out = torch.empty(
+            (num_m_tiles, k_tiles, 512), dtype=torch.uint8, device=A.device
+        )
+    if z_scale_isa_col_out is None:
+        z_scale_isa_col_out = torch.empty(
+            (num_n_tiles, col_k_tiles, 512), dtype=torch.uint8, device=A.device
+        )
+
+    L, M, _, _, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, z_fp8_out, None, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
+    major_configs = {
+        "A": ("m", "k", "l"), "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"), "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    for info in tensor_infos.values():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
+
+    device_cap = get_device_capacity(A.device)
+    assert device_cap[0] == 10, "Iso32 epi kernel requires SM100"
+    GemmCls = GemmSm100ZeroMatBlockscaledIso32Quant
+
+    tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None and name in major_configs:
+            leading_dim = 1 if info.major == major_configs[name][1] else 0
+            info.cute_tensor = _make_cute(info.tensor, leading_dim)
+
+    z_scale_row_cute = _make_cute(z_scale_isa_row_out, leading_dim=2)
+    z_scale_col_cute = _make_cute(z_scale_isa_col_out, leading_dim=2)
+    epi_args = GemmCls.EpilogueArguments(
+        mZScaleIsaRow=z_scale_row_cute,
+        mZScaleIsaCol=z_scale_col_cute,
+    )
+    scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
+    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+    _stream_obj = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(
+        _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
+    )
+
+    a_scale_cute = _make_cute(a_scales, leading_dim=1)
+    b_scale_cute = _make_cute(b_scales, leading_dim=1)
+
+    compile_key = (
+        "zeromat_iso32_quant",
+        A.shape[-1], A.dtype,
+        tuple(B.shape), B.dtype,
+        z_fp8_out.dtype,
+        True,
+        tile_M, tile_N, cluster_M, cluster_N,
+    )
+
+    cache = _zeromat_iso32_compile_cache
+    if compile_key not in cache:
+        gemm_obj = GemmCls(
+            cutlass.Float32,
+            _TORCH_TO_CUTLASS[A.dtype],
+            (tile_M, tile_N),
+            (cluster_M, cluster_N, 1),
+            gather_A=True,
+            sf_vec_size=32,
+        )
+        cache[compile_key] = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            current_stream,
+            a_scale_cute,
+            b_scale_cute,
+        )
+    cache[compile_key](
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        current_stream,
+        a_scale_cute,
+        b_scale_cute,
+    )
+    return z_fp8_out, z_scale_isa_row_out, z_scale_isa_col_out
+
+
+# ---------------------------------------------------------------------------
+# BF16 D wrapper (no quant epi) — used as a clean reference for iso32 byte-exact
+# validation against `_dual_varlen_iso32_quantize_kernel` on the same GEMM input.
+# ---------------------------------------------------------------------------
+
+
+class GemmSm100ZeroMatBf16(_GemmSm100ZeroMatMixin, GemmDefaultSm100):
+    """Bare zeromat blockscaled FP8 GEMM with BF16 D output (no quant epi).
+
+    Reference path for iso32 epi validation: produces the same GEMM
+    accumulator as `blockscaled_fp8_gemm_zeromat_iso32_quant` but writes
+    raw BF16, allowing the production `_dual_varlen_iso32_quantize_kernel`
+    to be run on the result for byte-exact comparison.
+    """
+    pass
+
+
+_zeromat_bf16_compile_cache = {}
+
+
+def blockscaled_fp8_gemm_zeromat_bf16(
+    A: Tensor,
+    B: Tensor,
+    cu_seqlens_m: Tensor,
+    A_idx: Tensor,
+    a_scales: Tensor,
+    b_scales: Tensor,
+    z_bf16_out: Optional[Tensor] = None,
+) -> Tensor:
+    """Blockscaled FP8 GEMM with BF16 D output (no quant epi).
+
+    Identical accumulation path to `blockscaled_fp8_gemm_zeromat_iso32_quant`;
+    differs only in the final D dtype (BF16 vs FP8) and skips the iso32 epi
+    quant step.  Used as the *ground-truth source tensor* for byte-exact
+    validation of the iso32 epi against `_dual_varlen_iso32_quantize_kernel`.
+    """
+    TK = A_idx.shape[0]
+    N = B.shape[-2]
+    if z_bf16_out is None:
+        z_bf16_out = torch.empty((TK, N), dtype=torch.bfloat16, device=A.device)
+
+    L, M, _, _, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, z_bf16_out, None, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
+    major_configs = {
+        "A": ("m", "k", "l"), "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"), "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    for info in tensor_infos.values():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
+
+    device_cap = get_device_capacity(A.device)
+    assert device_cap[0] == 10
+    GemmCls = GemmSm100ZeroMatBf16
+
+    tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None and name in major_configs:
+            leading_dim = 1 if info.major == major_configs[name][1] else 0
+            info.cute_tensor = _make_cute(info.tensor, leading_dim)
+
+    epi_args = GemmCls.EpilogueArguments()
+    scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
+    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+    _stream_obj = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(
+        _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
+    )
+    a_scale_cute = _make_cute(a_scales, leading_dim=1)
+    b_scale_cute = _make_cute(b_scales, leading_dim=1)
+
+    compile_key = (
+        "zeromat_bf16",
+        A.shape[-1], A.dtype,
+        tuple(B.shape), B.dtype,
+        z_bf16_out.dtype,
+        True,
+        tile_M, tile_N, cluster_M, cluster_N,
+    )
+
+    cache = _zeromat_bf16_compile_cache
+    if compile_key not in cache:
+        gemm_obj = GemmCls(
+            cutlass.Float32,
+            _TORCH_TO_CUTLASS[A.dtype],
+            (tile_M, tile_N),
+            (cluster_M, cluster_N, 1),
+            gather_A=True,
+            sf_vec_size=32,
+        )
+        cache[compile_key] = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            current_stream,
+            a_scale_cute,
+            b_scale_cute,
+        )
+    cache[compile_key](
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        current_stream,
+        a_scale_cute,
+        b_scale_cute,
+    )
+    return z_bf16_out
+
+
+# ---------------------------------------------------------------------------
+# Colwise-only quant variant (Session 1C — replaces _colwise_quantize_and_pack)
+# ---------------------------------------------------------------------------
+
+_zeromat_colquant_compile_cache = {}
+
+
+def blockscaled_fp8_gemm_zeromat_colwise_quant(
+    A: Tensor,
+    B: Tensor,
+    cu_seqlens_m: Tensor,
+    A_idx: Tensor,
+    a_scales: Tensor,
+    b_scales: Tensor,
+    z_fp8_out: Optional[Tensor] = None,
+    z_scale_isa_col_out: Optional[Tensor] = None,
+) -> tuple[Tensor, Tensor]:
+    """Pure colwise epi quant: produces FP8 D + col-ISA SF from one GEMM.
+
+    Replaces standalone `colwise_quantize_and_pack(BF16_D)` (237 us at
+    production T=8192 E=8 H=2048 I=1408).  Per-column-block (32 M-rows ×
+    1 N-col) amax computed via per-col `warp_redux_sync` inside the epi.
+
+    Output layout:
+      - z_fp8_out          : (TK, N) e4m3 (gather_A varlen output)
+      - z_scale_isa_col_out: (num_n_tiles, col_k_tiles, 512) u8 ISA-pack
+                             for the logical (N, TK) view (= "colwise" SF
+                             consumer layout used by wgrad GEMMs).
+    """
+    TK = A_idx.shape[0]
+    N = B.shape[-2]
+    assert N % 32 == 0, f"N must be divisible by 32, got {N}"
+
+    num_n_tiles = (N + 127) // 128
+    col_k_tiles = (TK + 127) // 128
+
+    if z_fp8_out is None:
+        z_fp8_out = torch.empty((TK, N), dtype=torch.float8_e4m3fn, device=A.device)
+    if z_scale_isa_col_out is None:
+        z_scale_isa_col_out = torch.empty(
+            (num_n_tiles, col_k_tiles, 512), dtype=torch.uint8, device=A.device
+        )
+
+    L, M, _, _, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, z_fp8_out, None, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
+    major_configs = {
+        "A": ("m", "k", "l"), "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"), "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    for info in tensor_infos.values():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
+
+    device_cap = get_device_capacity(A.device)
+    assert device_cap[0] == 10
+    GemmCls = GemmSm100ZeroMatBlockscaledColQuant
+
+    tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None and name in major_configs:
+            leading_dim = 1 if info.major == major_configs[name][1] else 0
+            info.cute_tensor = _make_cute(info.tensor, leading_dim)
+
+    z_scale_col_cute = _make_cute(z_scale_isa_col_out, leading_dim=2)
+    epi_args = GemmCls.EpilogueArguments(mZScaleIsaCol=z_scale_col_cute)
+    scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
+    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+    _stream_obj = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(
+        _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
+    )
+    a_scale_cute = _make_cute(a_scales, leading_dim=1)
+    b_scale_cute = _make_cute(b_scales, leading_dim=1)
+
+    compile_key = (
+        "zeromat_colwise_quant",
+        A.shape[-1], A.dtype,
+        tuple(B.shape), B.dtype,
+        z_fp8_out.dtype,
+        True,
+        tile_M, tile_N, cluster_M, cluster_N,
+    )
+
+    cache = _zeromat_colquant_compile_cache
+    if compile_key not in cache:
+        gemm_obj = GemmCls(
+            cutlass.Float32,
+            _TORCH_TO_CUTLASS[A.dtype],
+            (tile_M, tile_N),
+            (cluster_M, cluster_N, 1),
+            gather_A=True,
+            sf_vec_size=32,
+        )
+        cache[compile_key] = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            current_stream,
+            a_scale_cute,
+            b_scale_cute,
+        )
+    cache[compile_key](
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        current_stream,
+        a_scale_cute,
+        b_scale_cute,
+    )
+    return z_fp8_out, z_scale_isa_col_out
