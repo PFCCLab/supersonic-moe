@@ -72,6 +72,10 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_FP8_ASSUME_ALIGNED``. Default: False.
         stagewise_memory: Enable per-stage memory logging.
             Env: ``SONIC_MOE_STAGEWISE_MEMORY``. Default: False.
+        iso32_weight: Use ISO32 single-FP8-buffer quantization for weights.
+            Env: ``SONIC_MOE_FP8_ISO32_WEIGHT``. Default: False; set True/1 for the legacy iso32 path.
+        dz_iso32: Use ISO32 single-FP8-buffer quantization for backward dz.
+            Env: ``SONIC_MOE_DZ_ISO32``. Default: True; set False/0 for the safer 1x32 dual path.
     """
 
     use_fp8: Optional[bool] = None
@@ -86,6 +90,7 @@ class SonicMoEConfig:
     assume_aligned: Optional[bool] = None
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
+    dz_iso32: Optional[bool] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -165,6 +170,11 @@ class SonicMoEConfig:
         if self.iso32_weight is not None:
             return self.iso32_weight
         return _env_bool("SONIC_MOE_FP8_ISO32_WEIGHT", False) or False
+
+    def resolve_dz_iso32(self) -> bool:
+        if self.dz_iso32 is not None:
+            return self.dz_iso32
+        return _env_bool("SONIC_MOE_DZ_ISO32", True) or False
 
     # --- Context manager for temporary activation ----------------------------
 

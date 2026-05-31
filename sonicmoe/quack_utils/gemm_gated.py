@@ -47,6 +47,14 @@ from .gemm_sm100_fp8_zeromat import (
 )
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+_GATED_FAST_PATH: dict[tuple, tuple] = {}
+_MAX_GATED_FAST_PATH_ENTRIES = 32
+
+
+def _current_cu_stream() -> cuda.CUstream:
+    stream = torch.cuda.current_stream()
+    raw = stream.stream_base.raw_stream if hasattr(stream, "stream_base") else stream.cuda_stream
+    return cuda.CUstream(raw)
 
 
 class GemmGatedSm90(GemmGatedMixin, GemmSm90):
@@ -67,7 +75,7 @@ class BlockscaledQuantOnlySm100(BlockscaledQuantOnlyMixin, GemmSm100):
 
 
 gate_fn_map = {
-    "swiglu": quack.activation.swiglu_precise,
+    "swiglu": quack.activation.swiglu,
     "swiglu_oai": quack.activation.swiglu_oai,
     "reglu": quack.activation.reglu,
     "geglu": quack.activation.geglu,
@@ -98,13 +106,55 @@ def gemm_gated(
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # (total_m, N//32) uint8 — epilogue quant scale output
 ) -> None:
+    blockscaled = a_scales is not None and b_scales is not None
+    epilogue_quant = z_scale_out is not None
+    gather_A = A_idx is not None
+    fast_key = None
+    if (
+        cu_seqlens_m is not None
+        and gather_A
+        and blockscaled
+        and rowvec_bias is None
+        and colvec_bias is None
+        and tile_count_semaphore is None
+        and persistent
+        and cluster_N == 1
+    ):
+        fast_key = (
+            A.dtype, B.dtype, D.dtype if D is not None else None, PostAct.dtype, C.dtype if C is not None else None,
+            activation, tile_M, tile_N, cluster_M, cluster_N, pingpong, max_swizzle_size,
+            epilogue_quant, A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
+        )
+        cached = _GATED_FAST_PATH.get(fast_key)
+        if cached is not None:
+            compiled, GemmCls, epi_base, scheduler_args = cached
+            a_cute = _make_cute_tensor_dynamic(A, 1)
+            b_tensor = B.permute(1, 2, 0)
+            b_leading_dim = 1 if b_tensor.stride(1) == 1 else 0
+            b_cute = _make_cute_tensor_dynamic(b_tensor, b_leading_dim)
+            d_cute = _make_cute_tensor_dynamic(D, 1) if D is not None else None
+            c_cute = _make_cute_tensor_dynamic(C, 1) if C is not None else None
+            post_cute = _make_cute_tensor_dynamic(PostAct, 1)
+            epi_kwargs = {}
+            if epilogue_quant:
+                epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)
+            epi_args = GemmCls.EpilogueArguments(post_cute, epi_base, **epi_kwargs)
+            varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+            a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+            b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+            compiled(
+                a_cute, b_cute, d_cute, c_cute,
+                epi_args, scheduler_args, varlen_args, _current_cu_stream(),
+                a_scale_cute, b_scale_cute,
+            )
+            return
+
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
         if D is not None:
             assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
         assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
-    gather_A = A_idx is not None
     if gather_A:
         assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
@@ -215,8 +265,7 @@ def gemm_gated(
         A_idx,
     )
 
-    _stream_obj = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(_stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream)
+    current_stream = _current_cu_stream()
 
     blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None
@@ -272,7 +321,12 @@ def gemm_gated(
             a_scale_cute,
             b_scale_cute,
         )
-    cache[compile_key](
+    compiled = cache[compile_key]
+    if fast_key is not None:
+        if len(_GATED_FAST_PATH) > _MAX_GATED_FAST_PATH_ENTRIES:
+            _GATED_FAST_PATH.clear()
+        _GATED_FAST_PATH[fast_key] = (compiled, GemmCls, act_fn, scheduler_args)
+    compiled(
         tensor_infos["A"].cute_tensor,
         tensor_infos["B"].cute_tensor,
         tensor_infos["D"].cute_tensor,

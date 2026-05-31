@@ -27,27 +27,28 @@ import os
 
 import torch
 
+from ..config import get_active_config
 from ..triton_utils import wrap_triton_kernel
 from ._validate import check_tensor
 from .blockscaled_fp8_gemm import (
-    _dual_varlen_quantize_kernel,
-    _dual_varlen_iso32_quantize_kernel,
     _colwise_quantize_and_pack_kernel,
-    _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
+    _div_up,
+    _dual_varlen_iso32_quantize_kernel,
+    _dual_varlen_quantize_kernel,
+    _SF_TILE_K,
+    _SF_TILE_M,
+    _SF_TILE_STORAGE,
+    _SF_VEC_SIZE,
     _storage_per_batch,
 )
 
 
 def _iso32_enabled() -> bool:
-    """iso32 dz quant default = ON.
-
-    Phase 0 audit (S80a) proved iso32 produces identical downstream-GEMM
-    RRMSE to 1×32 on real Ernie-shape dz (ratio 1.000× across 6 captures).
-    Phase 1B microbench: −60 µs/iter (−20.7%) in dz quant stage; multi-layer
-    nsys (reports/mfu_s80b/): 2754→2693 µs/iter, 44.91%→45.92% MFU.
-    Determinism CI passes. Set SONIC_MOE_DZ_ISO32=0 to fall back to 1×32.
-    """
-    return os.environ.get("SONIC_MOE_DZ_ISO32", "1") == "1"
+    """iso32 dz quant default = ON; set SONIC_MOE_DZ_ISO32=0 to force 1x32."""
+    cfg = get_active_config()
+    if cfg is not None:
+        return cfg.resolve_dz_iso32()
+    return os.environ.get("SONIC_MOE_DZ_ISO32", "1") != "0"
 
 
 def fused_dual_colwise_quantize(
@@ -132,7 +133,7 @@ def fused_dual_colwise_quantize(
             GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
             SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
             SF_TILE_STORAGE=_SF_TILE_STORAGE,
-            num_warps=1,
+            num_warps=4,
         )
     else:
         # ── Kernel 1 (1×32 dual): row + col separate amaxes ──

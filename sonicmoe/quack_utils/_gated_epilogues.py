@@ -17,6 +17,7 @@ import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import math as _math
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple, torch2cute_dtype_map
 from quack.epi_ops import ColVecReduce, TileStore, EpiOp, assume_stride_divisibility
@@ -384,6 +385,524 @@ class BlockscaledQuantOnlyMixin(GemmDefaultEpiMixin):
 
 
 # ---------------------------------------------------------------------------
+# BlockscaledIsaRowScaleStore EpiOp (Session 1A foundation block)
+# ---------------------------------------------------------------------------
+#
+# Writes UE8M0 scale bytes directly into the ISA-pack layout used downstream
+# by blockscaled FP8 GEMMs (and produced standalone today by
+# `_quantize_and_pack_kernel`).
+#
+# Layout (3D uint8 buffer `(num_m_tiles, k_tiles, 512)`):
+#   SF_TILE_M       = 128
+#   SF_TILE_K       = 128
+#   SF_TILE_STORAGE = 512  (== SF_TILE_M * SF_TILE_K // SF_VEC_SIZE)
+#   SF_VEC_SIZE     = 32
+#
+# Offset of one E8M0 byte for absolute (m_abs, n_group_abs):
+#   m_tile          = m_abs // 128
+#   row_in_tile     = m_abs %  128
+#   k_tile_idx      = n_group_abs // 4
+#   k_in_tile       = n_group_abs %  4
+#   row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+#   byte_at         = scale[m_tile, k_tile_idx, row_base_offset + k_in_tile]
+#
+# Single-byte stores (NOT the uint32 4-byte pack the Triton kernel uses) —
+# the cute epi loop visits one group at a time, so packing 4 groups into
+# uint32 would require cross-iteration buffering.  Single-byte stores still
+# coalesce within a warp (consecutive lanes write adjacent bytes when
+# k_in_tile sweeps 0..3).
+# ---------------------------------------------------------------------------
+
+class BlockscaledIsaRowScaleStore(EpiOp):
+    """EpiOp: writes UE8M0 scale bytes into ISA-pack layout.
+
+    Scale buffer shape: `(num_m_tiles, k_tiles, 512)` uint8, byte-equivalent
+    to the 1D packed scale buffer produced by `_quantize_and_pack_kernel`.
+
+    begin(): computes absolute M row and N-group base for this thread.
+    begin_loop(): returns (param, m_abs, n_group_abs, m_limit, n_group_limit).
+    The mixin's epi_visit_subtile writes the scale byte after bounds check.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name)
+        if tensor is not None:
+            return {self.name: assume_stride_divisibility(tensor)}
+        return {self.name: None}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            # Thread-to-M-row: SM100 Ld32x32bOp maps tidx -> M-row within tile.
+            m_in_tile = ctx.tidx % tile_M
+            if const_expr(ctx.varlen_manager.varlen_m):
+                batch_start = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_abs = batch_start + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3] + Int32(1)]
+            else:
+                m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+                # m_limit derived from buffer shape: num_m_tiles * SF_TILE_M.
+                m_limit = param.shape[0] * Int32(128)
+            n_base = ctx.tile_coord_mnkl[1] * (tile_N // 32)
+            # n_group_limit derived from buffer shape: k_tiles * 4.
+            n_group_limit = param.shape[1] * Int32(4)
+            return (param, m_abs, n_base, m_limit, n_group_limit)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            param, m_abs, n_base, m_limit, n_group_limit = state
+            if const_expr(isinstance(epi_coord, tuple)):
+                n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
+            else:
+                n_sub = epi_coord
+            return (param, m_abs, n_base + n_sub, m_limit, n_group_limit)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# BlockscaledIsaQuantOnlyMixin (Session 1A foundation block)
+# ---------------------------------------------------------------------------
+
+class BlockscaledIsaQuantOnlyMixin(GemmDefaultEpiMixin):
+    """GemmDefault + epi blockscaled FP8 quant of D with ISA-pack scale store.
+
+    Parallel to `BlockscaledQuantOnlyMixin` but writes scales in ISA-pack
+    layout (shape `(num_m_tiles, k_tiles, 512)` uint8) instead of flat
+    `(M, N//32)`.  Same amax / E8M0 / quant_scale arithmetic — only the
+    final scale store differs.
+    """
+
+    _epi_ops = (
+        *GemmDefaultEpiMixin._epi_ops,
+        BlockscaledIsaRowScaleStore("mZScaleIsa"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mZScaleIsa: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        GemmDefaultEpiMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        _z_scale_active = epi_loop_tensors["mZScaleIsa"]
+        if const_expr(_z_scale_active is not None):
+            num_z = cute.size(tRS_rD)
+
+            # Step 1: amax over the register tile.
+            amax = Float32(0.0)
+            for i in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[i]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax = cute.arch.fmax(amax, abs_val)
+            amax = cute.arch.fmax(amax, Float32(1e-4))
+
+            # Step 2: integer+carry E8M0 (matches Triton reference).
+            amax_bits = _f32_as_i32(amax)
+            biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+            mantissa_bits = amax_bits & Int32(0x7FFFFF)
+            has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+            carry = Int32(1) if has_carry else Int32(0)
+            e8m0 = biased_exp - Int32(8) + carry
+            is_normal = cutlass.Boolean(biased_exp > Int32(0))
+            e8m0 = e8m0 if is_normal else Int32(0)
+            is_pos = cutlass.Boolean(e8m0 > Int32(0))
+            e8m0 = e8m0 if is_pos else Int32(0)
+
+            # Step 3: quant_scale = 2^(254 - e8m0) (clamped to [1, 254]).
+            qexp = Int32(254) - e8m0
+            qexp_hi = cutlass.Boolean(qexp > Int32(254))
+            qexp = Int32(254) if qexp_hi else qexp
+            qexp_lo = cutlass.Boolean(qexp < Int32(1))
+            qexp = Int32(1) if qexp_lo else qexp
+            quant_scale = _i32_as_f32(qexp << Int32(23))
+
+            # Step 4: scale registers; saturating cast to fp8 at TMA store time.
+            for i in cutlass.range(num_z, unroll_full=True):
+                tRS_rD[i] = tRS_rD[i] * quant_scale
+
+            # Step 5: store UE8M0 byte at ISA-pack offset (bounds-checked).
+            z_scale_info = epi_loop_tensors["mZScaleIsa"]
+            if const_expr(z_scale_info is not None):
+                scale_tensor, m_abs, n_group_abs, m_limit, n_group_limit = z_scale_info
+                in_bounds = (
+                    cutlass.Boolean(m_abs < m_limit)
+                    & cutlass.Boolean(n_group_abs < n_group_limit)
+                )
+                if in_bounds:
+                    # ISA-pack offset math (mirrors _quantize_and_pack_kernel).
+                    m_tile = m_abs // Int32(128)
+                    row_in_tile = m_abs % Int32(128)
+                    k_tile_idx = n_group_abs // Int32(4)
+                    k_in_tile = n_group_abs % Int32(4)
+                    row_base = (row_in_tile % Int32(32)) * Int32(16) + (
+                        row_in_tile // Int32(32)
+                    ) * Int32(4)
+                    inner_off = row_base + k_in_tile
+                    scale_tensor[m_tile, k_tile_idx, inner_off] = cutlass.Int8(e8m0)
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# BlockscaledIsaColScaleStore EpiOp (Session 1A-ext / iso32 col-axis)
+# ---------------------------------------------------------------------------
+#
+# Companion to BlockscaledIsaRowScaleStore: writes UE8M0 bytes into the
+# *column*-axis ISA-pack layout used by colwise blockscaled FP8 GEMMs (the
+# layout produced today by `_colwise_quantize_and_pack_kernel` and by the
+# col-SF half of `_dual_varlen_iso32_quantize_kernel`).
+#
+# Buffer shape `(num_n_tiles, col_k_tiles, 512)` uint8, where:
+#   num_n_tiles  = ceil(N / SF_TILE_M)         # N=feature-dim becomes "M"
+#   col_k_tiles  = ceil(M / SF_TILE_K)         # M=token-dim becomes "K"
+#
+# Offset for one E8M0 byte at absolute (n_abs, m_group_abs):
+#   col_n_tile        = n_abs // 128
+#   col_row_in_tile   = n_abs %  128
+#   col_k_tile_idx    = m_group_abs // 4
+#   col_k_in_tile     = m_group_abs %  4
+#   col_row_base      = (col_row_in_tile % 32) * 16 + (col_row_in_tile // 32) * 4
+#   byte_at           = scale[col_n_tile, col_k_tile_idx, col_row_base + col_k_in_tile]
+#
+# Caller (mixin) supplies (n_abs_per_lane, m_group_abs) at store time: lane
+# k of each warp writes the col-SF byte for n_abs = warp_n_base + k.
+# ---------------------------------------------------------------------------
+
+class BlockscaledIsaColScaleStore(EpiOp):
+    """EpiOp: writes UE8M0 scale bytes into col-axis ISA-pack layout."""
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name)
+        if tensor is not None:
+            return {self.name: assume_stride_divisibility(tensor)}
+        return {self.name: None}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            # Warp-base m_abs: all lanes in a warp share the same m_group
+            # (since SM100 Ld32x32bOp maps consecutive tidx -> consecutive
+            # m_in_tile within each 32-lane warp).
+            m_in_tile = ctx.tidx % tile_M
+            lane_id = ctx.tidx % Int32(32)
+            warp_m_base_in_tile = m_in_tile - lane_id
+            if const_expr(ctx.varlen_manager.varlen_m):
+                batch_start = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_warp_base = batch_start + ctx.tile_coord_mnkl[0] * tile_M + warp_m_base_in_tile
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3] + Int32(1)]
+            else:
+                m_warp_base = ctx.tile_coord_mnkl[0] * tile_M + warp_m_base_in_tile
+                # The col-SF buffer's k_tile dim encodes num_m_groups (rounded up).
+                # col_k_tiles * 4 (groups_per_k_tile) * 32 (rows_per_group) = M_upper.
+                m_limit = param.shape[1] * Int32(128)
+            # n_base = N-group start for this tile (each subtile bumps by 1
+            # n_group via begin_loop).  Lane k writes col-SF byte for
+            # n_abs = n_base_groups*32 + k.
+            n_tile_base = ctx.tile_coord_mnkl[1] * tile_N
+            # n_limit = num_n_tiles * SF_TILE_M (= 128)
+            n_limit = param.shape[0] * Int32(128)
+            return (param, m_warp_base, n_tile_base, lane_id, m_limit, n_limit)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            param, m_warp_base, n_tile_base, lane_id, m_limit, n_limit = state
+            if const_expr(isinstance(epi_coord, tuple)):
+                n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
+            else:
+                n_sub = epi_coord
+            # n_sub is in units of N-groups (one subtile == 32 N-cols).
+            n_warp_base = n_tile_base + n_sub * Int32(32)
+            return (param, m_warp_base, n_warp_base, lane_id, m_limit, n_limit)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# BlockscaledIso32QuantOnlyMixin (Session 1A-ext)
+# ---------------------------------------------------------------------------
+#
+# Block-amax (iso32) quantization fused into the GEMM epilogue.  Produces
+# THREE outputs from a single MMA:
+#   - z_fp8       (e4m3, MxN) saturating cast using block scale
+#   - z_row_isa   row-axis ISA-pack SF buffer (1A layout)
+#   - z_col_isa   col-axis ISA-pack SF buffer (this file)
+#
+# iso32 invariant: the e8m0 byte at (m_group, n_group) is the SAME byte in
+# both row-SF and col-SF layouts (just different offsets), because the amax
+# is reduced over the full 32x32 block (row + col together).  This is what
+# `_dual_varlen_iso32_quantize_kernel` exploits; we replicate it in epi.
+#
+# Warp layout assumption (same as 1A, validated): SM100 Ld32x32bOp maps
+# tidx -> m_in_tile such that consecutive tidx values in a warp form 32
+# contiguous M-rows of a single 32-row m_group, all sharing one 32-col
+# n_group.  warp_redux_sync(MAX) across these 32 lanes yields the block
+# amax (since each lane already reduced its 32 N-vals).
+# ---------------------------------------------------------------------------
+
+
+class BlockscaledIso32QuantOnlyMixin(GemmDefaultEpiMixin):
+    """GemmDefault + epi iso32 (block-amax) blockscaled FP8 quant of D with
+    dual ISA-pack scale stores (row + col).
+    """
+
+    _epi_ops = (
+        *GemmDefaultEpiMixin._epi_ops,
+        BlockscaledIsaRowScaleStore("mZScaleIsaRow"),
+        BlockscaledIsaColScaleStore("mZScaleIsaCol"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mZScaleIsaRow: Optional[cute.Tensor] = None
+        mZScaleIsaCol: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        GemmDefaultEpiMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        row_info = epi_loop_tensors["mZScaleIsaRow"]
+        col_info = epi_loop_tensors["mZScaleIsaCol"]
+        any_active = (row_info is not None) or (col_info is not None)
+        if const_expr(any_active):
+            num_z = cute.size(tRS_rD)
+
+            # Step 1: per-thread amax over the register tile (32 N-vals).
+            amax = Float32(0.0)
+            for i in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[i]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax = cute.arch.fmax(amax, abs_val)
+
+            # Step 2: WARP-LEVEL REDUCE across 32 lanes -> block amax.
+            # All 32 lanes in this warp share the same n_group AND span 32
+            # consecutive M-rows of one m_group, so the reduced max is the
+            # iso32 block amax for the (m_group, n_group) 32x32 block.
+            amax = cute.arch.warp_redux_sync(amax, "max")
+            amax = cute.arch.fmax(amax, Float32(1e-4))
+
+            # Step 3: integer+carry E8M0 (matches Triton reference).
+            amax_bits = _f32_as_i32(amax)
+            biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+            mantissa_bits = amax_bits & Int32(0x7FFFFF)
+            has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+            carry = Int32(1) if has_carry else Int32(0)
+            e8m0 = biased_exp - Int32(8) + carry
+            is_normal = cutlass.Boolean(biased_exp > Int32(0))
+            e8m0 = e8m0 if is_normal else Int32(0)
+            is_pos = cutlass.Boolean(e8m0 > Int32(0))
+            e8m0 = e8m0 if is_pos else Int32(0)
+
+            # Step 4: quant_scale = 2^(254 - e8m0).
+            qexp = Int32(254) - e8m0
+            qexp_hi = cutlass.Boolean(qexp > Int32(254))
+            qexp = Int32(254) if qexp_hi else qexp
+            qexp_lo = cutlass.Boolean(qexp < Int32(1))
+            qexp = Int32(1) if qexp_lo else qexp
+            quant_scale = _i32_as_f32(qexp << Int32(23))
+
+            # Step 5: scale registers; saturating cast to fp8 at TMA store.
+            for i in cutlass.range(num_z, unroll_full=True):
+                tRS_rD[i] = tRS_rD[i] * quant_scale
+
+            # Step 6a: ROW-SF store (per-lane, at (m_abs, n_group_abs)).
+            if const_expr(row_info is not None):
+                row_tensor, m_abs, n_group_abs, m_limit, n_group_limit = row_info
+                in_bounds = (
+                    cutlass.Boolean(m_abs < m_limit)
+                    & cutlass.Boolean(n_group_abs < n_group_limit)
+                )
+                if in_bounds:
+                    m_tile = m_abs // Int32(128)
+                    row_in_tile = m_abs % Int32(128)
+                    k_tile_idx = n_group_abs // Int32(4)
+                    k_in_tile = n_group_abs % Int32(4)
+                    row_base = (row_in_tile % Int32(32)) * Int32(16) + (
+                        row_in_tile // Int32(32)
+                    ) * Int32(4)
+                    inner_off = row_base + k_in_tile
+                    row_tensor[m_tile, k_tile_idx, inner_off] = cutlass.Int8(e8m0)
+
+            # Step 6b: COL-SF store (one lane per N-col within this warp's
+            # n_group; lane k writes col-SF byte for n_abs = warp_n_base + k).
+            if const_expr(col_info is not None):
+                col_tensor, m_warp_base, n_warp_base, lane_id, m_limit_c, n_limit_c = col_info
+                n_abs_lane = n_warp_base + lane_id
+                # m_group_abs for col-SF = warp's m-base // 32 (uniform within warp).
+                m_group_abs = m_warp_base // Int32(32)
+                in_bounds_c = (
+                    cutlass.Boolean(n_abs_lane < n_limit_c)
+                    & cutlass.Boolean(m_warp_base < m_limit_c)
+                )
+                if in_bounds_c:
+                    col_n_tile = n_abs_lane // Int32(128)
+                    col_row_in_tile = n_abs_lane % Int32(128)
+                    col_k_tile_idx = m_group_abs // Int32(4)
+                    col_k_in_tile = m_group_abs % Int32(4)
+                    col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (
+                        col_row_in_tile // Int32(32)
+                    ) * Int32(4)
+                    col_inner_off = col_row_base + col_k_in_tile
+                    col_tensor[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0)
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# BlockscaledColQuantOnlyMixin (Session 1C — pure colwise quant)
+# ---------------------------------------------------------------------------
+#
+# Per-column-block-amax quantization fused into the GEMM epilogue.  Replaces
+# the standalone `_colwise_quantize_and_pack_kernel` (237 us at production
+# shape) by computing per-(32-rows-in-M × 1-col-in-N) amax via 32 successive
+# `warp_redux_sync` calls (one per N-col covered by the warp's 32-wide
+# fragment) and writing TWO outputs from a single MMA:
+#   - z_fp8       (e4m3, MxN) saturating cast per col scale
+#   - z_col_isa   col-axis ISA-pack SF buffer (one byte per (32-rows, 1-col))
+#
+# Layout invariant (same as 1A-ext col): lane k of each warp stores the
+# col-SF byte for n_abs = warp_n_base + k, m_group_abs = warp_m_base // 32.
+#
+# Reference: TE cudnn `grouped_gemm_quant.quant_sfd_col` — per-col warp
+# redux with e8m0 cast-roundtrip for scale quantization fidelity.
+# ---------------------------------------------------------------------------
+
+
+class BlockscaledColQuantOnlyMixin(GemmDefaultEpiMixin):
+    """GemmDefault + epi pure colwise blockscaled FP8 quant of D with
+    ISA-pack col-SF store.  Equivalent to `colwise_quantize_and_pack` but
+    fused into the GEMM epi (zero standalone kernel)."""
+
+    _epi_ops = (
+        *GemmDefaultEpiMixin._epi_ops,
+        BlockscaledIsaColScaleStore("mZScaleIsaCol"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mZScaleIsaCol: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        GemmDefaultEpiMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        col_info = epi_loop_tensors["mZScaleIsaCol"]
+        if const_expr(col_info is not None):
+            col_tensor, m_warp_base, n_warp_base, lane_id, m_limit_c, n_limit_c = col_info
+            num_z = cute.size(tRS_rD)
+
+            # Per-col amax via per-col warp redux.  lane_id holds row
+            # m_warp_base + lane_id of one m_group; tRS_rD[k] is the value at
+            # N-col warp_n_base + k.  Reducing |tRS_rD[k]| MAX across 32
+            # lanes gives the block (32-rows × col k) amax.  The reduced
+            # value is returned uniformly to all lanes — lane k captures
+            # *its* col's e8m0 for the col-SF byte store after the loop.
+            #
+            # Each lane also keeps the 32 quant scales (one per col) to
+            # scale its 32 tRS_rD elements before the saturating fp8 cast.
+
+            my_col_e8m0 = Int32(0)
+
+            for k in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[k]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax_k = cute.arch.warp_redux_sync(abs_val, "max")
+                amax_k = cute.arch.fmax(amax_k, Float32(1e-4))
+
+                # E8M0 integer+carry (matches Triton reference; same as iso32).
+                amax_bits = _f32_as_i32(amax_k)
+                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                carry = Int32(1) if has_carry else Int32(0)
+                e8m0_k = biased_exp - Int32(8) + carry
+                is_normal = cutlass.Boolean(biased_exp > Int32(0))
+                e8m0_k = e8m0_k if is_normal else Int32(0)
+                is_pos = cutlass.Boolean(e8m0_k > Int32(0))
+                e8m0_k = e8m0_k if is_pos else Int32(0)
+
+                # Quant scale = 2^(254 - e8m0_k).
+                qexp = Int32(254) - e8m0_k
+                qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                qexp = Int32(254) if qexp_hi else qexp
+                qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                qexp = Int32(1) if qexp_lo else qexp
+                quant_scale_k = _i32_as_f32(qexp << Int32(23))
+
+                # Scale this col's value in every lane.
+                tRS_rD[k] = tRS_rD[k] * quant_scale_k
+
+                # Lane k captures e8m0 for col k = warp_n_base + k.
+                if lane_id == Int32(k):
+                    my_col_e8m0 = e8m0_k
+
+            # Col-SF store: lane k writes byte for n_abs = warp_n_base + k.
+            n_abs_lane = n_warp_base + lane_id
+            m_group_abs = m_warp_base // Int32(32)
+            in_bounds_c = (
+                cutlass.Boolean(n_abs_lane < n_limit_c)
+                & cutlass.Boolean(m_warp_base < m_limit_c)
+            )
+            if in_bounds_c:
+                col_n_tile = n_abs_lane // Int32(128)
+                col_row_in_tile = n_abs_lane % Int32(128)
+                col_k_tile_idx = m_group_abs // Int32(4)
+                col_k_in_tile = m_group_abs % Int32(4)
+                col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (
+                    col_row_in_tile // Int32(32)
+                ) * Int32(4)
+                col_inner_off = col_row_base + col_k_in_tile
+                col_tensor[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(my_col_e8m0)
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # GemmDGatedMixin (from gemm_dgated.py)
 # ---------------------------------------------------------------------------
 
@@ -574,6 +1093,144 @@ def _fp8e4m3_to_f32(x, *, loc=None, ip=None) -> Float32:
     )
     f32_val = _arith.extf(T.f32(), f16_val, loc=loc, ip=ip)
     return Float32(f32_val)
+
+
+# ---------------------------------------------------------------------------
+# Hardware-accelerated quant helpers (TE cudnn parity optimizations)
+# ---------------------------------------------------------------------------
+# These replace multi-instruction ALU sequences with native SM100 PTX
+# instructions, saving 6-10 registers per quant path.
+# ---------------------------------------------------------------------------
+
+@dsl_user_op
+def _hardware_f32_to_e8m0(x: Float32, *, loc=None, ip=None) -> Float32:
+    """PTX f32→ue8m0→f32 roundtrip using native BX8 instructions.
+
+    Replaces the manual integer+carry e8m0 computation (~10 ALU ops) with
+    a single PTX inline asm (2 native instructions).  Returns the e8m0
+    scale as a bf16→f32 value (approximately 2^e8m0).
+
+    Reference: TE cudnn ``cvt_f32_to_f8_to_f32``.
+    """
+    src = x.ir_value(loc=loc, ip=ip) if hasattr(x, 'ir_value') else x
+    asm_tmpl = (
+        "{\n"
+        "  .reg .b16 bf_lo;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 bf_lo, 0f00000000, $1;\n"
+        "  cvt.rn.bf16x2.ue8m0x2  $0, bf_lo;\n"
+        "}"
+    )
+    result = llvm.inline_asm(
+        T.f32(), [src],
+        asm_tmpl,
+        "=f,f",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return Float32(result)
+
+
+@dsl_user_op
+def _hardware_f32x4_to_f8x4_i32(fp32x4, fp8_dtype, *, loc=None, ip=None):
+    """PTX vec4 f32→fp8 conversion, packed as int32.
+
+    Uses ``cvt.rn.satfinite.e4m3x2.f32`` (x2 PTX) to convert 4 f32 values
+    into 4 packed fp8 bytes in one int32.  Replaces the DSL generic
+    ``r4.load().to(Float8E4M3FN)`` path which requires 4×4-element rmem
+    allocation + cast + recast.
+    """
+    from cutlass._mlir.dialects import vector as _vector
+
+    # Extract individual f32 values from the 4-element rmem tensor
+    f32_vals = fp32x4.load()  # Vec4f32
+
+    # Each PTX cvt.rn.satfinite.e4m3x2.f32 handles 2 f32 → 2 fp8
+    asm_tmpl = (
+        "{\n"
+        "  .reg .b16 lo, hi;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n"
+        "  mov.b32 $0, {lo, hi};\n"
+        "}"
+    )
+    # Get IR values from the 4 elements
+    def _ir(v, idx):
+        if hasattr(f32_vals, 'ir_value'):
+            vec_ir = f32_vals.ir_value(loc=loc, ip=ip)
+            return Float32(_vector.extract(vec_ir, [], [idx])).ir_value(loc=loc, ip=ip)
+        # Fallback: direct element access
+        return Float32(fp32x4[idx]).ir_value(loc=loc, ip=ip)
+
+    src0, src1, src2, src3 = _ir(f32_vals, 0), _ir(f32_vals, 1), _ir(f32_vals, 2), _ir(f32_vals, 3)
+    packed = llvm.inline_asm(
+        T.i32(),
+        [src0, src1, src2, src3],
+        asm_tmpl,
+        "=r,f,f,f,f",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return packed
+
+
+# Pre-computed constant: POW_2_127 = 2^127 ≈ 1.7e38.
+# Builder pattern: _i32_as_f32(Int32(254) << Int32(23)).
+# Used with hardware e8m0: quant_scale = POW_2_127 * rcp_approx(e8m0_float).
+
+
+@dsl_user_op
+def dswiglu_te_exp2(
+    x,
+    y,
+    dout,
+    *,
+    loc=None,
+    ip=None,
+):
+    """TE cudnn dswiglu formula using exp2 + rcp_approx.
+
+    This is a local Sonic copy of TE's vectorized dswiglu inner loop:
+      sig = rcp_approx(1 + exp2(-x * log2(e)))
+      swish = x * sig
+      dy = dout * swish
+      dx = dout * y * sig * (1 + x * (1 - sig))
+      out = swish * y
+
+    It replaces quack.activation.dswiglu's tanh.approx path and keeps the
+    same return contract (dx, dy, swiglu_out).
+    """
+    LOG2_E = Float32(1.4426950408889634)
+    if const_expr(not isinstance(x, tuple)):
+        sig_rcp = cute.math.exp2(Float32(0.0) - x * LOG2_E, fastmath=True) + Float32(1.0)
+        sig = cute.arch.rcp_approx(sig_rcp)
+        swish = x * sig
+        dy = dout * swish
+        dsig = x * (Float32(1.0) - sig)
+        dx = dout * y * sig * (Float32(1.0) + dsig)
+        out = swish * y
+        return dx, dy, out
+    else:
+        neg_log2e = (-LOG2_E, -LOG2_E)
+        sig_rcp = cute.arch.mul_packed_f32x2(x, neg_log2e, rnd="rn", ftz=False)
+        sig_rcp = cute.arch.add_packed_f32x2(
+            (
+                cute.math.exp2(sig_rcp[0], fastmath=True),
+                cute.math.exp2(sig_rcp[1], fastmath=True),
+            ),
+            (Float32(1.0), Float32(1.0)),
+            rnd="rn",
+            ftz=False,
+        )
+        sig = (cute.arch.rcp_approx(sig_rcp[0]), cute.arch.rcp_approx(sig_rcp[1]))
+        swish = cute.arch.mul_packed_f32x2(x, sig, rnd="rn", ftz=False)
+        dy = cute.arch.mul_packed_f32x2(dout, swish, rnd="rn", ftz=False)
+        dx = cute.arch.mul_packed_f32x2(dout, y, rnd="rn", ftz=False)
+        dx = cute.arch.mul_packed_f32x2(dx, sig, rnd="rn", ftz=False)
+        dsig = cute.arch.mul_packed_f32x2(x, (Float32(1.0) - sig[0], Float32(1.0) - sig[1]), rnd="rn", ftz=False)
+        dsig = cute.arch.add_packed_f32x2(dsig, (Float32(1.0), Float32(1.0)), rnd="rn", ftz=False)
+        dx = cute.arch.mul_packed_f32x2(dx, dsig, rnd="rn", ftz=False)
+        out = cute.arch.mul_packed_f32x2(swish, y, rnd="rn", ftz=False)
+        return dx, dy, out
 
 
 # ---------------------------------------------------------------------------
@@ -1027,4 +1684,625 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
+        return tRS_rOut
+
+
+# ---------------------------------------------------------------------------
+# Iso32DXYStore EpiOp (NEW — side-channel FP8 dXY + dual ISA SF for DGated)
+# ---------------------------------------------------------------------------
+#
+# Captures per-element (m_abs, n_dXY_abs) coordinates so the mixin can:
+#   * scatter-store FP8 dXY bytes to gmem  mDZFp8 [TK, 2I]  uint8
+#   * scatter-store row-axis ISA-pack SF bytes  mDZScaleIsaRow  uint8
+#   * scatter-store col-axis ISA-pack SF bytes  mDZScaleIsaCol  uint8
+#
+# Three optional kwargs (any subset can be None for A/B verification):
+#   mDZFp8Iso32_fp8   : (total_TK, 2I) uint8/Float8E4M3FN
+#   mDZFp8Iso32_row   : (num_m_tiles, k_tiles, 512) uint8  (row-ISA-pack, dXY-N domain)
+#   mDZFp8Iso32_col   : (num_n_tiles, col_k_tiles, 512) uint8  (col-ISA-pack)
+#
+# The single 32x32 iso32 amax (over the dXY-tensor) is shared between the
+# FP8 byte and BOTH scale bytes — this is the invariant that makes the
+# fusion correct vs `_dual_varlen_iso32_quantize_kernel`.
+# ---------------------------------------------------------------------------
+
+
+class Iso32DXYStore(EpiOp):
+    """EpiOp: captures coords for per-element scatter store of fp8 dXY +
+    dual ISA-pack SF bytes.  Mirrors :class:`FP8PreActLoad` but in the
+    write direction; passes a single tuple-payload through to the mixin's
+    ``epi_visit_subtile``.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+        return 0
+
+    def to_params(self, gemm, args):
+        fp8 = getattr(args, self.name + "_fp8", None)
+        row = getattr(args, self.name + "_row", None)
+        col = getattr(args, self.name + "_col", None)
+        if fp8 is None and row is None and col is None:
+            return {self.name: None}
+        return {
+            self.name: (
+                assume_stride_divisibility(fp8) if fp8 is not None else None,
+                assume_stride_divisibility(row) if row is not None else None,
+                assume_stride_divisibility(col) if col is not None else None,
+            )
+        }
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            fp8_t, row_t, col_t = param
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            if const_expr(ctx.varlen_manager.varlen_m):
+                m_offset = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[
+                    ctx.tile_coord_mnkl[3] + Int32(1)
+                ]
+            else:
+                m_offset = Int32(0)
+                # Non-varlen: use a sentinel so the bounds check is effectively
+                # always true (avoids Python `if` on a runtime value below).
+                m_limit = Int32(2_000_000_000)
+            m_base = ctx.tile_coord_mnkl[0] * tile_M
+            tDcD = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((tile_M, tile_N))
+            )
+            # dXY-N base in dXY logical coords (tile_N D-cols == 2*tile_N dXY-cols).
+            n_base_dxy = ctx.tile_coord_mnkl[1] * tile_N * 2
+            lane_id = ctx.tidx % Int32(32)
+            return (fp8_t, row_t, col_t, tDcD, m_offset, m_base, n_base_dxy, m_limit, lane_id)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            fp8_t, row_t, col_t, tDcD, m_offset, m_base, n_base_dxy, m_limit, lane_id = state
+            tDcD_sub = cute.group_modes(tDcD, 3, cute.rank(tDcD))[None, None, None, epi_coord]
+            return (fp8_t, row_t, col_t, tDcD_sub, m_offset, m_base, n_base_dxy, m_limit, lane_id)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GemmDGatedFP8CLoadIso32QuantMixin
+# ---------------------------------------------------------------------------
+#
+# Side-channel iso32 FP8-D quant for DGated FP8-C-load.  Keeps BF16 D path
+# fully intact; ADDITIONALLY writes:
+#   - dz_fp8   (Float8E4M3FN, varlen TK x 2I) via per-byte scatter
+#   - dz_sf_row  ISA-pack row-axis SF (in dXY-N domain)
+#   - dz_sf_col  ISA-pack col-axis SF
+#
+# Replaces the standalone `_dual_varlen_iso32_quantize_kernel(dz_bf16)`
+# (~102 us at production T=8192 E=8) once flag-wired in functional/__init__.py.
+#
+# Reference: TE `grouped_gemm_dswiglu_quant` epi pattern + 1A-ext mixin
+# invariants (block constancy / row=col SF equality at 32x32 blocks).
+# ---------------------------------------------------------------------------
+
+
+class GemmDGatedFP8CLoadIso32QuantMixin(GemmDGatedFP8CLoadMixin):
+    """GemmDGatedFP8CLoad + side-channel iso32 FP8 dXY quant (additive)."""
+
+    _epi_ops = (
+        *GemmDGatedFP8CLoadMixin._epi_ops,
+        Iso32DXYStore("mDZFp8Iso32"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mFP8PreAct_fp8: Optional[cute.Tensor] = None
+        mFP8PreAct_scales: Optional[cute.Tensor] = None
+        mDZFp8Iso32_fp8: Optional[cute.Tensor] = None
+        mDZFp8Iso32_row: Optional[cute.Tensor] = None
+        mDZFp8Iso32_col: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
+
+        if const_expr(self.c_dtype == cutlass.Int16):
+            tRS_rC_fp8 = cute.recast_tensor(tRS_rC, cutlass.Float8E4M3FN)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rC_fp8.layout.shape, Float32)
+            tRS_rXY_f32x2.store(tRS_rC_fp8.load().to(Float32))
+            fp8_preact_info = epi_loop_tensors["mFP8PreAct"]
+            if const_expr(fp8_preact_info is not None):
+                fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base = fp8_preact_info
+                num_d = cute.size(tDcD_sub)
+                for i in cutlass.range(num_d, unroll_full=True):
+                    coord = tDcD_sub[i]
+                    row, col = coord[0], coord[1]
+                    m_abs = m_offset + m_base + row
+                    n0 = n_base + col * 2
+                    group_0 = n0 >> Int32(5)
+                    group_1 = (n0 + Int32(1)) >> Int32(5)
+                    scale_0 = _i32_as_f32(Int32(scales_tensor[m_abs, group_0]) << Int32(23))
+                    scale_1 = _i32_as_f32(Int32(scales_tensor[m_abs, group_1]) << Int32(23))
+                    tRS_rXY_f32x2[2 * i] = tRS_rXY_f32x2[2 * i] * scale_0
+                    tRS_rXY_f32x2[2 * i + 1] = tRS_rXY_f32x2[2 * i + 1] * scale_1
+        else:
+            assert tRS_rC is not None
+            implicit_dtype = params.implicit_dtype
+            tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
+            tRS_rXY_f32x2.store(tRS_rXY_f16x2.load().to(Float32))
+
+        tRS_rdXY_f32x2 = cute.make_rmem_tensor_like(tRS_rXY_f32x2, Float32)
+        tRS_rOut = cute.make_rmem_tensor_like(tRS_rD, Float32)
+        tRS_rD_scaled = cute.make_rmem_tensor_like(tRS_rD)
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch < 100):
+                tRS_rD_scaled.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
+                tRS_rD_scaled_mn = layout_utils.convert_layout_zero_stride(tRS_rD_scaled, tDrColVec.layout)
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
+                        tRS_rD_scaled_mn[m, 2*n], tRS_rD_scaled_mn[m, 2*n+1] = cute.arch.mul_packed_f32x2(
+                            (tRS_rD_mn[m, 2*n], tRS_rD_mn[m, 2*n+1]),
+                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
+                        )
+        else:
+            tRS_rD_scaled.store(tRS_rD.load())
+        if const_expr(self.arch < 100):
+            for i in cutlass.range(cute.size(tRS_rD)):
+                tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = params.act_bwd_fn(
+                    tRS_rXY_f32x2[2*i], tRS_rXY_f32x2[2*i+1], tRS_rD_scaled[i])
+        else:
+            for i in cutlass.range(cute.size(tRS_rD) // 2):
+                (tRS_rdXY_f32x2[4*i], tRS_rdXY_f32x2[4*i+2]), \
+                (tRS_rdXY_f32x2[4*i+1], tRS_rdXY_f32x2[4*i+3]), \
+                (tRS_rOut[2*i], tRS_rOut[2*i+1]) = params.act_bwd_fn(
+                    (tRS_rXY_f32x2[4*i], tRS_rXY_f32x2[4*i+2]),
+                    (tRS_rXY_f32x2[4*i+1], tRS_rXY_f32x2[4*i+3]),
+                    (tRS_rD_scaled[2*i], tRS_rD_scaled[2*i+1]),
+                )
+        if const_expr(tDrColVecReduce is not None):
+            if const_expr(self.arch < 100):
+                for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
+                    tDrColVecReduce[i] += tRS_rOut[i] * tRS_rD[i]
+            else:
+                tDrColVecReduce_mn = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVecReduce.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVecReduce.layout)
+                for m in cutlass.range(cute.size(tDrColVecReduce_mn, mode=[0]), unroll_full=True):
+                    row_sum = cute.arch.mul_packed_f32x2(
+                        (tRS_rD_mn[m, 0], tRS_rD_mn[m, 1]), (tRS_rOut_mn[m, 0], tRS_rOut_mn[m, 1]))
+                    for n in cutlass.range(1, cute.size(tDrColVecReduce_mn, mode=[1]) // 2, unroll_full=True):
+                        row_sum = cute.arch.fma_packed_f32x2(
+                            (tRS_rD_mn[m, 2*n], tRS_rD_mn[m, 2*n+1]),
+                            (tRS_rOut_mn[m, 2*n], tRS_rOut_mn[m, 2*n+1]), row_sum)
+                    tDrColVecReduce_mn[m, 0] += row_sum[0] + row_sum[1]
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch < 100):
+                tRS_rOut.store(tRS_rOut.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
+                        tRS_rOut_mn[m, 2*n], tRS_rOut_mn[m, 2*n+1] = cute.arch.mul_packed_f32x2(
+                            (tRS_rOut_mn[m, 2*n], tRS_rOut_mn[m, 2*n+1]),
+                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
+                        )
+
+        # ── NEW: iso32 side-channel FP8 dXY quant ──
+        #
+        # tRS_rdXY_f32x2 holds 2*num_d f32 dXY values per lane, laid out so
+        # indices [4*i, 4*i+1, 4*i+2, 4*i+3] map to consecutive dXY-cols
+        # (2*col_D, 2*col_D+1, 2*(col_D+1), 2*(col_D+1)+1) for D-row coord
+        # (row_2i, row_2i+1).  We need iso32 32×32 blocks in the dXY-N domain:
+        # since each warp's 32 lanes span 32 contiguous M-rows AND share the
+        # same N-cols, the 32 lanes form a 32x(num_dxy_per_lane) iso32 block(s).
+        iso32_info = epi_loop_tensors["mDZFp8Iso32"]
+        if const_expr(iso32_info is not None):
+            fp8_t, row_t, col_t, tDcD_sub, m_offset, m_base, n_base_dxy, m_limit, lane_id = iso32_info
+            num_d = cute.size(tDcD_sub)
+            # num_dxy per lane = 2 * num_d (each D slot expands to 2 dXY cols).
+            # Group structure: 32 dXY cols == 1 iso32 group.  num_d must be
+            # a constexpr multiple of 16 so num_dxy_per_lane (= 2*num_d) is
+            # a multiple of 32.  Asserted at JIT time.
+            num_dxy = const_expr(2 * num_d)
+            assert num_dxy % 32 == 0, "Iso32 fusion requires 2*num_d_per_lane to be multiple of 32"
+            num_groups = const_expr(num_dxy // 32)
+
+            for g in cutlass.range(num_groups, unroll_full=True):
+                # Step 1: per-thread amax over 32 contiguous dXY vals.
+                amax = Float32(0.0)
+                for k in cutlass.range(32, unroll_full=True):
+                    v = tRS_rdXY_f32x2[g * 32 + k]
+                    neg = Float32(0.0) - v
+                    av = cute.arch.fmax(v, neg)
+                    amax = cute.arch.fmax(amax, av)
+                # Step 2: warp_redux across 32 lanes -> block (32x32) amax.
+                amax = cute.arch.warp_redux_sync(amax, "max")
+                amax = cute.arch.fmax(amax, Float32(1e-4))
+                # Step 3: integer+carry E8M0 (matches Triton reference).
+                amax_bits = _f32_as_i32(amax)
+                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                carry = Int32(1) if has_carry else Int32(0)
+                e8m0 = biased_exp - Int32(8) + carry
+                is_normal = cutlass.Boolean(biased_exp > Int32(0))
+                e8m0 = e8m0 if is_normal else Int32(0)
+                is_pos = cutlass.Boolean(e8m0 > Int32(0))
+                e8m0 = e8m0 if is_pos else Int32(0)
+                # Step 4: quant_scale = 2^(254 - e8m0).
+                qexp = Int32(254) - e8m0
+                qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                qexp = Int32(254) if qexp_hi else qexp
+                qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                qexp = Int32(1) if qexp_lo else qexp
+                quant_scale = _i32_as_f32(qexp << Int32(23))
+
+                # Step 5: scale into 32-element f32 buffer, then vector cast
+                # to fp8 (DSL auto-packs to vec4 cvt_fptrunc).  Original
+                # tRS_rdXY_f32x2 is left untouched so the BF16 pack-back at
+                # the end of this function preserves the parent's contract.
+                src32 = cute.make_rmem_tensor(cute.make_layout(32), Float32)
+                dst32 = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+                if const_expr(True):
+                    for k in cutlass.range(32, unroll_full=True):
+                        src32[k] = tRS_rdXY_f32x2[g * 32 + k] * quant_scale
+                    dst32.store(src32.load().to(cutlass.Float8E4M3FN))
+
+                # Step 6a: per-byte FP8 scatter store of dXY (via Uint8 recast
+                # to avoid per-element fp8 scatter store quirks).
+                if const_expr(fp8_t is not None):
+                    fp8_t_u8 = cute.recast_tensor(fp8_t, cutlass.Uint8)
+                    dst32_u8 = cute.recast_tensor(dst32, cutlass.Uint8)
+                    for k in cutlass.range(32, unroll_full=True):
+                        dxy_idx = g * 32 + k
+                        d_idx = dxy_idx // 2
+                        subbit = dxy_idx % 2
+                        coord = tDcD_sub[d_idx]
+                        row = coord[0]
+                        col = coord[1]
+                        m_abs_e = m_offset + m_base + row
+                        n_dxy_abs = n_base_dxy + col * 2 + subbit
+                        ok_m = cutlass.Boolean(m_abs_e < m_limit)
+                        if ok_m:
+                            fp8_t_u8[m_abs_e, n_dxy_abs] = dst32_u8[k]
+                # Step 6b: row-ISA-pack SF store.
+                if const_expr(row_t is not None):
+                    d_idx0 = (g * 32) // 2
+                    coord0 = tDcD_sub[d_idx0]
+                    row0 = coord0[0]
+                    col0 = coord0[1]
+                    m_abs_r = m_offset + m_base + row0
+                    n_group_abs = (n_base_dxy + col0 * 2 + g * 32) >> Int32(5)
+                    n_group_limit = row_t.shape[1] * Int32(4)
+                    ok_r = (
+                        cutlass.Boolean(m_abs_r < m_limit)
+                        & cutlass.Boolean(n_group_abs < n_group_limit)
+                    )
+                    if ok_r:
+                        m_tile = m_abs_r // Int32(128)
+                        row_in_tile = m_abs_r % Int32(128)
+                        k_tile_idx = n_group_abs // Int32(4)
+                        k_in_tile = n_group_abs % Int32(4)
+                        row_base = (row_in_tile % Int32(32)) * Int32(16) + (row_in_tile // Int32(32)) * Int32(4)
+                        inner_off = row_base + k_in_tile
+                        row_t[m_tile, k_tile_idx, inner_off] = cutlass.Int8(e8m0)
+                # Step 6c: col-ISA-pack SF store.
+                if const_expr(col_t is not None):
+                    d_idx0 = (g * 32) // 2
+                    coord0 = tDcD_sub[d_idx0]
+                    row_lane = coord0[0]
+                    col_lane = coord0[1]
+                    m_abs_lane = m_offset + m_base + row_lane
+                    m_warp_base = m_abs_lane - lane_id
+                    warp_n_dxy_base_g = n_base_dxy + col_lane * 2 + g * 32
+                    n_abs_lane = warp_n_dxy_base_g + lane_id
+                    m_group_abs = m_warp_base // Int32(32)
+                    n_limit_c = col_t.shape[0] * Int32(128)
+                    ok_c = (
+                        cutlass.Boolean(n_abs_lane < n_limit_c)
+                        & cutlass.Boolean(m_warp_base < m_limit)
+                    )
+                    if ok_c:
+                        col_n_tile = n_abs_lane // Int32(128)
+                        col_row_in_tile = n_abs_lane % Int32(128)
+                        col_k_tile_idx = m_group_abs // Int32(4)
+                        col_k_in_tile = m_group_abs % Int32(4)
+                        col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (col_row_in_tile // Int32(32)) * Int32(4)
+                        col_inner_off = col_row_base + col_k_in_tile
+                        col_t[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0)
+
+        # ── Write dXY back to BF16 D (only when iso32 is NOT active) ──
+        if const_expr(iso32_info is None):
+            if const_expr(self.c_dtype == cutlass.Int16):
+                pack_dtype = cutlass.BFloat16
+            else:
+                pack_dtype = params.implicit_dtype
+            tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
+            tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
+            tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
+        return tRS_rOut
+
+
+# ---------------------------------------------------------------------------
+# Y1sColQuantStore EpiOp — side-channel FP8 y1s + col-ISA SF for DGated
+# ---------------------------------------------------------------------------
+#
+# Captures per-element (m_abs, n_abs) coordinates for y1s so the mixin can:
+#   * scatter-store FP8 y1s bytes to gmem  mY1sFp8  [TK, I]  uint8
+#   * scatter-store col-axis ISA-pack SF bytes  mY1sScaleIsaCol  uint8
+#
+# Reference: TE cudnn `quant_sfd_col` — per-col warp redux with e8m0
+# cast-roundtrip.  Single warp_redux_sync per N-col, same invariant as
+# BlockscaledColQuantOnlyMixin but applied to DGated postact (tRS_rOut),
+# NOT to D output.
+# ---------------------------------------------------------------------------
+
+
+class Y1sColQuantStore(EpiOp):
+    """EpiOp: captures coords for per-element scatter store of fp8 y1s +
+    col-ISA SF bytes.  Mirrors :class:`FP8PreActLoad` but in the write
+    direction; passes a single tuple-payload through to the mixin's
+    ``epi_visit_subtile``.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+        return 0
+
+    def to_params(self, gemm, args):
+        fp8 = getattr(args, self.name + "_fp8", None)
+        col = getattr(args, self.name + "_col", None)
+        if fp8 is None and col is None:
+            return {self.name: None}
+        return {
+            self.name: (
+                assume_stride_divisibility(fp8) if fp8 is not None else None,
+                assume_stride_divisibility(col) if col is not None else None,
+            )
+        }
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            fp8_t, col_t = param
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            if const_expr(ctx.varlen_manager.varlen_m):
+                m_offset = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[
+                    ctx.tile_coord_mnkl[3] + Int32(1)
+                ]
+            else:
+                m_offset = Int32(0)
+                m_limit = Int32(2_000_000_000)
+            m_base = ctx.tile_coord_mnkl[0] * tile_M
+            n_base = ctx.tile_coord_mnkl[1] * tile_N
+            n_limit = col_t.shape[0] * Int32(128)  # total N for bounds check
+            tDcD = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((tile_M, tile_N))
+            )
+            lane_id = ctx.tidx % Int32(32)
+            return (fp8_t, col_t, tDcD, m_offset, m_base, n_base, n_limit, m_limit, lane_id)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            fp8_t, col_t, tDcD, m_offset, m_base, n_base, n_limit, m_limit, lane_id = state
+            tDcD_sub = cute.group_modes(tDcD, 3, cute.rank(tDcD))[None, None, None, epi_coord]
+            return (fp8_t, col_t, tDcD_sub, m_offset, m_base, n_base, n_limit, m_limit, lane_id)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GemmDGatedFP8CLoadY1sColQuantMixin
+# ---------------------------------------------------------------------------
+#
+# Side-channel FP8 y1s + col-ISA SF quant for DGated FP8-C-load.
+# Keeps BF16 y1s path fully intact; ADDITIONALLY writes:
+#   - y1s_fp8     (Float8E4M3FN, varlen TK x I) via per-byte scatter
+#   - y1s_sf_col   ISA-pack col-axis SF
+#
+# Replaces the standalone `_colwise_quantize_and_pack_kernel(y1s)`
+# (~79 us at production T=8192 E=8) once flag-wired.
+#
+# Reference: TE cudnn `quant_sfd_col` — per-col warp_redux_sync with
+# e8m0 roundtrip, same math as BlockscaledColQuantOnlyMixin but applied
+# to DGated postact (tRS_rOut) instead of D output (tRS_rD).
+# ---------------------------------------------------------------------------
+
+
+class GemmDGatedFP8CLoadY1sColQuantMixin(GemmDGatedFP8CLoadMixin):
+    """GemmDGatedFP8CLoad + side-channel y1s FP8 + col-SF quant (additive)."""
+
+    _epi_ops = (
+        *GemmDGatedFP8CLoadMixin._epi_ops,
+        Y1sColQuantStore("mY1sColQuant"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mFP8PreAct_fp8: Optional[cute.Tensor] = None
+        mFP8PreAct_scales: Optional[cute.Tensor] = None
+        mY1sColQuant_fp8: Optional[cute.Tensor] = None
+        mY1sColQuant_col: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        # Run the parent epi_visit_subtile (FP8CLoad) to get tRS_rOut.
+        tRS_rOut = GemmDGatedFP8CLoadMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        # ── Side-channel: y1s colwise FP8 quant ──
+        y1s_info = epi_loop_tensors["mY1sColQuant"]
+        if const_expr(y1s_info is not None):
+            fp8_t, col_t, tDcD_sub, m_offset, m_base, n_base, n_limit, m_limit, lane_id = y1s_info
+            num_d = cute.size(tDcD_sub)
+
+            fp8_t_u8 = cute.recast_tensor(fp8_t, cutlass.Uint8) if const_expr(fp8_t is not None) else None
+
+            # Per-col amax + quant: group four N columns so the expensive FP8
+            # cast uses one vec4 conversion, matching TE's quant_sfd_col shape.
+            for j4 in cutlass.range(num_d // 4, unroll_full=True):
+                if const_expr(fp8_t is not None):
+                    qvals = cute.make_rmem_tensor(cute.make_layout(4), Float32)
+                e8m0s = cute.make_rmem_tensor(cute.make_layout(4), Int32)
+
+                for jj in cutlass.range(4, unroll_full=True):
+                    j = j4 * 4 + jj
+                    val = tRS_rOut[j]
+                    neg = Float32(0.0) - val
+                    abs_val = cute.arch.fmax(val, neg)
+                    amax_j = cute.arch.warp_redux_sync(abs_val, "max")
+                    amax_j = cute.arch.fmax(amax_j, Float32(1e-4))
+
+                    # Integer e8m0 for uint8 ISA SF store (must match consumer encoding).
+                    amax_bits = _f32_as_i32(amax_j)
+                    biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                    mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                    has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                    carry = Int32(1) if has_carry else Int32(0)
+                    e8m0 = biased_exp - Int32(8) + carry
+                    e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
+                    e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
+                    e8m0s[jj] = e8m0
+
+                    # Hardware-accelerated quant_scale (TE cudnn parity).
+                    # e8m0_float ≈ 2^actual_exp; scale = 256 * rcp = 2^(8-actual_exp).
+                    if const_expr(fp8_t is not None or self.postact_dtype == cutlass.Float8E4M3FN):
+                        qexp = Int32(254) - e8m0
+                        qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                        qexp = Int32(254) if qexp_hi else qexp
+                        qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                        qexp = Int32(1) if qexp_lo else qexp
+                        quant_scale = _i32_as_f32(qexp << Int32(23))
+                        if const_expr(fp8_t is not None):
+                            qvals[jj] = val * quant_scale
+                        else:
+                            tRS_rOut[j] = val * quant_scale
+
+                if const_expr(fp8_t is not None):
+                    qvals_fp8 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float8E4M3FN)
+                    qvals_fp8.store(qvals.load().to(cutlass.Float8E4M3FN))
+                    qvals_u8 = cute.recast_tensor(qvals_fp8, cutlass.Uint8)
+
+                for jj in cutlass.range(4, unroll_full=True):
+                    j = j4 * 4 + jj
+                    coord = tDcD_sub[j]
+                    row = coord[0]
+                    col = coord[1]
+                    n_abs = n_base + col
+                    m_abs = m_offset + m_base + row
+                    m_warp_base = m_abs - lane_id
+                    m_group_abs = m_warp_base // Int32(32)
+                    if const_expr(col_t is not None):
+                        col_n_tile = n_abs // Int32(128)
+                        col_row_in_tile = n_abs % Int32(128)
+                        col_k_tile_idx = m_group_abs // Int32(4)
+                        col_k_in_tile = m_group_abs % Int32(4)
+                        col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (
+                            col_row_in_tile // Int32(32)
+                        ) * Int32(4)
+                        col_inner_off = col_row_base + col_k_in_tile
+                        ok_c = (
+                            cutlass.Boolean(n_abs < n_limit)
+                            & cutlass.Boolean(m_warp_base < m_limit)
+                            & cutlass.Boolean(lane_id == Int32(0))
+                        )
+                        if ok_c:
+                            col_t[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0s[jj])
+
+                    if const_expr(fp8_t is not None):
+                        ok_m = cutlass.Boolean(m_abs < m_limit)
+                        if ok_m:
+                            fp8_t_u8[m_abs, n_abs] = qvals_u8[jj]
+
+            for j_tail in cutlass.range(num_d - (num_d % 4), num_d, unroll_full=True):
+                val = tRS_rOut[j_tail]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax_j = cute.arch.warp_redux_sync(abs_val, "max")
+                amax_j = cute.arch.fmax(amax_j, Float32(1e-4))
+                amax_bits = _f32_as_i32(amax_j)
+                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                carry = Int32(1) if has_carry else Int32(0)
+                e8m0 = biased_exp - Int32(8) + carry
+                e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
+                e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
+                val_scaled = val
+                if const_expr(fp8_t is not None or self.postact_dtype == cutlass.Float8E4M3FN):
+                    qexp = Int32(254) - e8m0
+                    qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                    qexp = Int32(254) if qexp_hi else qexp
+                    qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                    qexp = Int32(1) if qexp_lo else qexp
+                    quant_scale = _i32_as_f32(qexp << Int32(23))
+                    val_scaled = val * quant_scale
+                    if const_expr(fp8_t is None):
+                        tRS_rOut[j_tail] = val_scaled
+                coord = tDcD_sub[j_tail]
+                row = coord[0]
+                col = coord[1]
+                n_abs = n_base + col
+                m_abs = m_offset + m_base + row
+                m_warp_base = m_abs - lane_id
+                m_group_abs = m_warp_base // Int32(32)
+                if const_expr(col_t is not None):
+                    col_n_tile = n_abs // Int32(128)
+                    col_row_in_tile = n_abs % Int32(128)
+                    col_k_tile_idx = m_group_abs // Int32(4)
+                    col_k_in_tile = m_group_abs % Int32(4)
+                    col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (
+                        col_row_in_tile // Int32(32)
+                    ) * Int32(4)
+                    col_inner_off = col_row_base + col_k_in_tile
+                    ok_c = (
+                        cutlass.Boolean(n_abs < n_limit)
+                        & cutlass.Boolean(m_warp_base < m_limit)
+                        & cutlass.Boolean(lane_id == Int32(0))
+                    )
+                    if ok_c:
+                        col_t[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0)
+                if const_expr(fp8_t is not None):
+                    ok_m = cutlass.Boolean(m_abs < m_limit)
+                    if ok_m:
+                        r4 = cute.make_rmem_tensor(cute.make_layout(4), Float32)
+                        r4[0] = val_scaled
+                        r4_fp8 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float8E4M3FN)
+                        r4_fp8.store(r4.load().to(cutlass.Float8E4M3FN))
+                        r4_u8 = cute.recast_tensor(r4_fp8, cutlass.Uint8)
+                        fp8_t_u8[m_abs, n_abs] = r4_u8[0]
+
         return tRS_rOut
