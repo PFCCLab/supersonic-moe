@@ -61,7 +61,7 @@ class SonicMoEConfig:
         fused_gated: Use fused gemm_gated/dgated CUTLASS kernels.
             Env: ``SONIC_MOE_FP8_FUSED_GATED``. Default: True.
         save_z_fp8: Save z tensor in FP8 to reduce memory.
-            Env: ``SONIC_MOE_FP8_SAVE_Z_FP8``. Default: True.
+            Env: ``SONIC_MOE_FP8_SAVE_Z_FP8``. Default: False (precision first).
         fused_swiglu_quant: Use fused SwiGLU+quantize kernels.
             Env: ``SONIC_MOE_FP8_FUSED_SWIGLU_QUANT``. Default: True.
         epilogue_quant: Enable epilogue blockscaled quant of z.
@@ -123,19 +123,20 @@ class SonicMoEConfig:
     def resolve_save_z_fp8(self) -> bool:
         if self.save_z_fp8 is not None:
             return self.save_z_fp8
-        return _env_bool("SONIC_MOE_FP8_SAVE_Z_FP8", True) or False
+        return _env_bool("SONIC_MOE_FP8_SAVE_Z_FP8", False) or False
 
     def resolve_recompute_z(self) -> bool:
-        """Recompute z_fp8 in DownProj backward (skip storing in forward).
+        """Recompute z in DownProj backward (skip storing in forward).
 
-        When True, ``_UpProjection.forward`` does NOT populate the
-        ``z_fp8`` prequant cache and ``_DownProjection.forward`` saves a
-        recompute closure to ctx instead of the fp8 z tensor.  Backward
-        re-runs the up-proj GEMM (gather-A + epilogue blockscaled fp8
-        quant) just-in-time and discards the recomputed y1 (SwiGLU /
+        When True, ``_UpProjection.forward`` does NOT populate the z prequant
+        cache and ``_DownProjection.forward`` saves a recompute closure to ctx
+        instead of the z tensor.  Backward re-runs the up-proj GEMM (gather-A
+        + epilogue) just-in-time and discards the recomputed y1 (SwiGLU /
         PostAct write are wasted, ~5-15% of an up-proj fwd cost).
-        Saves ~213 MiB peak (fp8 z) per active layer at ERNIE shape.
-        Implies save_z_fp8=True semantically.
+
+        Precision-first: the recompute emits BF16 z (no z quant) by default;
+        it only emits FP8 z when ``save_z_fp8`` is explicitly enabled.  This is
+        now independent of ``save_z_fp8`` (no longer implies it).
         """
         if self.recompute_z is not None:
             return self.recompute_z
