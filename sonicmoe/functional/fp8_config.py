@@ -77,11 +77,11 @@ def _use_fp8_wgrad() -> bool | None:
 
 
 def _save_z_fp8() -> bool:
-    """Check if z tensor should be stored in FP8 format to save memory (default: enabled)."""
+    """Check if z tensor should be stored in FP8 format to save memory (default: DISABLED)."""
     cfg = get_active_config()
     if cfg is not None and cfg.save_z_fp8 is not None:
         return cfg.save_z_fp8
-    return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "1").lower() in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _recompute_z() -> bool:

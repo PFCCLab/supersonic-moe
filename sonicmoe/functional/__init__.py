@@ -215,7 +215,10 @@ from ..quack_utils.blockscaled_fp8_gemm import (
     quantize_and_pack_activation,
 )
 from ..quack_utils.fused_quant_kernels import fused_dual_colwise_quantize
-from ..quack_utils.gemm_sm100_fp8_zeromat import blockscaled_fp8_gemm_zeromat_quant
+from ..quack_utils.gemm_sm100_fp8_zeromat import (
+    blockscaled_fp8_gemm_zeromat_bf16,
+    blockscaled_fp8_gemm_zeromat_quant,
+)
 
 
 def _swiglu_forward_interleaved(z: torch.Tensor) -> torch.Tensor:
@@ -382,6 +385,54 @@ def _recompute_z_fp8(
         b_scales=w1_scales,
     )
     return z_fp8, z_raw_scales.view(_E8M0_DTYPE)
+
+
+def _recompute_z_bf16(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
+    x_gather_idx: torch.Tensor,
+    x_fp8_pre: torch.Tensor | None = None,
+    x_scales_pre: torch.Tensor | None = None,
+    w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Re-run up-proj to materialize z in BF16 for backward (no z quant).
+
+    Precision-preserving counterpart of ``_recompute_z_fp8``: identical FP8 GEMM
+    accumulation (``blockscaled_fp8_gemm_zeromat_bf16``) but a BF16 D output, so z
+    is never quantized.  Used as the default recompute path when ``save_z_fp8`` is
+    disabled (precision first).
+    """
+    if w1_fp8_pre is None:
+        raise RuntimeError("Sonic FP8 recompute requires explicit w1_fused payload")
+    w1_fp8, w1_scales = w1_fp8_pre
+
+    if x_fp8_pre is not None or x_scales_pre is not None:
+        if x_fp8_pre is None or x_scales_pre is None:
+            raise ValueError("x_fp8_pre and x_scales_pre must be provided together")
+        x_fp8 = x_fp8_pre
+        x_scales_t = x_scales_pre
+        _PREQUANT_HIT_COUNT["activation_recompute"] += 1
+    else:
+        if x is None:
+            raise ValueError("BF16 x is required when no prequant activation payload is provided")
+        x_fp8, x_scales_t = quantize_and_pack_activation(x)
+    TK = x_gather_idx.shape[0]
+    K = x_fp8.shape[1]
+    x_scales_tk_e8m0 = _gather_1x32_scales_to_isa(
+        x_scales_t, x_gather_idx, int(x_fp8.shape[0]), K
+    )
+    del x_scales_t
+
+    z = blockscaled_fp8_gemm_zeromat_bf16(
+        x_fp8,
+        w1_fp8.mT,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        a_scales=x_scales_tk_e8m0,
+        b_scales=w1_scales,
+    )
+    return z
 
 
 # ---------------------------------------------------------------------------
@@ -591,15 +642,17 @@ def _use_fp8_wgrad() -> bool | None:
 
 
 def _save_z_fp8() -> bool:
-    """Check if z tensor should be stored in FP8 format to save memory (default: enabled).
+    """Check if z tensor should be stored in FP8 format to save memory (default: DISABLED).
 
     When enabled, z(TK, 2I) is quantized to blockscaled FP8 at end of forward
     and dequantized at start of backward, saving ~50% of z's memory footprint.
+    Default is OFF (precision first): z stays BF16 end-to-end and is never
+    quantized — the dgated backward kernel consumes z as a BF16 epilogue preact.
     """
     cfg = get_active_config()
     if cfg is not None and cfg.save_z_fp8 is not None:
         return cfg.save_z_fp8
-    return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "1").lower() in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _recompute_z() -> bool:
@@ -1130,14 +1183,19 @@ class _UpProjection(torch.autograd.Function):
                         x, w1, expert_frequency_offset, x_gather_idx,
                         w1_fp8_pre=w1_fused_payload,
                         x_fp8_pre=x_fp8_pre, x_scales_pre=x_scales_pre,
-                        store_z=not (cfg.save_z_fp8 and cfg.recompute_z),
+                        store_z=not cfg.recompute_z,
                     )
-                    if cfg.save_z_fp8 and cfg.recompute_z:
-                        # Forward skips preact storage; z_fp8 is materialized just-in-time
+                    if cfg.recompute_z:
+                        # Forward skips preact storage; z is materialized just-in-time
                         # in DownProj.backward from the recompute args stashed here.
+                        # Precision-first: recompute z in BF16 (no z quant) by default;
+                        # only emit FP8 when save_z_fp8 is explicitly opted in.
                         _PREQUANTIZED_SCALES.pop("z_fp8", None)
                         x_recompute = None if x_fp8_pre is not None else x
-                        _PREQUANTIZED_SCALES["z_fp8_recompute"] = (
+                        recompute_key = (
+                            "z_fp8_recompute" if cfg.save_z_fp8 else "z_bf16_recompute"
+                        )
+                        _PREQUANTIZED_SCALES[recompute_key] = (
                             x_recompute, w1, expert_frequency_offset, x_gather_idx,
                             x_fp8_pre, x_scales_pre, w1_fused_payload,
                         )
@@ -1835,6 +1893,12 @@ class _DownProjection(torch.autograd.Function):
         # (e.g. epilogue quant produced them), even if z.dtype is no longer bf16.
         z_has_prequant = "z_fp8" in _PREQUANTIZED_SCALES
         z_has_recompute = "z_fp8_recompute" in _PREQUANTIZED_SCALES
+        # BF16 recompute (precision-first default): forward stored only a zero-storage
+        # bf16 z placeholder; backward re-runs the up-proj GEMM with a BF16 D output so
+        # z is never quantized.  Independent of save_z_fp8 / the fp8 recompute path.
+        z_bf16_recompute_args = _PREQUANTIZED_SCALES.pop("z_bf16_recompute", None)
+        ctx._needs_z_recompute_bf16 = z_bf16_recompute_args is not None
+        ctx._z_bf16_recompute_args = z_bf16_recompute_args
         z_is_fp8 = (cfg.enabled and use_quack_gemm and cfg.save_z_fp8
                     and cfg.alignment_assumed
                     and (z.dtype == torch.bfloat16 or z_has_prequant or z_has_recompute))
@@ -2005,6 +2069,11 @@ class _DownProjection(torch.autograd.Function):
             w2_dtype = w2.dtype
             w2_device = w2.device
             z_fp8 = z_raw_scales_u8 = None
+            if getattr(ctx, "_needs_z_recompute_bf16", False):
+                # Replace the zero-storage bf16 placeholder with a freshly recomputed
+                # BF16 z (no z quant); feeds the bf16-preact path of gemm_dgated.
+                z = _recompute_z_bf16(*ctx._z_bf16_recompute_args)
+                ctx._z_bf16_recompute_args = None
 
         # Defer dw2 allocation: in the fused_gated path, dw2 is not needed
         # until the wgrad GEMM (~384 MiB after dgated outputs dz+y1s).
