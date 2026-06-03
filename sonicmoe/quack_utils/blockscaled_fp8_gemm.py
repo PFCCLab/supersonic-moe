@@ -2197,10 +2197,9 @@ def _dual_varlen_quantize_kernel(
     src_ptrs = src_ptr + tk_offs[:, None].to(tl.int64) * src_stride_row + dim_offs[None, :].to(tl.int64) * src_stride_col
     values = tl.load(src_ptrs, mask=mask_2d, other=0.0).to(tl.float32)  # (32, 128)
 
-    # ── Col-major quantize: groups of 32 along TK ──
-    # For each of the 128 dim elements, find amax across 32 TK rows
-    values_t = tl.trans(values)   # (128, 32)
-    col_amax = tl.max(tl.abs(values_t), axis=1)  # (128,)
+    # ── Col-major quantize: groups of 32 along TK (amax over the 32 TK rows) ──
+    # No transpose: reduce over axis=0 (TK rows) directly.
+    col_amax = tl.max(tl.abs(values), axis=0)  # (128,)
     col_bits = col_amax.to(tl.int32, bitcast=True)
     col_bexp = (col_bits >> 23) & 0xFF
     col_mant = col_bits & 0x7FFFFF
@@ -2209,12 +2208,11 @@ def _dual_varlen_quantize_kernel(
     col_e8m0 = tl.maximum(col_e8m0, 0).to(tl.uint8)
     col_qexp = tl.maximum(tl.minimum(254 - col_e8m0.to(tl.int32), 254), 1)
     col_qscale = (col_qexp << 23).to(tl.float32, bitcast=True)
-    col_fp8 = (values_t * col_qscale[:, None]).to(tl.float8e4nv)  # (128, 32)
+    col_fp8 = (values * col_qscale[None, :]).to(tl.float8e4nv)  # (32, 128)
 
-    # Write col fp8: same physical (TK, dim) layout, just different quant
-    col_fp8_t = tl.trans(col_fp8)  # (32, 128) — back to (TK, dim) order
+    # Write col fp8: same physical (TK, dim) layout (no transpose back)
     col_out_ptrs = col_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + dim_offs[None, :].to(tl.int64)
-    tl.store(col_out_ptrs, col_fp8_t, mask=mask_2d)
+    tl.store(col_out_ptrs, col_fp8, mask=mask_2d)
 
     # Write col ISA scales (dim rows, TK cols in logical layout)
     GROUPS_PER_K: tl.constexpr = SF_TILE_K // GROUP_SIZE
@@ -2228,39 +2226,33 @@ def _dual_varlen_quantize_kernel(
     tl.store(col_scales_ptr + col_isa_offs.to(tl.int64), col_e8m0, mask=dim_mask)
 
     # ── Row-major quantize: groups of 32 along dim ──
-    # Process 4 groups of 32 within the 128-dim block.
-    # Re-reads from source (L2 cache hot from the initial load above).
+    # Reuse the already-loaded `values` (32,128) registers — no re-read, no loop.
+    # Reshape (32, 128) -> (32, 4, 32): [tk, g, j] = values[tk, g*32 + j].
     GROUPS_PER_DIM: tl.constexpr = BLOCK_DIM // GROUP_SIZE  # 4
     row_row_tiles = tk_offs // SF_TILE_M
     row_row_in_tile = tk_offs % SF_TILE_M
     row_row_base = (row_row_in_tile % 32) * 16 + (row_row_in_tile // 32) * 4
 
-    packed_i32 = tl.zeros([GROUP_SIZE], dtype=tl.int32)
+    vr = tl.reshape(values, (GROUP_SIZE, GROUPS_PER_DIM, GROUP_SIZE))  # (32,4,32)
+    row_amax = tl.max(tl.abs(vr), axis=2)  # (32,4)
+    row_bits = row_amax.to(tl.int32, bitcast=True)
+    row_bexp = (row_bits >> 23) & 0xFF
+    row_mant = row_bits & 0x7FFFFF
+    row_carry = tl.where(row_mant > 0x600000, 1, 0)
+    row_e8m0 = tl.where(row_bexp > 0, row_bexp - 8 + row_carry, 0)
+    row_e8m0 = tl.maximum(row_e8m0, 0)  # (32,4) int32
+    row_qexp = tl.maximum(tl.minimum(254 - row_e8m0, 254), 1)
+    row_qscale = (row_qexp << 23).to(tl.float32, bitcast=True)  # (32,4)
+    row_fp8 = (vr * row_qscale[:, :, None]).to(tl.float8e4nv)   # (32,4,32)
+    row_fp8 = tl.reshape(row_fp8, (GROUP_SIZE, BLOCK_DIM))      # (32,128)
 
-    for g in tl.range(0, GROUPS_PER_DIM):
-        g_dim_offs = pid_dim_block * BLOCK_DIM + g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        g_mask = tk_mask[:, None] & (g_dim_offs[None, :] < dim)
-        g_ptrs = src_ptr + tk_offs[:, None].to(tl.int64) * src_stride_row + g_dim_offs[None, :].to(tl.int64) * src_stride_col
-        g_vals = tl.load(g_ptrs, mask=g_mask, other=0.0).to(tl.float32)
+    # Write row fp8: full (32,128) block at once
+    row_out_ptrs = row_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + dim_offs[None, :].to(tl.int64)
+    tl.store(row_out_ptrs, row_fp8, mask=mask_2d)
 
-        # E8M0 quant per TK row (amax over 32 dim cols)
-        row_amax = tl.max(tl.abs(g_vals), axis=1)  # (32,)
-        row_bits = row_amax.to(tl.int32, bitcast=True)
-        row_bexp = (row_bits >> 23) & 0xFF
-        row_mant = row_bits & 0x7FFFFF
-        row_carry = tl.where(row_mant > 0x600000, 1, 0)
-        row_e8m0 = tl.where(row_bexp > 0, row_bexp - 8 + row_carry, 0)
-        row_e8m0 = tl.maximum(row_e8m0, 0)
-        row_qexp = tl.maximum(tl.minimum(254 - row_e8m0, 254), 1)
-        row_qscale = (row_qexp << 23).to(tl.float32, bitcast=True)
-        row_fp8_g = (g_vals * row_qscale[:, None]).to(tl.float8e4nv)
-
-        # Write row fp8
-        row_out_ptrs = row_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + g_dim_offs[None, :].to(tl.int64)
-        tl.store(row_out_ptrs, row_fp8_g, mask=g_mask)
-
-        # Pack ISA scale byte
-        packed_i32 = packed_i32 | ((row_e8m0 & 0xFF) << (g * 8))
+    # Pack the 4 e8m0 bytes per TK row into a uint32 (disjoint byte positions => sum == OR)
+    shifts = tl.arange(0, GROUPS_PER_DIM) * 8  # (4,)
+    packed_i32 = tl.sum((row_e8m0 & 0xFF) << shifts[None, :], axis=1)  # (32,)
 
     # Write row ISA packed scales as uint32
     row_tile_base = (row_row_tiles * row_k_tiles + pid_dim_block) * SF_TILE_STORAGE
@@ -2319,7 +2311,8 @@ def dual_quantize_varlen(
     col_k_tiles = _div_up(TK, _SF_TILE_K)
 
     grid = (_div_up(TK, GROUP_SIZE), _div_up(dim, BLOCK_DIM))
-    # NCU-guided: num_warps=1 gives 2× speedup (157µs vs 314µs at TK=65536).
+    # NCU-guided: num_warps=1 optimal (single-pass read; 2/4/8 fragment the
+    # (32,128)/32-group tile and regress). Real dz (262144,1536): 389.63us ncu.
     _dual_varlen_quantize_kernel[grid](
         src,
         row_fp8, row_scales,
