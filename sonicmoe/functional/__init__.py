@@ -910,7 +910,7 @@ class _FP8Config:
             self.dz_iso32 = active_cfg.resolve_dz_iso32()
         else:
             self.iso32_weight = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
-            self.dz_iso32 = os.environ.get("SONIC_MOE_DZ_ISO32", "1") != "0"
+            self.dz_iso32 = os.environ.get("SONIC_MOE_DZ_ISO32", "0") != "0"
 
     # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
     # Session 53 re-benchmarked after cache fix + stash:
@@ -2383,7 +2383,7 @@ class _DownProjection(torch.autograd.Function):
                             )
                         else:
                             if dout_has_comm_fp8_payload:
-                                if os.environ.get("SONIC_MOE_DZ_ISO32", "1") != "0":
+                                if os.environ.get("SONIC_MOE_DZ_ISO32", "0") != "0":
                                     dz_fp8, dz_packed_scales, dz_col_scales = iso32_dual_quantize_varlen(
                                         dz, TK_wgrad, dz.shape[1]
                                     )
