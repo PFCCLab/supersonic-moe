@@ -245,7 +245,8 @@ def _fused_blockscaled_gated_forward(
     x_fp8_pre: torch.Tensor | None = None,
     x_scales_pre: torch.Tensor | None = None,
     store_z: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    fuse_y1_quant: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
     Zero-materialization path (SonicMoE design principle):
@@ -298,6 +299,28 @@ def _fused_blockscaled_gated_forward(
     else:
         z_scale_out = None
 
+    # y1 postact-quant fusion: write y1 (=SwiGLU(z)) directly as FP8 + ISA scales
+    # in the up-proj epilogue (GemmGatedSm100ZeroMatPostActQuant).  Mutually
+    # exclusive with z epilogue quant.  Precision-first: z stays bf16.
+    fuse_y1 = fuse_y1_quant and not epilogue_quant
+    if fuse_y1_quant and epilogue_quant:
+        raise RuntimeError(
+            "SONIC_MOE_FUSE_Y1_QUANT (y1 postact epilogue quant) is mutually "
+            "exclusive with z epilogue quant (save_z_fp8); disable one"
+        )
+    if fuse_y1:
+        I_dim = w1.shape[0] // 2  # w1 is (2I, H, E) -> N=2I, postact y1 has I cols
+        assert TK % 128 == 0 and I_dim % 128 == 0, (
+            f"fuse_y1_quant requires TK ({TK}) and I ({I_dim}) be multiples of 128 "
+            "for the ISA-packed scale layout"
+        )
+        postact_scale_out = torch.empty(
+            (TK // 128, I_dim // 128, 512), dtype=torch.uint8, device=x.device
+        )
+        postact_dtype = torch.float8_e4m3fn
+    else:
+        postact_scale_out = None
+        postact_dtype = torch.bfloat16
     # CUTLASS fp8 D output: writes z directly as fp8, epilogue computes
     # blockscaled e8m0 scales in registers.  Eliminates standalone z quant
     # kernel (~141µs) and halves D write bandwidth (192MB fp8 vs 384MB bf16).
@@ -311,7 +334,7 @@ def _fused_blockscaled_gated_forward(
         x_fp8, w1_fp8,
         activation="swiglu",
         out_dtype=z_out_dtype,
-        postact_dtype=torch.bfloat16,
+        postact_dtype=postact_dtype,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
@@ -320,6 +343,7 @@ def _fused_blockscaled_gated_forward(
         dynamic_scheduler=False,
         tuned=False,
         z_scale_out=z_scale_out,
+        postact_scale_out=postact_scale_out,
     )
     del x_fp8, x_scales_tk_e8m0
 
@@ -342,7 +366,21 @@ def _fused_blockscaled_gated_forward(
             (TK, w1.shape[0]), (0, 0)
         )
 
-    return z, y1
+    # y1 fusion: y1 is FP8 from the epilogue.  Hand back the fp8 data + ISA
+    # scales explicitly, replace the graph node with a lightweight bf16
+    # placeholder (freed storage); the bf16 y1 values are consumed ONLY by the
+    # (now-eliminated) standalone quant — DownProjection backward recomputes y1
+    # from z, never reading these values.
+    y1_fp8_fused = None
+    y1_scales_fused = None
+    if fuse_y1:
+        y1_fp8_fused = y1
+        y1_scales_fused = postact_scale_out.reshape(1, -1).view(_E8M0_DTYPE)
+        y1 = torch.empty(1, dtype=torch.bfloat16, device=y1_fp8_fused.device).as_strided(
+            (TK, w1.shape[0] // 2), (0, 0)
+        )
+
+    return z, y1, y1_fp8_fused, y1_scales_fused
 
 
 def _recompute_z_fp8(
@@ -531,10 +569,11 @@ def _padded_blockscaled_gated_forward(
         expert_frequency_offset, TK
     )
     if not needs_pad:
-        return _fused_blockscaled_gated_forward(
+        z, y1, _, _ = _fused_blockscaled_gated_forward(
             x, w1, expert_frequency_offset, x_gather_idx,
             w1_fp8_pre=w1_fp8_pre,
         )
+        return z, y1
 
     # Step 1: Quantize at T-size (same as aligned path — no padding here)
     x_fp8, x_scales_t = quantize_and_pack_activation(x)
@@ -621,6 +660,21 @@ def _use_fused_zy1_quant() -> bool:
     if cfg is not None and cfg.fused_zy1_quant is not None:
         return cfg.fused_zy1_quant
     return os.getenv("SONIC_MOE_FP8_FUSED_ZY1_QUANT", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _use_fuse_y1_quant() -> bool:
+    """Fuse y1 (=SwiGLU(z)) FP8 quant into the up-proj GEMM epilogue (default OFF).
+
+    When enabled, the up-proj GemmGatedSm100ZeroMatPostActQuant kernel writes y1
+    directly as FP8 + ISA-packed UE8M0 scales, eliminating the standalone
+    quantize_and_pack_activation(y1) kernel (~138us) and the bf16 y1 HBM
+    materialization (~814 MiB).  Mutually exclusive with z epilogue quant
+    (save_z_fp8); precision-first — z stays bf16.
+    """
+    cfg = get_active_config()
+    if cfg is not None and getattr(cfg, "fuse_y1_quant", None) is not None:
+        return cfg.fuse_y1_quant
+    return os.getenv("SONIC_MOE_FUSE_Y1_QUANT", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fp8_wgrad() -> bool | None:
@@ -1179,11 +1233,13 @@ class _UpProjection(torch.autograd.Function):
                     if prequant_activation_payload is not None:
                         x_fp8_pre, x_scales_pre = prequant_activation_payload
                     w1_fused_payload = fp8_weight_payload["w1_fused"]
-                    z, y1 = _fused_blockscaled_gated_forward(
+                    fuse_y1 = _use_fuse_y1_quant() and not cfg.save_z_fp8
+                    z, y1, y1_fp8_fused, y1_scales_fused = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx,
                         w1_fp8_pre=w1_fused_payload,
                         x_fp8_pre=x_fp8_pre, x_scales_pre=x_scales_pre,
                         store_z=not cfg.recompute_z,
+                        fuse_y1_quant=fuse_y1,
                     )
                     if cfg.recompute_z:
                         # Forward skips preact storage; z is materialized just-in-time
@@ -1199,7 +1255,10 @@ class _UpProjection(torch.autograd.Function):
                             x_recompute, w1, expert_frequency_offset, x_gather_idx,
                             x_fp8_pre, x_scales_pre, w1_fused_payload,
                         )
-                        y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                        if y1_fp8_fused is not None:
+                            y1_fp8, y1_packed_scales = y1_fp8_fused, y1_scales_fused
+                        else:
+                            y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     elif cfg.save_z_fp8 and "z_fp8" not in _PREQUANTIZED_SCALES:
                         if _use_fused_zy1_quant():
                             # Fused z+y1 quantization: single kernel launch, ~3µs
@@ -1223,8 +1282,16 @@ class _UpProjection(torch.autograd.Function):
                         # _fused_blockscaled_gated_forward.  z is a bf16 placeholder
                         # with freed storage (for autograd graph only).
                         # No resize needed — storage is already 0.
-                        y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                        if y1_fp8_fused is not None:
+                            y1_fp8, y1_packed_scales = y1_fp8_fused, y1_scales_fused
+                        else:
+                            y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
+                    if y1_fp8_fused is not None:
+                        # Fused y1: bf16 y1 is a freed-storage placeholder.  The
+                        # DownProjection MUST hit this prequant entry — quantizing
+                        # the placeholder would yield garbage.  Mark it required.
+                        _PREQUANTIZED_SCALES["fwd_required"] = True
                     # y1.untyped_storage().resize_(0)
                 elif aligned:
                     w1_fp8, w1_scales = precompute_weight_fp8(w1)
@@ -1756,6 +1823,7 @@ class _DownProjection(torch.autograd.Function):
                     # (zero quant overhead — y1 was quantized while hot in L2).
                     # Format: 3-tuple (bf16_ref, fp8_data, packed_scales).
                     prequant = _PREQUANTIZED_SCALES.pop("fwd", None)
+                    fwd_required = _PREQUANTIZED_SCALES.pop("fwd_required", False)
                     has_prequant = (
                         prequant is not None
                         and len(prequant) == 3
@@ -1774,6 +1842,22 @@ class _DownProjection(torch.autograd.Function):
                         )
                         del y1_fp8, y1_packed_scales
                     else:
+                        if fwd_required:
+                            # Fused y1-quant mode: bf16 y1 is a freed-storage
+                            # placeholder; quantizing it would yield garbage.
+                            # A miss here is a hard bug, never a fallback.
+                            raise RuntimeError(
+                                "Fused y1-quant prequant MISS in DownProjection "
+                                f"(fwd_required set): y1 meta dtype={y1.dtype} "
+                                f"shape={tuple(y1.shape)} stride={tuple(y1.stride())} "
+                                f"data_ptr={y1.data_ptr()}; prequant="
+                                f"{'None' if prequant is None else 'present'}. "
+                                "The up-proj epilogue y1_fp8 must be consumed here."
+                            )
+                        assert y1.stride() != (0, 0), (
+                            "y1 has zero-stride (freed-storage placeholder) but no "
+                            "prequant entry — refusing to quantize garbage"
+                        )
                         # Fallback: inline FP8 quant (prequant cache miss)
                         w2_fp8, w2_scales = fp8_weight_payload["w2_varlen"]
                         y1_fp8, y1_scales = quantize_and_pack_activation(y1)

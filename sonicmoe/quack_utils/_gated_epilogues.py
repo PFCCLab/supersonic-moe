@@ -6,6 +6,7 @@
 # .gemm_sm100_fp8_zeromat, or .blockscaled_fp8_gemm.
 # ********************************************************************************
 
+import os
 from typing import Callable, NamedTuple, Optional, Tuple
 
 import cutlass
@@ -66,12 +67,75 @@ def _halve_epi_tile(gemm, epi_tile):
     return (epi_tile[0], epi_tile[1] // 2)
 
 
+def _gated_epi_tile_n_target() -> int:
+    """Target epilogue subtile N for the forward gated up-proj GEMM.
+
+    The cutlass default (compute_epilogue_tile_shape) picks epi_tile_n=32 for the
+    bf16-D / cta=256x256 grouped up-proj, which is suboptimal: this GEMM is
+    compute-bound (SM ~66%, DRAM ~22%) and a wider epilogue subtile cuts epilogue
+    iteration count.  ncu (base clock, real Qwen3 shape TK=262144,N=2048) shows
+    epi_tile_n=64 is the optimum: 1323->1246 us (-5.8%), SM 65.8->69.4%,
+    bit-identical output vs n=32 (z/y1 max_abs_diff=0).  64 also makes the gated
+    postact (half-N) subtile a full 32-element 1x32 scale group, enabling fused
+    postact FP8 quant.  Set to 0 to disable (use cutlass default).
+    """
+    return int(os.getenv("SONIC_MOE_GATED_EPI_TILE_N", "64"))
+
+
+def _make_forced_epi_tile_fn(orig_fn, target_n: int):
+    """Wrap compute_epilogue_tile_shape to raise epi_tile_n to ``target_n``.
+
+    Only raises (never lowers) the N subtile, caps at cta_n, and preserves the
+    cutlass warp-layout stride structure so smem/TMA partitioning is unchanged.
+    """
+
+    def _forced(cta_tile_shape, use_2cta_instrs, layout_d, elem_ty_d,
+                *, layout_c=None, elem_ty_c=None, loc=None, ip=None):
+        tile_m_layout, tile_n_layout = orig_fn(
+            cta_tile_shape, use_2cta_instrs, layout_d, elem_ty_d,
+            layout_c=layout_c, elem_ty_c=elem_ty_c, loc=loc, ip=ip,
+        )
+        cta_m, cta_n = cta_tile_shape[:2]
+        (warp_m, warp_n) = (2, 2) if (cta_m == 64 and use_2cta_instrs) else (4, 1)
+        cur_n = cute.size(tile_n_layout)
+        new_n = min(int(cta_n), max(int(cur_n), int(target_n)))
+        # keep N a multiple of warp_n and even (gated halves the N tile)
+        if new_n <= cur_n or (new_n % warp_n) != 0 or (new_n % 2) != 0:
+            return (tile_m_layout, tile_n_layout)
+        tile_n_layout_new = cute.make_layout(
+            (new_n // warp_n, warp_n), stride=(1, cta_n // warp_n), loc=loc, ip=ip
+        )
+        return (tile_m_layout, cute.coalesce(tile_n_layout_new, loc=loc, ip=ip))
+
+    return _forced
+
+
 # ---------------------------------------------------------------------------
 # GemmGatedMixin (from gemm_gated.py)
 # ---------------------------------------------------------------------------
 
 class GemmGatedMixin(GemmActMixin):
     _epi_ops = (*GemmActMixin._epi_ops[:-1], TileStore("mPostAct", epi_tile_fn=_halve_epi_tile))
+
+    def _setup_attributes(self, epilogue_args, varlen_args):
+        """Raise the epilogue subtile N for the (compute-bound) gated up-proj.
+
+        ncu-validated: epi_tile_n=64 is the optimum for the bf16-D grouped up-proj
+        (vs cutlass-default 32), -5.8% kernel time, bit-identical output.  We
+        temporarily wrap compute_epilogue_tile_shape during the base setup (epi_tile
+        is consumed by _compute_stages inside it, so post-fixing is too late).
+        Forward gated only — dgated uses a different mixin and is unaffected.
+        """
+        target_n = _gated_epi_tile_n_target()
+        if target_n <= 0:
+            super()._setup_attributes(epilogue_args, varlen_args)
+            return
+        orig_fn = sm100_utils.compute_epilogue_tile_shape
+        sm100_utils.compute_epilogue_tile_shape = _make_forced_epi_tile_fn(orig_fn, target_n)
+        try:
+            super()._setup_attributes(epilogue_args, varlen_args)
+        finally:
+            sm100_utils.compute_epilogue_tile_shape = orig_fn
 
     def epi_setup_postact(
         self,
@@ -304,6 +368,8 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
         return tRS_rPostAct
 
 
+
+
 # ---------------------------------------------------------------------------
 # BlockscaledQuantOnlyMixin (from gemm_gated.py)
 # ---------------------------------------------------------------------------
@@ -464,6 +530,137 @@ class BlockscaledIsaRowScaleStore(EpiOp):
                 n_sub = epi_coord
             return (param, m_abs, n_base + n_sub, m_limit, n_group_limit)
         return None
+
+
+class BlockscaledIsaPostActScaleStore(BlockscaledIsaRowScaleStore):
+    """EpiOp: writes UE8M0 postact (y1) scale bytes into ISA-pack layout.
+
+    Identical ISA-pack offset math to `BlockscaledIsaRowScaleStore`, but the
+    N-group base is computed over the *postact* feature axis (N//2, the SwiGLU
+    output width) rather than the full GEMM-N (z) axis.  With epi_tile_n(z)=64
+    each epi subtile produces exactly one 1x32 postact group, so the z-subtile
+    index (epi_coord N-sub) maps 1:1 to a postact group.
+    """
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            postact_tile_N = tile_N // 2
+            m_in_tile = ctx.tidx % tile_M
+            if const_expr(ctx.varlen_manager.varlen_m):
+                batch_start = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_abs = batch_start + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3] + Int32(1)]
+            else:
+                m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+                m_limit = param.shape[0] * Int32(128)
+            n_base = ctx.tile_coord_mnkl[1] * (postact_tile_N // 32)
+            n_group_limit = param.shape[1] * Int32(4)
+            return (param, m_abs, n_base, m_limit, n_group_limit)
+        return None
+
+
+
+# ---------------------------------------------------------------------------
+# GemmGatedPostActIsaQuantMixin (Session 10: y1 postact-quant fusion)
+# ---------------------------------------------------------------------------
+
+class GemmGatedPostActIsaQuantMixin(GemmGatedMixin):
+    """GemmGated + epilogue blockscaled FP8 quant of the *postact* (y1=SwiGLU(z)).
+
+    Fuses the standalone `quantize_and_pack_activation(y1)` into the up-proj
+    epilogue: after computing tRS_rPostAct (SwiGLU of z), it amax-reduces the
+    postact register fragment, derives the integer+carry E8M0 scale (identical
+    arithmetic to the proven z-quant path), multiplies the postact registers,
+    and writes the UE8M0 byte into the ISA-pack scale buffer.  The fp32->fp8
+    saturating cast happens in epi_convert_postact at TMA store time.
+
+    REQUIRES epi_tile_n(z)=64 so that each epi subtile's postact fragment is
+    exactly one 1x32 group (one m-row x 32 postact-cols).  The default
+    GemmGatedMixin._setup_attributes override forces epi_tile_n=64.
+    """
+    _epi_ops = (
+        *GemmGatedMixin._epi_ops,
+        BlockscaledIsaPostActScaleStore("mPostActScaleIsa"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mPostActScaleIsa: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        tRS_rPostAct = GemmGatedMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        _pa_scale_active = epi_loop_tensors["mPostActScaleIsa"]
+        if const_expr(_pa_scale_active is not None):
+            num_pa = cute.size(tRS_rPostAct)
+
+            # Step 1: amax over the postact register fragment (one 1x32 group).
+            amax = Float32(0.0)
+            for i in cutlass.range(num_pa, unroll_full=True):
+                val = tRS_rPostAct[i]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax = cute.arch.fmax(amax, abs_val)
+            amax = cute.arch.fmax(amax, Float32(1e-4))
+
+            # Step 2: integer+carry E8M0 (matches Triton reference).
+            amax_bits = _f32_as_i32(amax)
+            biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+            mantissa_bits = amax_bits & Int32(0x7FFFFF)
+            has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+            carry = Int32(1) if has_carry else Int32(0)
+            e8m0 = biased_exp - Int32(8) + carry
+            is_normal = cutlass.Boolean(biased_exp > Int32(0))
+            e8m0 = e8m0 if is_normal else Int32(0)
+            is_pos = cutlass.Boolean(e8m0 > Int32(0))
+            e8m0 = e8m0 if is_pos else Int32(0)
+
+            # Step 3: quant_scale = 2^(254 - e8m0) (clamped to [1, 254]).
+            qexp = Int32(254) - e8m0
+            qexp_hi = cutlass.Boolean(qexp > Int32(254))
+            qexp = Int32(254) if qexp_hi else qexp
+            qexp_lo = cutlass.Boolean(qexp < Int32(1))
+            qexp = Int32(1) if qexp_lo else qexp
+            quant_scale = _i32_as_f32(qexp << Int32(23))
+
+            # Step 4: scale postact registers; fp8 cast at TMA store time.
+            for i in cutlass.range(num_pa, unroll_full=True):
+                tRS_rPostAct[i] = tRS_rPostAct[i] * quant_scale
+
+            # Step 5: store UE8M0 byte at ISA-pack offset (bounds-checked).
+            pa_scale_info = epi_loop_tensors["mPostActScaleIsa"]
+            if const_expr(pa_scale_info is not None):
+                scale_tensor, m_abs, n_group_abs, m_limit, n_group_limit = pa_scale_info
+                in_bounds = (
+                    cutlass.Boolean(m_abs < m_limit)
+                    & cutlass.Boolean(n_group_abs < n_group_limit)
+                )
+                if in_bounds:
+                    m_tile = m_abs // Int32(128)
+                    row_in_tile = m_abs % Int32(128)
+                    k_tile_idx = n_group_abs // Int32(4)
+                    k_in_tile = n_group_abs % Int32(4)
+                    row_base = (row_in_tile % Int32(32)) * Int32(16) + (
+                        row_in_tile // Int32(32)
+                    ) * Int32(4)
+                    inner_off = row_base + k_in_tile
+                    scale_tensor[m_tile, k_tile_idx, inner_off] = cutlass.Int8(e8m0)
+
+        return tRS_rPostAct
 
 
 # ---------------------------------------------------------------------------
