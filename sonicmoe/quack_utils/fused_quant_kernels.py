@@ -44,11 +44,11 @@ from .blockscaled_fp8_gemm import (
 
 
 def _iso32_enabled() -> bool:
-    """iso32 dz quant default = ON; set SONIC_MOE_DZ_ISO32=0 to force 1x32."""
+    """iso32 dz quant default = OFF (precision-first); set SONIC_MOE_DZ_ISO32=1 for legacy iso32."""
     cfg = get_active_config()
     if cfg is not None:
         return cfg.resolve_dz_iso32()
-    return os.environ.get("SONIC_MOE_DZ_ISO32", "1") != "0"
+    return os.environ.get("SONIC_MOE_DZ_ISO32", "0") != "0"
 
 
 def fused_dual_colwise_quantize(

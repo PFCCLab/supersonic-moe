@@ -45,6 +45,7 @@ from .blockscaled_fp8_gemm import _tile_atom_to_shape_SF_rank_aware
 from ._gated_epilogues import (
     GemmGatedMixin,
     GemmGatedBlockscaledQuantMixin,
+    GemmGatedPostActIsaQuantMixin,
     BlockscaledQuantOnlyMixin,
     BlockscaledIsaQuantOnlyMixin,
     BlockscaledIso32QuantOnlyMixin,
@@ -382,6 +383,18 @@ class GemmGatedSm100ZeroMat(GemmGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
 
 class GemmGatedSm100ZeroMatBlockscaledQuant(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
     """SM100 GemmGated + epilogue blockscaled FP8 quant + zero-materialization SFA fix."""
+    pass
+
+
+class GemmGatedSm100ZeroMatPostActQuant(GemmGatedPostActIsaQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """SM100 GemmGated + epilogue blockscaled FP8 quant of the postact (y1) + zero-mat SFA fix.
+
+    Fuses the standalone quantize_and_pack_activation(y1) into the up-proj
+    epilogue: emits y1 directly as ISA-packed FP8 (mPostAct fp8) + ISA UE8M0
+    scales (mPostActScaleIsa), eliminating the ~814MB bf16 y1 materialization
+    and the standalone ~138us quant kernel.  z (mD) stays bf16.  Requires
+    epi_tile_n(z)=64 (default override) for 1:1 subtile->postact-group mapping.
+    """
     pass
 
 

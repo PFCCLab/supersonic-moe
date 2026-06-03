@@ -43,6 +43,7 @@ from ._gated_epilogues import (
 from .gemm_sm100_fp8_zeromat import (
     GemmGatedSm100ZeroMat,
     GemmGatedSm100ZeroMatBlockscaledQuant,
+    GemmGatedSm100ZeroMatPostActQuant,
     GemmSm100ZeroMatBlockscaledQuant,
 )
 
@@ -105,9 +106,15 @@ def gemm_gated(
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # (total_m, N//32) uint8 — epilogue quant scale output
+    postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
 ) -> None:
     blockscaled = a_scales is not None and b_scales is not None
     epilogue_quant = z_scale_out is not None
+    postact_quant = postact_scale_out is not None
+    assert not (epilogue_quant and postact_quant), (
+        "z_scale_out (z-quant) and postact_scale_out (y1-quant) are mutually "
+        "exclusive epilogue-quant modes; got both non-None"
+    )
     gather_A = A_idx is not None
     fast_key = None
     if (
@@ -123,7 +130,7 @@ def gemm_gated(
         fast_key = (
             A.dtype, B.dtype, D.dtype if D is not None else None, PostAct.dtype, C.dtype if C is not None else None,
             activation, tile_M, tile_N, cluster_M, cluster_N, pingpong, max_swizzle_size,
-            epilogue_quant, A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
+            epilogue_quant, postact_quant, A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
         )
         cached = _GATED_FAST_PATH.get(fast_key)
         if cached is not None:
@@ -138,6 +145,8 @@ def gemm_gated(
             epi_kwargs = {}
             if epilogue_quant:
                 epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)
+            if postact_quant:
+                epi_kwargs["mPostActScaleIsa"] = _make_cute_tensor_dynamic(postact_scale_out, leading_dim=2)
             epi_args = GemmCls.EpilogueArguments(post_cute, epi_base, **epi_kwargs)
             varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
             a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
@@ -201,11 +210,19 @@ def gemm_gated(
     # Use zero-materialization kernel when gather_A + blockscaled (FP8 with A_idx)
     blockscaled_runtime = a_scales is not None and b_scales is not None
     epilogue_quant = z_scale_out is not None
+    postact_quant = postact_scale_out is not None
     if epilogue_quant:
         assert device_capacity[0] > 9, "Epilogue quant only supported on SM100+"
+    if postact_quant:
+        assert device_capacity[0] > 9, "Postact quant only supported on SM100+"
+        assert gather_A and blockscaled_runtime, (
+            "Postact (y1) quant only supported on the gather_A+blockscaled zeromat path"
+        )
     if device_capacity[0] > 9 and gather_A and blockscaled_runtime:
         if epilogue_quant:
             GemmCls = GemmGatedSm100ZeroMatBlockscaledQuant
+        elif postact_quant:
+            GemmCls = GemmGatedSm100ZeroMatPostActQuant
         else:
             GemmCls = GemmGatedSm100ZeroMat
     elif device_capacity[0] > 9:
@@ -235,6 +252,8 @@ def gemm_gated(
     epi_kwargs = {}
     if epilogue_quant:
         epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)
+    if postact_quant:
+        epi_kwargs["mPostActScaleIsa"] = _make_cute_tensor_dynamic(postact_scale_out, leading_dim=2)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
@@ -294,6 +313,7 @@ def gemm_gated(
         A_idx is not None,
         blockscaled,
         epilogue_quant,
+        postact_quant,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_gated.compile_cache

@@ -91,6 +91,7 @@ def gemm_gated_tuned(
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # epilogue quant scale output
+    postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
 ) -> None:
     if config is None:
         config = quack_default_config(A.device)
@@ -137,6 +138,7 @@ def gemm_gated_tuned(
         a_scales=a_scales,
         b_scales=b_scales,
         z_scale_out=z_scale_out,
+        postact_scale_out=postact_scale_out,
     )
 
 
@@ -258,6 +260,7 @@ def gemm_gated(
     b_scales: Optional[Tensor] = None,
     tuned: bool = True,
     z_scale_out: Optional[Tensor] = None,
+    postact_scale_out: Optional[Tensor] = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -276,11 +279,12 @@ def gemm_gated(
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    if z_scale_out is not None:
-        # Epilogue quant: bypass custom_op, call tuned fn directly (untuned for blockscaled).
+    if z_scale_out is not None or postact_scale_out is not None:
+        # Epilogue quant (z or postact/y1): bypass custom_op, call tuned fn directly (untuned for blockscaled).
         fn = partial(gemm_gated_tuned.fn, config=None)
         fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx,
-           dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out)
+           dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out,
+           postact_scale_out=postact_scale_out)
     else:
         gemm_gated_out(
             A, B, preact_out, postact_out, C, bias, activation,
