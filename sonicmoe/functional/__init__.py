@@ -674,7 +674,11 @@ def _use_fuse_y1_quant() -> bool:
     cfg = get_active_config()
     if cfg is not None and getattr(cfg, "fuse_y1_quant", None) is not None:
         return cfg.fuse_y1_quant
-    return os.getenv("SONIC_MOE_FUSE_Y1_QUANT", "").lower() in {"1", "true", "yes", "on"}
+    # Default ON: nsys-projection A/B (TK>=131072, H2048 I1024) shows -5..-11%
+    # step time, precision-neutral; eliminates the standalone y1 quant kernel
+    # (~132us/step) + bf16 y1 HBM (~814 MiB/layer).  Unaligned shapes fall back
+    # gracefully at the call site (alignment gate); z stays bf16 (save_z OFF).
+    return os.getenv("SONIC_MOE_FUSE_Y1_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fp8_wgrad() -> bool | None:
@@ -1233,7 +1237,14 @@ class _UpProjection(torch.autograd.Function):
                     if prequant_activation_payload is not None:
                         x_fp8_pre, x_scales_pre = prequant_activation_payload
                     w1_fused_payload = fp8_weight_payload["w1_fused"]
-                    fuse_y1 = _use_fuse_y1_quant() and not cfg.save_z_fp8
+                    # Gate on 128-alignment so unaligned shapes fall back to the
+                    # standalone y1 quant (else-branch below) instead of asserting.
+                    fuse_y1 = (
+                        _use_fuse_y1_quant()
+                        and not cfg.save_z_fp8
+                        and TK % 128 == 0
+                        and I % 128 == 0
+                    )
                     z, y1, y1_fp8_fused, y1_scales_fused = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx,
                         w1_fp8_pre=w1_fused_payload,
@@ -2217,7 +2228,7 @@ class _DownProjection(torch.autograd.Function):
                         w2_scales = ctx._w2_dgated_scales
                     else:
                         w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
-                    config = gemm_dgated.default_config(dout.device)
+                    config = gemm_dgated.default_config(dout.device, num_experts=w2_fp8_enk.shape[0])
                     total_m = x_gather_idx.shape[0]  # TK
                     n = w2_fp8_enk.shape[-2]
                     dz = torch.empty((total_m, n * 2), dtype=torch.bfloat16, device=dout.device)

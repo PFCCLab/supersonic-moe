@@ -3936,7 +3936,8 @@ def _pad_quantize_and_pack_kernel(
     Avoids materializing a bf16 padded intermediate buffer.
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
-    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    # int64 row index to avoid row*stride overflow on multi-GB tensors (rows*K > 2^31).
+    row_ids = (row_base + tl.arange(0, BLOCK_ROWS)).to(tl.int64)
     row_mask_1d = row_ids < rows
 
     # Load source indices (invariant across groups)
