@@ -431,5 +431,5 @@ def gemm_dgated(
     )
 
 
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 gemm_dgated.compile_cache = _ICC("dgated")

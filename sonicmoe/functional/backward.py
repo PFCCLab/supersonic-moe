@@ -265,7 +265,7 @@ def _up_projection_backward_act(
     )
 
 
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 _up_projection_backward_act.compile_cache = _ICC("up_proj_bwd_act")
 
 

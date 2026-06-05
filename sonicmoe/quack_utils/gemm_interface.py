@@ -40,14 +40,44 @@ from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
 default_device_capacity = get_device_capacity(paddle.device("cuda"))
 
 
-def default_config(device) -> GemmConfig:
+# SM103 (B300) backward dgated blockscaled GEMM: above this expert count we
+# keep the conservative 1-CTA tile. cluster_m=2 gives no measured speedup at
+# E=128 small-hidden (+1.4% regression) and E>64 is exactly the regime the
+# original stability override targeted ("avoid 2CTA-M varlen gather on SM103";
+# illegal-instruction fault under skewed expert load), which has NOT been
+# re-qualified for skew at E>64 on the current toolchain.
+_DGATED_2CTA_MAX_EXPERTS = 64
+
+
+def default_config(device, num_experts: int = 1) -> GemmConfig:
     config = quack_default_config(device)
     cap = get_device_capacity(device)
     if cap[0] == 10 and cap[1] >= 3:
+        # SM103 (B300) backward dgated blockscaled GEMM. cluster_m=2 enables
+        # 2-CTA cooperative tiling (TE-style 2cta) which the prior cluster_m=1
+        # override disabled.  Empirically (nsys GPU-projection, fresh proc/cfg):
+        # cluster_m=2 is ~6-14% faster on the dgated kernel at production shapes
+        # (E<=64, e.g. Qwen3-30B-A3B H2048 I1024 E64: 459->421us, -8.4%) and
+        # bit-identical (rrmse=0; tile/cluster partition does not change the
+        # K-reduction order) with zero extra memory. Verified finite+bit-
+        # identical under 80%-skewed and extreme single-expert routing at E=64.
+        # E>64 stays 1-CTA: no measured win there and it is the historical
+        # skew-fault regime (see _DGATED_2CTA_MAX_EXPERTS above).
+        cluster_m = 2 if num_experts <= _DGATED_2CTA_MAX_EXPERTS else 1
+        # tile_m=256 + cluster_m=2 => true 2-CTA tcgen05 MMA (use_2cta_instrs).
+        # Session-38 ncu (B300, E64 H2048 I1024 TK262144): -4.7% on the dgated
+        # kernel vs tile_m=128 (1,111,392->1,059,136 ns base-clock; tensor-pipe
+        # 38.77->40.74%), BIT-IDENTICAL dz/colvec/y1s (max_abs_diff=0; M-tiling
+        # does not change the K-reduction) and compute-sanitizer memcheck-clean
+        # (0 errors) under 80%-skew + single-dominant routing at E=64.  Gated to
+        # the real dgated expert range [2, 64]: num_experts==1 is the weight-grad
+        # caller (it cannot see the real E, so it stays tile_m=128 to avoid the
+        # unvalidated E>64 true-2CTA regime), and E>64 stays tile_m=128 cm=1.
+        tile_m = 256 if 2 <= num_experts <= _DGATED_2CTA_MAX_EXPERTS else 128
         return GemmConfig(
-            tile_m=128,
+            tile_m=tile_m,
             tile_n=128,
-            cluster_m=1,
+            cluster_m=cluster_m,
             cluster_n=1,
             pingpong=False,
             is_dynamic_persistent=config.is_dynamic_persistent,
@@ -175,7 +205,8 @@ def gemm_dgated_tuned(
     b_scales: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     if config is None:
-        config = default_config(A.device)
+        # B is (K, N) or (L, K, N); L == num_experts for the grouped path.
+        config = default_config(A.device, num_experts=(B.shape[0] if B.ndim == 3 else 1))
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"

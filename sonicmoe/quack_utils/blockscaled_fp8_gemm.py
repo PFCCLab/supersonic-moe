@@ -111,7 +111,7 @@ _WEIGHT_CACHE: dict[
     tuple[int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 _COMPILE_CACHE = _ICC("blockscaled_grouped")
 _PAD_PLAN_CACHE: dict = {}       # content-key -> plan
 # Fast-path cache: skip validation/tensor-info/compile-key on steady-state calls.
@@ -3936,7 +3936,8 @@ def _pad_quantize_and_pack_kernel(
     Avoids materializing a bf16 padded intermediate buffer.
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
-    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    # int64 row index to avoid row*stride overflow on multi-GB tensors (rows*K > 2^31).
+    row_ids = (row_base + tl.arange(0, BLOCK_ROWS)).to(tl.int64)
     row_mask_1d = row_ids < rows
 
     # Load source indices (invariant across groups)

@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import torch
 
-from sonicmoe.enums import LIBRARY_NAME
-from sonicmoe.jit import cpp_jit
+from ...enums import LIBRARY_NAME
+from ...jit import cpp_jit
 
 
 @torch.library.custom_op(

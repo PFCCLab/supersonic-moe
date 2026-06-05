@@ -54,7 +54,8 @@ def _dequant_blockscaled_fp8_kernel(
     Actual value = fp8_raw * 2^(e8m0 - 127).
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
-    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    # int64 row index to avoid row*stride overflow on multi-GB tensors (rows*D > 2^31).
+    row_ids = (row_base + tl.arange(0, BLOCK_ROWS)).to(tl.int64)
     row_mask = row_ids < rows
     num_groups: tl.constexpr = D // GROUP_SIZE
 

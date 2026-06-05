@@ -40,19 +40,19 @@ import torch
 import triton
 import triton.language as tl
 
-from sonicmoe.enums import ActivationType
-from sonicmoe.ernie_compat.deepep_metadata import (
+from ..enums import ActivationType
+from .deepep_metadata import (
     deepep_topk_to_sonic_metadata,
     invalidate_topk_cache,
 )
-from sonicmoe.functional import (
+from ..functional import (
     _DownProjection,
     _UpProjection,
     _refresh_fp8_config,
     clear_all_fp8_weight_caches,
 )
-from sonicmoe.functional.utils import enable_fp8
-from sonicmoe.quack_utils import (
+from ..functional.utils import enable_fp8
+from ..quack_utils import (
     install_native_fp8_weight_cache,
     precompute_weight_fp8,
     precompute_weight_fp8_for_direct_fused_dgated,
@@ -60,7 +60,7 @@ from sonicmoe.quack_utils import (
     precompute_weight_fp8_warmup,
     quantize_native_fp8_weights,
 )
-from sonicmoe.quack_utils.blockscaled_fp8_gemm import _iso32_weight_enabled, _storage_per_batch
+from ..quack_utils.blockscaled_fp8_gemm import _iso32_weight_enabled, _storage_per_batch
 
 
 # ── PyLayer ctx stub ──────────────────────────────────────────────────────────
