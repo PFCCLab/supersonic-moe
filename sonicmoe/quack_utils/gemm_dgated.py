@@ -114,8 +114,11 @@ def gemm_dgated(
     iso32_dz_col_scales: Optional[Tensor] = None,  # ISA-pack col-axis SF (num_n_tiles, col_k_tiles, 512) uint8
     y1s_col_fp8: Optional[Tensor] = None,  # (total_m, n) fp8 — side-channel FP8 y1s output
     y1s_col_scales: Optional[Tensor] = None,  # ISA-pack col-axis SF (num_n_tiles, col_k_tiles, 512) uint8
+    swiglu_clamp_value: float = 0.0,
 ) -> None:
     """If tile_count_semaphore is provided, it must already be zero'ed out."""
+    if activation != "swiglu":
+        swiglu_clamp_value = 0.0
     fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
     iso32_dz_mode = (
         iso32_dz_fp8 is not None
@@ -139,7 +142,7 @@ def gemm_dgated(
         fast_key = (
             A.dtype, B.dtype, Out.dtype, PostAct.dtype, activation,
             tile_M, tile_N, cluster_M, cluster_N, pingpong, max_swizzle_size,
-            fp8_preact_mode, iso32_dz_mode, y1s_col_quant_mode,
+            fp8_preact_mode, iso32_dz_mode, y1s_col_quant_mode, float(swiglu_clamp_value),
             A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
         )
         cached = _DGATED_FAST_PATH.get(fast_key)
@@ -188,6 +191,7 @@ def gemm_dgated(
                 post_cute,
                 act_fn,
                 implicit_dtype=implicit_dtype,
+                swiglu_clamp_value=float(swiglu_clamp_value),
                 mColVecBroadcast=from_dlpack(colvec_scale.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0),
                 mColVecReduce=from_dlpack(colvec_reduce.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1),
                 **epi_kwargs,
@@ -309,7 +313,9 @@ def gemm_dgated(
                 leading_dim=1 if info.major == major_configs[name][1] else 0,
             )
     act_fn = dswiglu_te_exp2 if (
-        activation == "swiglu" and os.environ.get("SONIC_MOE_DSWIGLU_TE_EXP2", "0") == "1"
+        activation == "swiglu"
+        and os.environ.get("SONIC_MOE_DSWIGLU_TE_EXP2", "0") == "1"
+        and float(swiglu_clamp_value) <= 0.0
     ) else dgate_fn_map[activation]
     epi_kwargs = {}
     if fp8_preact_mode:
@@ -331,6 +337,7 @@ def gemm_dgated(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
         implicit_dtype=implicit_dtype,
+        swiglu_clamp_value=float(swiglu_clamp_value),
         mColVecBroadcast=(
             from_dlpack(colvec_scale.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=1 if cu_seqlens_m is None else 0
@@ -385,6 +392,7 @@ def gemm_dgated(
         fp8_preact_mode,
         iso32_dz_mode,
         y1s_col_quant_mode,
+        float(swiglu_clamp_value),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dgated.compile_cache

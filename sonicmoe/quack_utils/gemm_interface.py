@@ -122,6 +122,7 @@ def gemm_gated_tuned(
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # epilogue quant scale output
     postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
+    swiglu_clamp_value: float = 0.0,
 ) -> None:
     if config is None:
         config = quack_default_config(A.device)
@@ -169,6 +170,7 @@ def gemm_gated_tuned(
         b_scales=b_scales,
         z_scale_out=z_scale_out,
         postact_scale_out=postact_scale_out,
+        swiglu_clamp_value=swiglu_clamp_value,
     )
 
 
@@ -203,6 +205,7 @@ def gemm_dgated_tuned(
     config: Optional[GemmConfig] = None,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
+    swiglu_clamp_value: float = 0.0,
 ) -> Optional[Tensor]:
     if config is None:
         # B is (K, N) or (L, K, N); L == num_experts for the grouped path.
@@ -263,6 +266,7 @@ def gemm_dgated_tuned(
         A_idx=A_idx,
         a_scales=a_scales,
         b_scales=b_scales,
+        swiglu_clamp_value=swiglu_clamp_value,
     )
     if colvec_reduce:
         colvec_reduce_final = colvec_reduce_partial.sum(dim=-1)
@@ -292,6 +296,7 @@ def gemm_gated(
     tuned: bool = True,
     z_scale_out: Optional[Tensor] = None,
     postact_scale_out: Optional[Tensor] = None,
+    swiglu_clamp_value: float = 0.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -315,11 +320,11 @@ def gemm_gated(
         fn = partial(gemm_gated_tuned.fn, config=None)
         fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx,
            dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out,
-           postact_scale_out=postact_scale_out)
+           postact_scale_out=postact_scale_out, swiglu_clamp_value=swiglu_clamp_value)
     else:
         gemm_gated_out(
             A, B, preact_out, postact_out, C, bias, activation,
-            cu_seqlens_m, A_idx, dynamic_scheduler, tuned, a_scales, b_scales,
+            cu_seqlens_m, A_idx, dynamic_scheduler, tuned, a_scales, b_scales, swiglu_clamp_value,
         )
     return preact_out, postact_out
 
@@ -328,7 +333,7 @@ def gemm_gated(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None, float swiglu_clamp_value=0.0) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -344,6 +349,7 @@ def gemm_gated_out(
     tuned: bool = True,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
+    swiglu_clamp_value: float = 0.0,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     # Blockscaled fused gated kernels run correctly with the default config on SM100,
@@ -353,7 +359,7 @@ def gemm_gated_out(
     safe_tuned = tuned and not _uses_blockscaled_runtime(a_scales, b_scales)
     fn = gemm_gated_tuned if safe_tuned else partial(gemm_gated_tuned.fn, config=None)
     fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler,
-       a_scales=a_scales, b_scales=b_scales)
+       a_scales=a_scales, b_scales=b_scales, swiglu_clamp_value=swiglu_clamp_value)
 
 
 def gemm_dgated(
@@ -373,6 +379,7 @@ def gemm_dgated(
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
     tuned: bool = True,
+    swiglu_clamp_value: float = 0.0,
 ) -> Tuple[Tensor, Tensor]:
     """GEMM with gated activation gradient and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -406,6 +413,7 @@ def gemm_dgated(
         tuned,
         a_scales,
         b_scales,
+        swiglu_clamp_value,
     )
     if not colvec_reduce:
         return dx_out, postact_out
@@ -420,7 +428,7 @@ gemm_dgated.default_config = default_config
     "quack::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None) -> Tensor?",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None, float swiglu_clamp_value=0.0) -> Tensor?",
 )
 def gemm_dgated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -437,6 +445,7 @@ def gemm_dgated_out(
     tuned: bool = True,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
+    swiglu_clamp_value: float = 0.0,
 ) -> Optional[Tensor]:
     """GEMM with gated activation gradient and pre-allocated output tensors."""
     safe_tuned = tuned and not _uses_blockscaled_runtime(a_scales, b_scales)
@@ -455,6 +464,7 @@ def gemm_dgated_out(
         dynamic_scheduler,
         a_scales=a_scales,
         b_scales=b_scales,
+        swiglu_clamp_value=swiglu_clamp_value,
     )
 
 
@@ -474,6 +484,7 @@ def gemm_dgated_out_fake(
     tuned: bool = True,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
+    swiglu_clamp_value: float = 0.0,
 ) -> Optional[Tensor]:
     if not colvec_reduce:
         return None

@@ -86,7 +86,7 @@ def test_dgated_kernel_invocable(M, I, H):
     torch.manual_seed(42)
 
     try:
-        from sonicmoe.quack_utils.gemm_dgated import gemm_dgated
+        from sonicmoe.quack_utils.gemm_interface import gemm_dgated
     except ImportError:
         pytest.skip("gemm_dgated not importable")
 
@@ -103,6 +103,8 @@ def test_dgated_kernel_invocable(M, I, H):
             PreAct=z,
             activation="swiglu",
             dx_out=dz,
+            colvec_scale=torch.ones(M * E, dtype=torch.float32, device=device),
+            colvec_reduce=True,
             cu_seqlens_m=cu_seqlens,
             dynamic_scheduler=False,
         )

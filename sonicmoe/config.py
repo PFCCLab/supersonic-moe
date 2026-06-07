@@ -76,6 +76,8 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_FP8_ISO32_WEIGHT``. Default: False; set True/1 for the legacy iso32 path.
         dz_iso32: Use ISO32 single-FP8-buffer quantization for backward dz.
             Env: ``SONIC_MOE_DZ_ISO32``. Default: False (precision-first 1x32 dual path); set True/1 for the legacy iso32 path.
+        swiglu_clamp_value: Optional user-controlled SwiGLU clamp value.
+            Default: 0.0 (disabled).
     """
 
     use_fp8: Optional[bool] = None
@@ -91,6 +93,7 @@ class SonicMoEConfig:
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
     dz_iso32: Optional[bool] = None
+    swiglu_clamp_value: Optional[float] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -176,6 +179,11 @@ class SonicMoEConfig:
         if self.dz_iso32 is not None:
             return self.dz_iso32
         return _env_bool("SONIC_MOE_DZ_ISO32", False) or False
+
+    def resolve_swiglu_clamp_value(self) -> float:
+        if self.swiglu_clamp_value is not None:
+            return max(float(self.swiglu_clamp_value), 0.0)
+        return 0.0
 
     # --- Context manager for temporary activation ----------------------------
 

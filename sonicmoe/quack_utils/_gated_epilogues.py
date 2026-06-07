@@ -110,12 +110,68 @@ def _make_forced_epi_tile_fn(orig_fn, target_n: int):
     return _forced
 
 
+
+@dsl_user_op
+@cute.jit
+def _swiglu_clamp_pair(gate, up, clamp_value: cutlass.Constexpr[float], *, loc=None, ip=None):
+    cv = Float32(clamp_value)
+    neg_cv = Float32(0.0) - cv
+    if const_expr(not isinstance(gate, tuple)):
+        gate_c = utils.fmin(gate, cv)
+        up_c = cute.arch.fmax(utils.fmin(up, cv), neg_cv)
+        return gate_c, up_c
+    else:
+        gate_c = (utils.fmin(gate[0], cv), utils.fmin(gate[1], cv))
+        up_c = (
+            cute.arch.fmax(utils.fmin(up[0], cv), neg_cv),
+            cute.arch.fmax(utils.fmin(up[1], cv), neg_cv),
+        )
+        return gate_c, up_c
+
+
+@dsl_user_op
+@cute.jit
+def _swiglu_clamp_bwd_grads(dx, dy, gate, up, clamp_value: cutlass.Constexpr[float], *, loc=None, ip=None):
+    cv = Float32(clamp_value)
+    zero = Float32(0.0)
+    if const_expr(not isinstance(gate, tuple)):
+        gate_ok = cutlass.Boolean(gate <= cv)
+        up_abs = cute.arch.fmax(up, zero - up)
+        up_ok = cutlass.Boolean(up_abs <= cv)
+        return (dx if gate_ok else zero), (dy if up_ok else zero)
+    else:
+        gate_ok0 = cutlass.Boolean(gate[0] <= cv)
+        gate_ok1 = cutlass.Boolean(gate[1] <= cv)
+        up_abs0 = cute.arch.fmax(up[0], zero - up[0])
+        up_abs1 = cute.arch.fmax(up[1], zero - up[1])
+        up_ok0 = cutlass.Boolean(up_abs0 <= cv)
+        up_ok1 = cutlass.Boolean(up_abs1 <= cv)
+        dx_c = (dx[0] if gate_ok0 else zero, dx[1] if gate_ok1 else zero)
+        dy_c = (dy[0] if up_ok0 else zero, dy[1] if up_ok1 else zero)
+        return dx_c, dy_c
+
 # ---------------------------------------------------------------------------
 # GemmGatedMixin (from gemm_gated.py)
 # ---------------------------------------------------------------------------
 
 class GemmGatedMixin(GemmActMixin):
     _epi_ops = (*GemmActMixin._epi_ops[:-1], TileStore("mPostAct", epi_tile_fn=_halve_epi_tile))
+    _extra_param_fields = (
+        ("act_fn", cutlass.Constexpr, None),
+        ("swiglu_clamp_value", cutlass.Constexpr, 0.0),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
     def _setup_attributes(self, epilogue_args, varlen_args):
         """Raise the epilogue subtile N for the (compute-bound) gated up-proj.
@@ -189,8 +245,10 @@ class GemmGatedMixin(GemmActMixin):
         if self.arch == 90:
             assert self.cta_tile_shape_mnk[1] % 32 == 0, "GemmGatedSm90 requires tileN to be divisible by 32"
         self.cta_tile_shape_postact_mn = (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1] // 2)
+        self.swiglu_clamp_value = args.swiglu_clamp_value
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
+        d["swiglu_clamp_value"] = args.swiglu_clamp_value
         return self.EpilogueParams(**d)
 
     @cute.jit
@@ -200,12 +258,18 @@ class GemmGatedMixin(GemmActMixin):
         tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
         if const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
-                tRS_rPostAct[i] = params.act_fn(tRS_rD[2 * i], tRS_rD[2 * i + 1])
+                gate = tRS_rD[2 * i]
+                up = tRS_rD[2 * i + 1]
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate, up = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                tRS_rPostAct[i] = params.act_fn(gate, up)
         else:
             for i in cutlass.range(cute.size(tRS_rPostAct) // 2, unroll_full=True):
-                tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
-                    (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
-                )
+                gate = (tRS_rD[4 * i], tRS_rD[4 * i + 2])
+                up = (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate, up = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(gate, up)
         return tRS_rPostAct
 
     @cute.jit
@@ -306,6 +370,7 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -590,6 +655,7 @@ class GemmGatedPostActIsaQuantMixin(GemmGatedMixin):
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -1110,6 +1176,7 @@ class GemmDGatedMixin(GemmActMixin):
     _extra_param_fields = (
         ("act_bwd_fn", cutlass.Constexpr, None),
         ("implicit_dtype", cutlass.Constexpr, None),
+        ("swiglu_clamp_value", cutlass.Constexpr, 0.0),
     )
 
     def epi_setup_postact(
@@ -1157,6 +1224,7 @@ class GemmDGatedMixin(GemmActMixin):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
         implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -1175,9 +1243,11 @@ class GemmDGatedMixin(GemmActMixin):
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         assert self.c_dtype.width == 32, "C storage type must be 32 bit"
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
+        self.swiglu_clamp_value = args.swiglu_clamp_value
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
         d["implicit_dtype"] = args.implicit_dtype
+        d["swiglu_clamp_value"] = args.swiglu_clamp_value
         return self.EpilogueParams(**d)
 
     @cute.jit
@@ -1213,22 +1283,34 @@ class GemmDGatedMixin(GemmActMixin):
             tRS_rD_scaled.store(tRS_rD.load())
         if const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rD)):
-                (
-                    tRS_rdXY_f32x2[2 * i],
-                    tRS_rdXY_f32x2[2 * i + 1],
-                    tRS_rOut[i],
-                ) = params.act_bwd_fn(tRS_rXY_f32x2[2 * i], tRS_rXY_f32x2[2 * i + 1], tRS_rD_scaled[i])
+                gate = tRS_rXY_f32x2[2 * i]
+                up = tRS_rXY_f32x2[2 * i + 1]
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, tRS_rD_scaled[i])
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                    tRS_rdXY_f32x2[2 * i], tRS_rdXY_f32x2[2 * i + 1], tRS_rOut[i] = dx, dy, out
+                else:
+                    tRS_rdXY_f32x2[2 * i], tRS_rdXY_f32x2[2 * i + 1], tRS_rOut[i] = params.act_bwd_fn(
+                        gate, up, tRS_rD_scaled[i]
+                    )
         else:
             for i in cutlass.range(cute.size(tRS_rD) // 2):
-                (
-                    (tRS_rdXY_f32x2[4 * i], tRS_rdXY_f32x2[4 * i + 2]),
-                    (tRS_rdXY_f32x2[4 * i + 1], tRS_rdXY_f32x2[4 * i + 3]),
-                    (tRS_rOut[2 * i], tRS_rOut[2 * i + 1]),
-                ) = params.act_bwd_fn(
-                    (tRS_rXY_f32x2[4 * i], tRS_rXY_f32x2[4 * i + 2]),
-                    (tRS_rXY_f32x2[4 * i + 1], tRS_rXY_f32x2[4 * i + 3]),
-                    (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1]),
-                )
+                gate = (tRS_rXY_f32x2[4 * i], tRS_rXY_f32x2[4 * i + 2])
+                up = (tRS_rXY_f32x2[4 * i + 1], tRS_rXY_f32x2[4 * i + 3])
+                dout = (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1])
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, dout)
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                else:
+                    dx, dy, out = params.act_bwd_fn(gate, up, dout)
+                tRS_rdXY_f32x2[4 * i] = dx[0]
+                tRS_rdXY_f32x2[4 * i + 2] = dx[1]
+                tRS_rdXY_f32x2[4 * i + 1] = dy[0]
+                tRS_rdXY_f32x2[4 * i + 3] = dy[1]
+                tRS_rOut[2 * i] = out[0]
+                tRS_rOut[2 * i + 1] = out[1]
         if const_expr(tDrColVecReduce is not None):
             # Need to multiply before D is scaled by colvec_scale
             if const_expr(self.arch < 100):
@@ -1520,9 +1602,11 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
             assert self.c_dtype.width == 32, "C storage type must be 32 bit"
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
+        self.swiglu_clamp_value = args.swiglu_clamp_value
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
         d["implicit_dtype"] = args.implicit_dtype
+        d["swiglu_clamp_value"] = args.swiglu_clamp_value
         return self.EpilogueParams(**d)
 
     @mlir_namedtuple
@@ -1530,6 +1614,7 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
         implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -1619,22 +1704,34 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
             tRS_rD_scaled.store(tRS_rD.load())
         if const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rD)):
-                (
-                    tRS_rdXY_f32x2[2 * i],
-                    tRS_rdXY_f32x2[2 * i + 1],
-                    tRS_rOut[i],
-                ) = params.act_bwd_fn(tRS_rXY_f32x2[2 * i], tRS_rXY_f32x2[2 * i + 1], tRS_rD_scaled[i])
+                gate = tRS_rXY_f32x2[2 * i]
+                up = tRS_rXY_f32x2[2 * i + 1]
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, tRS_rD_scaled[i])
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                    tRS_rdXY_f32x2[2 * i], tRS_rdXY_f32x2[2 * i + 1], tRS_rOut[i] = dx, dy, out
+                else:
+                    tRS_rdXY_f32x2[2 * i], tRS_rdXY_f32x2[2 * i + 1], tRS_rOut[i] = params.act_bwd_fn(
+                        gate, up, tRS_rD_scaled[i]
+                    )
         else:
             for i in cutlass.range(cute.size(tRS_rD) // 2):
-                (
-                    (tRS_rdXY_f32x2[4 * i], tRS_rdXY_f32x2[4 * i + 2]),
-                    (tRS_rdXY_f32x2[4 * i + 1], tRS_rdXY_f32x2[4 * i + 3]),
-                    (tRS_rOut[2 * i], tRS_rOut[2 * i + 1]),
-                ) = params.act_bwd_fn(
-                    (tRS_rXY_f32x2[4 * i], tRS_rXY_f32x2[4 * i + 2]),
-                    (tRS_rXY_f32x2[4 * i + 1], tRS_rXY_f32x2[4 * i + 3]),
-                    (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1]),
-                )
+                gate = (tRS_rXY_f32x2[4 * i], tRS_rXY_f32x2[4 * i + 2])
+                up = (tRS_rXY_f32x2[4 * i + 1], tRS_rXY_f32x2[4 * i + 3])
+                dout = (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1])
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, dout)
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                else:
+                    dx, dy, out = params.act_bwd_fn(gate, up, dout)
+                tRS_rdXY_f32x2[4 * i] = dx[0]
+                tRS_rdXY_f32x2[4 * i + 2] = dx[1]
+                tRS_rdXY_f32x2[4 * i + 1] = dy[0]
+                tRS_rdXY_f32x2[4 * i + 3] = dy[1]
+                tRS_rOut[2 * i] = out[0]
+                tRS_rOut[2 * i + 1] = out[1]
         if const_expr(tDrColVecReduce is not None):
             if const_expr(self.arch < 100):
                 for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
@@ -1720,9 +1817,11 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         # Int16 C: c_dtype is Int16 (2 packed fp8), allow it
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
+        self.swiglu_clamp_value = args.swiglu_clamp_value
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
         d["implicit_dtype"] = args.implicit_dtype
+        d["swiglu_clamp_value"] = args.swiglu_clamp_value
         return self.EpilogueParams(**d)
 
     def _setup_attributes(self, epilogue_args, varlen_args):
@@ -1764,6 +1863,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
         implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -1834,17 +1934,33 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
             tRS_rD_scaled.store(tRS_rD.load())
         if const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rD)):
-                tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = params.act_bwd_fn(
-                    tRS_rXY_f32x2[2*i], tRS_rXY_f32x2[2*i+1], tRS_rD_scaled[i])
+                gate = tRS_rXY_f32x2[2*i]
+                up = tRS_rXY_f32x2[2*i+1]
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, tRS_rD_scaled[i])
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                    tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = dx, dy, out
+                else:
+                    tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = params.act_bwd_fn(
+                        gate, up, tRS_rD_scaled[i])
         else:
             for i in cutlass.range(cute.size(tRS_rD) // 2):
-                (tRS_rdXY_f32x2[4*i], tRS_rdXY_f32x2[4*i+2]), \
-                (tRS_rdXY_f32x2[4*i+1], tRS_rdXY_f32x2[4*i+3]), \
-                (tRS_rOut[2*i], tRS_rOut[2*i+1]) = params.act_bwd_fn(
-                    (tRS_rXY_f32x2[4*i], tRS_rXY_f32x2[4*i+2]),
-                    (tRS_rXY_f32x2[4*i+1], tRS_rXY_f32x2[4*i+3]),
-                    (tRS_rD_scaled[2*i], tRS_rD_scaled[2*i+1]),
-                )
+                gate = (tRS_rXY_f32x2[4*i], tRS_rXY_f32x2[4*i+2])
+                up = (tRS_rXY_f32x2[4*i+1], tRS_rXY_f32x2[4*i+3])
+                dout = (tRS_rD_scaled[2*i], tRS_rD_scaled[2*i+1])
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, dout)
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                else:
+                    dx, dy, out = params.act_bwd_fn(gate, up, dout)
+                tRS_rdXY_f32x2[4*i] = dx[0]
+                tRS_rdXY_f32x2[4*i+2] = dx[1]
+                tRS_rdXY_f32x2[4*i+1] = dy[0]
+                tRS_rdXY_f32x2[4*i+3] = dy[1]
+                tRS_rOut[2*i] = out[0]
+                tRS_rOut[2*i+1] = out[1]
         if const_expr(tDrColVecReduce is not None):
             if const_expr(self.arch < 100):
                 for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
@@ -1997,6 +2113,7 @@ class GemmDGatedFP8CLoadIso32QuantMixin(GemmDGatedFP8CLoadMixin):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
         implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -2061,17 +2178,33 @@ class GemmDGatedFP8CLoadIso32QuantMixin(GemmDGatedFP8CLoadMixin):
             tRS_rD_scaled.store(tRS_rD.load())
         if const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rD)):
-                tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = params.act_bwd_fn(
-                    tRS_rXY_f32x2[2*i], tRS_rXY_f32x2[2*i+1], tRS_rD_scaled[i])
+                gate = tRS_rXY_f32x2[2*i]
+                up = tRS_rXY_f32x2[2*i+1]
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, tRS_rD_scaled[i])
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                    tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = dx, dy, out
+                else:
+                    tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = params.act_bwd_fn(
+                        gate, up, tRS_rD_scaled[i])
         else:
             for i in cutlass.range(cute.size(tRS_rD) // 2):
-                (tRS_rdXY_f32x2[4*i], tRS_rdXY_f32x2[4*i+2]), \
-                (tRS_rdXY_f32x2[4*i+1], tRS_rdXY_f32x2[4*i+3]), \
-                (tRS_rOut[2*i], tRS_rOut[2*i+1]) = params.act_bwd_fn(
-                    (tRS_rXY_f32x2[4*i], tRS_rXY_f32x2[4*i+2]),
-                    (tRS_rXY_f32x2[4*i+1], tRS_rXY_f32x2[4*i+3]),
-                    (tRS_rD_scaled[2*i], tRS_rD_scaled[2*i+1]),
-                )
+                gate = (tRS_rXY_f32x2[4*i], tRS_rXY_f32x2[4*i+2])
+                up = (tRS_rXY_f32x2[4*i+1], tRS_rXY_f32x2[4*i+3])
+                dout = (tRS_rD_scaled[2*i], tRS_rD_scaled[2*i+1])
+                if const_expr(self.swiglu_clamp_value > 0.0):
+                    gate_c, up_c = _swiglu_clamp_pair(gate, up, self.swiglu_clamp_value)
+                    dx, dy, out = params.act_bwd_fn(gate_c, up_c, dout)
+                    dx, dy = _swiglu_clamp_bwd_grads(dx, dy, gate, up, self.swiglu_clamp_value)
+                else:
+                    dx, dy, out = params.act_bwd_fn(gate, up, dout)
+                tRS_rdXY_f32x2[4*i] = dx[0]
+                tRS_rdXY_f32x2[4*i+2] = dx[1]
+                tRS_rdXY_f32x2[4*i+1] = dy[0]
+                tRS_rdXY_f32x2[4*i+3] = dy[1]
+                tRS_rOut[2*i] = out[0]
+                tRS_rOut[2*i+1] = out[1]
         if const_expr(tDrColVecReduce is not None):
             if const_expr(self.arch < 100):
                 for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
@@ -2341,6 +2474,7 @@ class GemmDGatedFP8CLoadY1sColQuantMixin(GemmDGatedFP8CLoadMixin):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
         implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None

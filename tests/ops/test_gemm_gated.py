@@ -47,7 +47,7 @@ def _setup_uniform_routing(T, H, I, E, K):
     return TK, total_M, cu_seqlens, A_idx
 
 
-def _torch_gemm_gated_gold(x, w1, cu_seqlens, E):
+def _torch_gemm_gated_gold(x, w1, cu_seqlens, E, swiglu_clamp_value=0.0):
     """Torch gold: per-expert grouped GEMM + SwiGLU (interleaved layout).
 
     x:  (total_M, H) bf16
@@ -69,6 +69,9 @@ def _torch_gemm_gated_gold(x, w1, cu_seqlens, E):
     z_f32 = z.float()
     gate = z_f32[:, 0::2]
     up = z_f32[:, 1::2]
+    if swiglu_clamp_value > 0.0:
+        gate = gate.clamp(max=swiglu_clamp_value)
+        up = up.clamp(min=-swiglu_clamp_value, max=swiglu_clamp_value)
     y1 = (gate * torch.sigmoid(gate) * up).to(torch.bfloat16)
     return z, y1
 
@@ -195,3 +198,53 @@ def test_bf16_vs_fp8(T, H, I, E, K, seed):
     else:
         max_abs = (fp8_y1.float() - bf16_y1.float()).abs().max().item()
         assert max_abs < 0.01, f"FP8 vs BF16 y1 max_abs {max_abs:.6f} >= 0.01 (near-zero ref)"
+
+
+def test_swiglu_clamp_bf16_and_fp8_epilogues(seed):
+    """Clamp applies in GEMM-gated epilogues and leaves preact z unchanged."""
+    from sonicmoe.quack_utils.gemm_interface import gemm_gated
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+        quantize_and_pack_activation,
+        precompute_weight_fp8_for_fused_gated,
+    )
+
+    T, H, I, E, K = 256, 128, 128, 2, 1
+    clamp = 0.35
+    TK, total_M, cu_seqlens, _ = _setup_uniform_routing(T, H, I, E, K)
+    x = torch.randn(total_M, H, dtype=torch.bfloat16, device="cuda") * 0.15
+    w1 = torch.randn(2 * I, H, E, dtype=torch.bfloat16, device="cuda") * 0.15
+
+    gold_z, gold_y1 = _torch_gemm_gated_gold(x, w1, cu_seqlens, E, swiglu_clamp_value=clamp)
+    _, unclamped_y1 = _torch_gemm_gated_gold(x, w1, cu_seqlens, E)
+    assert (gold_y1.float() - unclamped_y1.float()).abs().max().item() > 1e-4
+
+    w1_3d = w1.permute(2, 1, 0).contiguous()
+    preact, postact = gemm_gated(
+        x, w1_3d, activation="swiglu", cu_seqlens_m=cu_seqlens, swiglu_clamp_value=clamp
+    )
+    _report_metrics(preact, gold_z, "z: BF16 clamp vs torch")
+    _report_metrics(postact, gold_y1, "y1: BF16 clamp vs torch")
+    assert_bf16_close(preact, gold_z, atol=1.4e-2)
+    assert_bf16_close(postact, gold_y1, atol=1.4e-2)
+
+    x_fp8, a_scales = quantize_and_pack_activation(x)
+    w_fp8, b_scales = precompute_weight_fp8_for_fused_gated(w1)
+    fp8_z, fp8_y1 = gemm_gated(
+        x_fp8, w_fp8, activation="swiglu", out_dtype=torch.bfloat16, postact_dtype=torch.bfloat16,
+        cu_seqlens_m=cu_seqlens, a_scales=a_scales, b_scales=b_scales,
+        swiglu_clamp_value=clamp,
+    )
+    _report_metrics(fp8_z, gold_z, "z: FP8 clamp vs torch")
+    r, c = _report_metrics(fp8_y1, gold_y1, "y1: FP8 clamp vs torch")
+    assert r < 0.12 and c > 0.985
+
+    z_scale_out = torch.empty(total_M, (2 * I) // 32, dtype=torch.uint8, device="cuda")
+    fp8_z_q, fp8_y1_q = gemm_gated(
+        x_fp8, w_fp8, activation="swiglu", out_dtype=torch.float8_e4m3fn, postact_dtype=torch.bfloat16,
+        cu_seqlens_m=cu_seqlens, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out,
+        swiglu_clamp_value=clamp,
+    )
+    assert fp8_z_q.dtype == torch.float8_e4m3fn
+    assert z_scale_out.view(torch.uint8).to(torch.int32).sum().item() > 0
+    r_q, c_q = _report_metrics(fp8_y1_q, gold_y1, "y1: z-quant epilogue clamp vs torch")
+    assert r_q < 0.12 and c_q > 0.985

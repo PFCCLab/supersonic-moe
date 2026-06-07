@@ -235,6 +235,37 @@ def _swiglu_backward_interleaved(
     return swiglu_backward_triton(dy1, z, s)
 
 
+def _swiglu_forward_clamp_reference(z: torch.Tensor, clamp_value: float) -> torch.Tensor:
+    gate = z[..., 0::2].float().clamp(max=clamp_value)
+    up = z[..., 1::2].float().clamp(min=-clamp_value, max=clamp_value)
+    return (gate * torch.sigmoid(gate) * up).to(torch.bfloat16)
+
+
+def _swiglu_backward_clamp_reference(
+    dy1: torch.Tensor,
+    z: torch.Tensor,
+    s: torch.Tensor,
+    clamp_value: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    gate = z[..., 0::2].float()
+    up = z[..., 1::2].float()
+    gate_c = gate.clamp(max=clamp_value)
+    up_c = up.clamp(min=-clamp_value, max=clamp_value)
+    sig = torch.sigmoid(gate_c)
+    silu = gate_c * sig
+    y1s = (silu * up_c * s.unsqueeze(-1).float()).to(torch.bfloat16)
+    dy = dy1.float() * s.unsqueeze(-1).float()
+    dgate = dy * up_c * sig * (1.0 + gate_c * (1.0 - sig))
+    dup = dy * silu
+    dgate = torch.where(gate <= clamp_value, dgate, torch.zeros_like(dgate))
+    dup = torch.where(up.abs() <= clamp_value, dup, torch.zeros_like(dup))
+    dz = torch.empty_like(z, dtype=torch.bfloat16)
+    dz[..., 0::2] = dgate.to(torch.bfloat16)
+    dz[..., 1::2] = dup.to(torch.bfloat16)
+    ds = (dy1.float() * (silu * up_c)).sum(dim=-1)
+    return dz, y1s, ds
+
+
 def _fused_blockscaled_gated_forward(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -344,6 +375,7 @@ def _fused_blockscaled_gated_forward(
         tuned=False,
         z_scale_out=z_scale_out,
         postact_scale_out=postact_scale_out,
+        swiglu_clamp_value=cfg.swiglu_clamp_value,
     )
     del x_fp8, x_scales_tk_e8m0
 
@@ -607,6 +639,7 @@ def _padded_blockscaled_gated_forward(
         b_scales=w1_scales,
         dynamic_scheduler=False,
         tuned=False,
+        swiglu_clamp_value=_get_fp8_config().swiglu_clamp_value,
     )
     del x_fp8, x_scales_tk_e8m0, padded_gather_idx
 
@@ -895,7 +928,7 @@ class _FP8Config:
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
-        "iso32_weight", "dz_iso32",
+        "iso32_weight", "dz_iso32", "swiglu_clamp_value",
     )
 
     def __init__(self) -> None:
@@ -912,9 +945,11 @@ class _FP8Config:
         if active_cfg is not None:
             self.iso32_weight = active_cfg.resolve_iso32_weight()
             self.dz_iso32 = active_cfg.resolve_dz_iso32()
+            self.swiglu_clamp_value = active_cfg.resolve_swiglu_clamp_value()
         else:
             self.iso32_weight = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
             self.dz_iso32 = os.environ.get("SONIC_MOE_DZ_ISO32", "0") != "0"
+            self.swiglu_clamp_value = 0.0
 
     # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
     # Session 53 re-benchmarked after cache fix + stash:
@@ -950,6 +985,7 @@ class _FP8Config:
         cfg.alignment_assumed = False
         cfg.iso32_weight = False
         cfg.dz_iso32 = False
+        cfg.swiglu_clamp_value = 0.0
         return cfg
 
 
@@ -1322,7 +1358,13 @@ class _UpProjection(torch.autograd.Function):
 
                     # Fused SwiGLU+quant only when segments are aligned
                     if cfg.fused_swiglu_quant:
-                        if cfg.save_z_fp8:
+                        if cfg.swiglu_clamp_value > 0.0:
+                            y1 = _swiglu_forward_clamp_reference(z, cfg.swiglu_clamp_value)
+                            if cfg.save_z_fp8:
+                                z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
+                                _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                            y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                        elif cfg.save_z_fp8:
                             # Fused SwiGLU+y1_quant+z_save: read z ONCE
                             if swiglu_forward_quant_pack_zsave_triton is None:
                                 raise RuntimeError("fused SwiGLU z-save quant helper is unavailable")
@@ -1330,12 +1372,18 @@ class _UpProjection(torch.autograd.Function):
                                 swiglu_forward_quant_pack_zsave_triton(z)
                             )
                             _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                            y1 = y1_fp8
                         else:
-                            y1_fp8, y1_packed_scales = swiglu_forward_quant_pack_triton(z)
-                        _PREQUANTIZED_SCALES["fwd"] = (y1_fp8, y1_fp8, y1_packed_scales)
-                        y1 = y1_fp8
+                            y1 = _swiglu_forward_interleaved(z)
+                            y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                        _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
+                        if cfg.swiglu_clamp_value <= 0.0 and cfg.save_z_fp8:
+                            y1 = y1_fp8
                     else:
-                        y1 = _swiglu_forward_interleaved(z)
+                        if cfg.swiglu_clamp_value > 0.0:
+                            y1 = _swiglu_forward_clamp_reference(z, cfg.swiglu_clamp_value)
+                        else:
+                            y1 = _swiglu_forward_interleaved(z)
                 else:
                     if fp8_weight_payload is None:
                         raise RuntimeError("Sonic FP8 forward requires explicit weight payload; call fp8_quant_weight() before FP8 forward")
@@ -1356,6 +1404,7 @@ class _UpProjection(torch.autograd.Function):
                     postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
                     dynamic_scheduler=False,
                     tuned=False,
+                    swiglu_clamp_value=cfg.swiglu_clamp_value,
                 )
         else:
             raise RuntimeError(
@@ -1373,7 +1422,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.stream_id = stream_id
         ctx.use_quack_gemm = use_quack_gemm
         # Store FP8 config snapshot for backward (avoids os.getenv in backward).
-        ctx._fp8_cfg = cfg if (use_quack_gemm and cfg.enabled) else _FP8Config.disabled()
+        ctx._fp8_cfg = cfg if use_quack_gemm else _FP8Config.disabled()
         # Legacy compat: keep individual flags for code that reads them directly.
         ctx._fp8_enabled = ctx._fp8_cfg.enabled
         ctx._alignment_assumed = ctx._fp8_cfg.alignment_assumed
@@ -1961,7 +2010,7 @@ class _DownProjection(torch.autograd.Function):
         ctx.stream_id = stream_id
         ctx.use_quack_gemm = use_quack_gemm
         # Store FP8 config snapshot for backward.
-        ctx._fp8_cfg = cfg if (use_quack_gemm and cfg.enabled) else _FP8Config.disabled()
+        ctx._fp8_cfg = cfg if use_quack_gemm else _FP8Config.disabled()
         # Legacy compat aliases
         ctx._fp8_enabled_flag = ctx._fp8_cfg.enabled
         ctx._alignment_assumed_flag = ctx._fp8_cfg.alignment_assumed
@@ -2343,6 +2392,7 @@ class _DownProjection(torch.autograd.Function):
                         iso32_dz_col_scales=dz_epi_col_scales_3d,
                         y1s_col_fp8=None,
                         y1s_col_scales=y1s_col_scales_epi,
+                        swiglu_clamp_value=ctx._fp8_cfg.swiglu_clamp_value,
                     )
                     ds = colvec_reduce_partial.sum(dim=-1)
                     del dout_fp8, dout_scales, z, colvec_reduce_partial
@@ -2550,24 +2600,44 @@ class _DownProjection(torch.autograd.Function):
                             # 1. Dequant z_fp8 -> z_bf16  (~0.046ms, BLOCK_ROWS=16)
                             # 2. dSwiGLU + quant + ISA-pack + dz_bf16  (~0.36ms, single kernel)
                             # Total ~0.41ms vs fused 0.47ms (12% faster)
-                            if swiglu_backward_quant_pack_triton is None:
-                                raise RuntimeError("fused SwiGLU backward quant helper is unavailable")
-                            z_bf16 = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
-                            dz_fp8, dz_packed_scales, y1s, ds, dz = (
-                                swiglu_backward_quant_pack_triton(
-                                    dy1, z_bf16, s, return_dz_bf16=True
+                            if ctx._fp8_cfg.swiglu_clamp_value > 0.0:
+                                z_bf16 = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                                dz, y1s, ds = _swiglu_backward_clamp_reference(
+                                    dy1, z_bf16, s, ctx._fp8_cfg.swiglu_clamp_value
                                 )
-                            )
-                            del z_bf16
+                                del z_bf16
+                                dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+                            else:
+                                if swiglu_backward_quant_pack_triton is None:
+                                    raise RuntimeError("fused SwiGLU backward quant helper is unavailable")
+                                z_bf16 = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                                dz_fp8, dz_packed_scales, y1s, ds, dz = (
+                                    swiglu_backward_quant_pack_triton(
+                                        dy1, z_bf16, s, return_dz_bf16=True
+                                    )
+                                )
+                                del z_bf16
                             _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                         else:
                             # Fused: read fp8 z directly, skip bf16 materialization
-                            dz, y1s, ds = swiglu_backward_from_fp8_triton(
-                                dy1, z_fp8, z_raw_scales_u8, s
-                            )
+                            if ctx._fp8_cfg.swiglu_clamp_value > 0.0:
+                                z_bf16 = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                                dz, y1s, ds = _swiglu_backward_clamp_reference(
+                                    dy1, z_bf16, s, ctx._fp8_cfg.swiglu_clamp_value
+                                )
+                                del z_bf16
+                            else:
+                                dz, y1s, ds = swiglu_backward_from_fp8_triton(
+                                    dy1, z_fp8, z_raw_scales_u8, s
+                                )
                         del z_fp8, z_raw_scales_u8
                     else:
-                        dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
+                        if ctx._fp8_cfg.swiglu_clamp_value > 0.0:
+                            dz, y1s, ds = _swiglu_backward_clamp_reference(
+                                dy1, z, s, ctx._fp8_cfg.swiglu_clamp_value
+                            )
+                        else:
+                            dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
                     del dy1
 
                     _log_stage_memory("backward:down-proj-dgated")
@@ -2618,6 +2688,7 @@ class _DownProjection(torch.autograd.Function):
                     A_idx=x_gather_idx,
                     dynamic_scheduler=False,
                     tuned=False,
+                    swiglu_clamp_value=ctx._fp8_cfg.swiglu_clamp_value,
                 )
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
@@ -2780,6 +2851,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
                 a_scales=x_scales,
                 b_scales=w1_scales,
                 tuned=False,
+                swiglu_clamp_value=_get_fp8_config().swiglu_clamp_value,
             )
             del x_fp8, x_scales
         elif _fp8_enabled():
@@ -2795,6 +2867,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
                 postact_dtype=torch.float8_e4m3fn,
                 store_preact=needs_preact,
                 dynamic_scheduler=False,
+                swiglu_clamp_value=_get_fp8_config().swiglu_clamp_value,
             )
         else:
             z, y1 = gemm_gated(
@@ -2806,6 +2879,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
                 postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
                 store_preact=needs_preact,
                 dynamic_scheduler=False,
+                swiglu_clamp_value=_get_fp8_config().swiglu_clamp_value,
             )
         _log_stage_memory("forward:up-proj")
 

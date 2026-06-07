@@ -107,7 +107,10 @@ def gemm_gated(
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # (total_m, N//32) uint8 — epilogue quant scale output
     postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
+    swiglu_clamp_value: float = 0.0,
 ) -> None:
+    if activation != "swiglu":
+        swiglu_clamp_value = 0.0
     blockscaled = a_scales is not None and b_scales is not None
     epilogue_quant = z_scale_out is not None
     postact_quant = postact_scale_out is not None
@@ -130,7 +133,8 @@ def gemm_gated(
         fast_key = (
             A.dtype, B.dtype, D.dtype if D is not None else None, PostAct.dtype, C.dtype if C is not None else None,
             activation, tile_M, tile_N, cluster_M, cluster_N, pingpong, max_swizzle_size,
-            epilogue_quant, postact_quant, A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
+            epilogue_quant, postact_quant, float(swiglu_clamp_value),
+            A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
         )
         cached = _GATED_FAST_PATH.get(fast_key)
         if cached is not None:
@@ -147,7 +151,9 @@ def gemm_gated(
                 epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)
             if postact_quant:
                 epi_kwargs["mPostActScaleIsa"] = _make_cute_tensor_dynamic(postact_scale_out, leading_dim=2)
-            epi_args = GemmCls.EpilogueArguments(post_cute, epi_base, **epi_kwargs)
+            epi_args = GemmCls.EpilogueArguments(
+                post_cute, epi_base, swiglu_clamp_value=float(swiglu_clamp_value), **epi_kwargs
+            )
             varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
             a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
             b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
@@ -257,6 +263,7 @@ def gemm_gated(
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
+        swiglu_clamp_value=float(swiglu_clamp_value),
         mRowVecBroadcast=(
             from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
             if rowvec_bias is not None
@@ -314,6 +321,7 @@ def gemm_gated(
         blockscaled,
         epilogue_quant,
         postact_quant,
+        float(swiglu_clamp_value),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_gated.compile_cache
