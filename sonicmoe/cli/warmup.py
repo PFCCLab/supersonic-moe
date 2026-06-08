@@ -75,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     os.environ.setdefault("SONIC_MOE_JIT_VERBOSE", "1")
 
-    from sonicmoe.cache_manager import (
+    from ..cache_manager import (
         setup_cache,
         clear_all_caches,
         cache_stats,
@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
         clear_all_caches()
         logging.info("[warmup-cli] Cleared cache root %s", get_cache_root())
 
-    from sonicmoe.jit_warmup import warmup_jit, warmup_jit_parallel
+    from ..jit_warmup import warmup_jit, warmup_jit_parallel
 
     # Default production sweep covers the seqlen × topk regimes that the
     # dynamic-dim JIT keys still re-tune for (small/medium/large total_K).

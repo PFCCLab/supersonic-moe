@@ -286,5 +286,5 @@ def gemm_gated(
     )
 
 
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 gemm_gated.compile_cache = _ICC("gated")

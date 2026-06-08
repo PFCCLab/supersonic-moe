@@ -10,7 +10,7 @@ import inspect
 # `@triton.autotune` decorators, because Autotuner.__init__ snapshots the
 # `cache_results` flag at decoration time. Without this, every cold process
 # re-runs ~30 s of autotune sweep for token_gather_sum_kernel alone.
-from sonicmoe import _triton_autotune_persist as _triton_autotune_persist  # noqa: F401
+from . import _triton_autotune_persist as _triton_autotune_persist  # noqa: F401
 
 # ── Triton ↔ Paddle stream compat ────────────────────────────────────────────
 # Must run before any Triton kernel is launched. Triton binds
@@ -18,9 +18,9 @@ from sonicmoe import _triton_autotune_persist as _triton_autotune_persist  # noq
 # patch every sonicmoe Triton kernel launches on the legacy NULL stream while
 # Paddle's GEMMs run on Paddle's own compute stream — causing implicit
 # cross-stream sync (perf tax) and producer/consumer race hazards.
-from sonicmoe import _triton_stream_compat as _triton_stream_compat  # noqa: F401
-from sonicmoe import _quack_compat as _quack_compat  # noqa: F401
-from sonicmoe import ernie_compat as ernie_compat  # noqa: F401
+from . import _triton_stream_compat as _triton_stream_compat  # noqa: F401
+from . import _quack_compat as _quack_compat  # noqa: F401
+from . import ernie_compat as ernie_compat  # noqa: F401
 
 # ── Paddle compat shims for missing torch.cuda internals ─────────────────────
 # torch.random.manual_seed() calls torch.cuda._is_in_bad_fork() internally.
@@ -91,3 +91,4 @@ from .moe import MoE
 from .quack_utils import make_blockscaled_grouped_reverse_scatter_idx, pack_blockscaled_1x32_scales
 from .ernie_compat.deepep_metadata import deepep_to_sonic_metadata, deepep_topk_to_sonic_metadata
 from .ernie_compat.mlp_node_v2 import _differentiable_router_scores
+from . import jit_warmup as jit_warmup  # noqa: F401

@@ -33,14 +33,14 @@ import torch
 # Try to import the JIT-compiled CUDA kernels
 _HAS_CUDA_KERNEL = False
 try:
-    from sonicmoe.ernie_compat.deepep_metadata_cuda import deepep_metadata_cuda
+    from .deepep_metadata_cuda import deepep_metadata_cuda
     _HAS_CUDA_KERNEL = True
 except Exception:
     pass
 
 _HAS_TOPK_CUDA_KERNEL = False
 try:
-    from sonicmoe.ernie_compat.deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
+    from .deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
     _HAS_TOPK_CUDA_KERNEL = True
 except Exception:
     pass

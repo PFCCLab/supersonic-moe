@@ -1,8 +1,8 @@
 """JIT warmup: pre-compile all CuTe + Triton kernels before training begins.
 
-Usage::
+Usage through PaddleFleet::
 
-    from sonicmoe.jit_warmup import warmup_jit
+    from paddlefleet_ops.sonicmoe.jit_warmup import warmup_jit
 
     # Dynamic-dim mode (recommended): single warmup covers ALL seqlens.
     warmup_jit(E=8, H=3072, I=1536, device="cuda")
@@ -22,6 +22,17 @@ import os
 import time
 
 import torch
+
+from . import functional
+from .cache_manager import setup_cache, is_warm, mark_warm
+from .enums import ActivationType
+from .functional import clear_all_fp8_weight_caches, _refresh_fp8_config
+from .functional.utils import enable_fp8
+from .ernie_compat.mlp_node_v2 import (
+    SonicMoEMlpNode,
+    flush_native_grads,
+    invalidate_weight_caches,
+)
 
 _log = logging.getLogger("sonicmoe.jit")
 
@@ -72,9 +83,8 @@ def warmup_jit(
         Run warmup even if the sentinel matches.
     """
     if device is None:
-        # Resolve current device through paddle to avoid hitting the
-        # torch-proxy lazy-import issue when sonicmoe is imported under
-        # ``enable_torch_proxy(scope={"sonicmoe", ...})``.
+        # Resolve current device through paddle because production enters warmup
+        # through PaddleFleet's ecosystem import path.
         import paddle as _paddle
         try:
             place = _paddle.framework._current_expected_place()
@@ -86,7 +96,6 @@ def warmup_jit(
         except Exception:
             dev_id = 0
         device = f"cuda:{int(dev_id)}"
-    from sonicmoe.cache_manager import setup_cache, is_warm, mark_warm
 
     if cache_dir:
         setup_cache(cache_dir)
@@ -138,6 +147,7 @@ def warmup_jit_parallel(
     total_K_list: list[int] | None = None,
     workers: int = 2,
     cache_dir: str | None = None,
+    import_module: str = "paddlefleet_ops.sonicmoe.jit_warmup",
 ) -> float:
     """Multi-process cold warmup. Spawns ``workers`` subprocesses, each
     warming a partition of ``total_K_list``. All share the same disk cache
@@ -162,13 +172,12 @@ def warmup_jit_parallel(
     buckets = [b for b in buckets if b]
 
     snippet_template = """\
+import importlib
 import os
 os.environ.setdefault('SONIC_MOE_JIT_VERBOSE', '1')
-import paddle
-paddle.compat.enable_torch_proxy(scope={'sonicmoe','quack','triton'}, silent=True)
-from sonicmoe.cache_manager import setup_cache; setup_cache()
-from sonicmoe.jit_warmup import warmup_jit
-warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, force=True, skip_if_warm=False)
+mod = importlib.import_module(%r)
+mod.setup_cache()
+mod.warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, force=True, skip_if_warm=False)
 """
     env_base = os.environ.copy()
     env_base.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
@@ -190,7 +199,7 @@ warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, force=True, skip_if_warm=F
     procs = []
     t0 = time.perf_counter()
     for w_idx, ks in enumerate(buckets):
-        code = snippet_template % (E, H, I, repr(bool(fp8)), repr(list(ks)))
+        code = snippet_template % (import_module, E, H, I, repr(bool(fp8)), repr(list(ks)))
         env_w = env_base.copy()
         env_w["CUDA_VISIBLE_DEVICES"] = gpu_pool[w_idx % len(gpu_pool)]
         p = subprocess.Popen(
@@ -227,17 +236,7 @@ def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool):
       - CUDA topk metadata kernel
     """
     import paddle
-    paddle.compat.enable_torch_proxy(
-        scope={"sonicmoe", "quack", "triton"}, silent=True,
-    )
 
-    from sonicmoe.enums import ActivationType
-    from sonicmoe.functional import clear_all_fp8_weight_caches, _refresh_fp8_config
-    from sonicmoe.functional.utils import enable_fp8
-    from sonicmoe.ernie_compat.mlp_node_v2 import (
-        SonicMoEMlpNode, invalidate_weight_caches, flush_native_grads,
-    )
-    import sonicmoe.functional as functional
     functional._ALIGNMENT_ASSUMED = True
 
     topk = min(E, 8)

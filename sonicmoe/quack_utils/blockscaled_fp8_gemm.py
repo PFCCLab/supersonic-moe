@@ -111,7 +111,7 @@ _WEIGHT_CACHE: dict[
     tuple[int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 _COMPILE_CACHE = _ICC("blockscaled_grouped")
 _PAD_PLAN_CACHE: dict = {}       # content-key -> plan
 # Fast-path cache: skip validation/tensor-info/compile-key on steady-state calls.
