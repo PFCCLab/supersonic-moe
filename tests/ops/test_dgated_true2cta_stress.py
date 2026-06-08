@@ -88,7 +88,7 @@ def build(TK, H, I, E, seed=0):
                 gi=gi, dsc=dsc, TK=TK)
 
 
-def run(d, cu, TM):
+def run(d, cu, TM, clamp=0.0):
     TK, n = d["TK"], d["n"]
     dz = torch.empty((TK, n * 2), dtype=torch.bfloat16, device=DEV)
     cr = torch.empty((TK, _div_up(n, 128)), dtype=torch.float32, device=DEV)
@@ -99,6 +99,7 @@ def run(d, cu, TM):
         colvec_scale=d["sf"], colvec_reduce=cr,
         cu_seqlens_m=cu, A_idx=d["gi"], a_scales=d["dsc"], b_scales=d["w2s"],
         preact_fp8=None, preact_scales=None, y1s_col_fp8=None, y1s_col_scales=None,
+        swiglu_clamp_value=clamp,
     )
     return dz, cr, y
 
@@ -160,16 +161,20 @@ def main():
     ap.add_argument("--case", default=None, help="single case for sanitizer")
     ap.add_argument("--tm", type=int, default=256)
     ap.add_argument("--routing", default="uniform")
+    ap.add_argument("--clamp", type=float, default=0.0)
     args = ap.parse_args()
 
     if args.case:  # single-config mode (for compute-sanitizer)
         TK, H, I, E = CASES[args.case]
         d = build(TK, H, I, E)
         cu = {"uniform": _cu_uniform, "skew": _cu_skew, "single": _cu_single}[args.routing](TK, E)
-        dz, cr, y = run(d, cu, args.tm)
+        dz, cr, y = run(d, cu, args.tm, clamp=args.clamp)
         torch.cuda.synchronize()
-        _check_finite(f"{args.case}/{args.routing}/tm{args.tm}", dz, cr, y)
-        print(f"[{args.case}/{args.routing}/tm{args.tm}] finite OK dz_norm={dz.float().norm().item():.4f}")
+        _check_finite(f"{args.case}/{args.routing}/tm{args.tm}/clamp{args.clamp}", dz, cr, y)
+        print(
+            f"[{args.case}/{args.routing}/tm{args.tm}/clamp{args.clamp}] "
+            f"finite OK dz_norm={dz.float().norm().item():.4f}"
+        )
         return
 
     allok = True

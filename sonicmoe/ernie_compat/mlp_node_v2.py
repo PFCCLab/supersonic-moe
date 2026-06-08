@@ -40,6 +40,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ..config import SonicMoEConfig, get_active_config
 from ..enums import ActivationType
 from .deepep_metadata import (
     deepep_topk_to_sonic_metadata,
@@ -467,6 +468,8 @@ class SonicMoEMlpNode:
         Activation function (default SWIGLU).
     stream_id
         CUDA stream index for FP8 ops.
+    swiglu_clamp_value
+        User-controlled SwiGLU clamp value; 0.0 disables the clamp.
     """
 
     def __init__(
@@ -477,6 +480,7 @@ class SonicMoEMlpNode:
         intermediate_size: int,
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
+        swiglu_clamp_value: float = 0.0,
     ):
         self._experts = list(experts)
         self._E = n_experts
@@ -484,6 +488,7 @@ class SonicMoEMlpNode:
         self._I = intermediate_size
         self._activation_type = activation_type
         self._stream_id = stream_id
+        self._swiglu_clamp_value = max(float(swiglu_clamp_value), 0.0)
 
         # Per-instance state — no module-level globals.
         self._w_cache: dict[tuple, torch.Tensor] = {}
@@ -859,41 +864,50 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
 
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
-        with enable_fp8(use_fp8):
-            _refresh_fp8_config()
-            y1, z = _UpProjection.forward(
-                up_ctx,
-                hidden_states, w1, None,        # x, w1, b1
-                expert_frequency_offset, TK_padded, None, stream_id,
-                x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-                True,                           # is_varlen_K
-                activation_type,
-                False,                          # is_inference_mode_enabled
-                False,                          # use_low_precision_postact_buffer
-                fp8_activation_payload,
-                fp8_weight_payload,
+        active_cfg = get_active_config()
+        if active_cfg is not None:
+            cfg = (
+                active_cfg.replace(swiglu_clamp_value=node._swiglu_clamp_value)
+                if node._swiglu_clamp_value > 0.0 else active_cfg
             )
+        else:
+            cfg = SonicMoEConfig(swiglu_clamp_value=node._swiglu_clamp_value)
+        with cfg.activate():
+            with enable_fp8(use_fp8):
+                _refresh_fp8_config()
+                y1, z = _UpProjection.forward(
+                    up_ctx,
+                    hidden_states, w1, None,        # x, w1, b1
+                    expert_frequency_offset, TK_padded, None, stream_id,
+                    x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+                    num_activated_expert_per_token_offset,
+                    True,                           # is_varlen_K
+                    activation_type,
+                    False,                          # is_inference_mode_enabled
+                    False,                          # use_low_precision_postact_buffer
+                    fp8_activation_payload,
+                    fp8_weight_payload,
+                )
 
-        # ── DownProjection forward (via FakeCtx) ─────────────────────────
-        down_ctx = _FakeCtx()
-        with enable_fp8(use_fp8):
-            out = _DownProjection.forward(
-                down_ctx,
-                y1, z, w2, None,                # y1, z, w2, b2
-                router_scores, s_scatter_idx, expert_frequency_offset,
-                T_down, topk, stream_id,
-                x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-                True,                           # is_varlen_K
-                activation_type,
-                None,                           # fp8_protocol
-                None,
-                fp8_weight_payload,
-                router_scores_expert_order,
-                router_scores_token_order,
-                score_src_idx,
-            )
+            # ── DownProjection forward (via FakeCtx) ─────────────────────────
+            down_ctx = _FakeCtx()
+            with enable_fp8(use_fp8):
+                out = _DownProjection.forward(
+                    down_ctx,
+                    y1, z, w2, None,                # y1, z, w2, b2
+                    router_scores, s_scatter_idx, expert_frequency_offset,
+                    T_down, topk, stream_id,
+                    x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+                    num_activated_expert_per_token_offset,
+                    True,                           # is_varlen_K
+                    activation_type,
+                    None,                           # fp8_protocol
+                    None,
+                    fp8_weight_payload,
+                    router_scores_expert_order,
+                    router_scores_token_order,
+                    score_src_idx,
+                )
 
         ctx._up_ctx = up_ctx
         ctx._down_ctx = down_ctx
