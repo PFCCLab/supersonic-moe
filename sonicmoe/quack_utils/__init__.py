@@ -47,6 +47,7 @@ from .blockscaled_fp8_gemm import (
     pack_blockscaled_1x32_scales,
     prefetch_blockscaled_w2_fp8,
     precompute_weight_fp8,
+    quantize_native_fp8_weights,
     precompute_weight_fp8_for_direct_fused_dgated,
     precompute_weight_fp8_for_fused_dgated,
     precompute_weight_fp8_for_fused_gated,

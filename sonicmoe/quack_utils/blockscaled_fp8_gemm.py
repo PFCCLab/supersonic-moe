@@ -5106,3 +5106,24 @@ def blockscaled_fp8_weight_grad_gemm_fast(
         out.copy_(grouped_out)
         return out
     return grouped_out
+
+
+def quantize_native_fp8_weights(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    iso32: Optional[bool] = None,
+) -> dict[str, object]:
+    if iso32 is None:
+        iso32 = _iso32_weight_enabled()
+    if iso32:
+        return {
+            "format": "iso32",
+            "w1": iso32_dual_quantize_weight_3d(w1.permute(2, 0, 1)),
+            "w2": iso32_dual_quantize_weight_3d(w2.permute(2, 0, 1)),
+        }
+    return {
+        "format": "1x32",
+        "w1": _quantize_weight_pair_3d_triton(w1.permute(2, 0, 1)),
+        "w2": _quantize_weight_pair_3d_triton(w2.permute(2, 0, 1)),
+    }

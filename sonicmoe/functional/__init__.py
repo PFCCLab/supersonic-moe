@@ -283,6 +283,18 @@ def _recompute_z_fp8(
     return z_fp8, z_raw_scales
 
 
+def _get_fp8_weight_attr(
+    weight: torch.Tensor,
+    key: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    attr = getattr(weight, key, None)
+    if attr is None:
+        raise RuntimeError(
+            f"Sonic FP8 forward requires weight.{key} attribute; "
+            "call quant_weight() before FP8 forward"
+        )
+    return attr
+
 # ---------------------------------------------------------------------------
 # Route-level padding: pad routing metadata once so the alignment check
 # sees 128-aligned expert_frequency_offset → entire fwd+bwd runs the proven
@@ -875,8 +887,9 @@ class _UpProjection(torch.autograd.Function):
                 cfg.alignment_assumed = aligned
 
                 if aligned and cfg.fused_gated:
+                    w1_fp8 = _get_fp8_weight_attr(w1, "fp8")
                     z, y1 = _fused_blockscaled_gated_forward(
-                        x, w1, expert_frequency_offset, x_gather_idx
+                        x, w1, expert_frequency_offset, x_gather_idx, w1_fp8_pre=w1_fp8
                     )
                     if cfg.save_z_fp8 and cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);
@@ -999,9 +1012,12 @@ class _UpProjection(torch.autograd.Function):
             ctx._w1_device = w1.device
             # Eagerly lookup w1T fp8 cache — will be used in backward actgrad.
             # This is a cache hit (zero compute) since forward already populated the fused cache.
-            _w1T_fp8, _w1T_scales = _STASHED_FP8_WEIGHTS.get("w1T_varlen", None) or precompute_weight_fp8(w1, permute=(1, 0, 2))
-            ctx._w1T_fp8 = _w1T_fp8
-            ctx._w1T_scales = _w1T_scales
+            # _w1T_fp8, _w1T_scales = _STASHED_FP8_WEIGHTS.get("w1T_varlen", None) or precompute_weight_fp8(w1, permute=(1, 0, 2))
+            # ctx._w1T_fp8 = _w1T_fp8
+            # ctx._w1T_scales = _w1T_scales
+            ctx._w1T_fp8, ctx._w1T_scales = _get_fp8_weight_attr(
+                w1, "transposed_fp8"
+            )
             ctx.save_for_backward(
                 x,
                 # w1 omitted — backward uses ctx._w1T_fp8 + metadata
@@ -1397,7 +1413,8 @@ class _DownProjection(torch.autograd.Function):
                     )
                     if has_prequant:
                         _PREQUANT_HIT_COUNT["fwd"] += 1
-                        w2_fp8, w2_scales = _STASHED_FP8_WEIGHTS.get("w2_varlen", None) or precompute_weight_fp8(w2)
+                        # w2_fp8, w2_scales = _STASHED_FP8_WEIGHTS.get("w2_varlen", None) or precompute_weight_fp8(w2)
+                        w2_fp8, w2_scales = _get_fp8_weight_attr(w2, "fp8")
                         _, y1_fp8, y1_packed_scales = prequant
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
@@ -1409,7 +1426,8 @@ class _DownProjection(torch.autograd.Function):
                         del y1_fp8, y1_packed_scales
                     else:
                         # Fallback: inline FP8 quant (prequant cache miss)
-                        w2_fp8, w2_scales = _STASHED_FP8_WEIGHTS.get("w2_varlen", None) or precompute_weight_fp8(w2)
+                        # w2_fp8, w2_scales = _STASHED_FP8_WEIGHTS.get("w2_varlen", None) or precompute_weight_fp8(w2)
+                        w2_fp8, w2_scales = _get_fp8_weight_attr(w2, "fp8")
                         y1_fp8, y1_scales = quantize_and_pack_activation(y1)
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
@@ -1422,7 +1440,8 @@ class _DownProjection(torch.autograd.Function):
                 else:
                     # Blockscaled FP8 down-proj: use pre-quantized y1 if available
                     # from fused SwiGLU+quant in _UpProjection.forward.
-                    w2_fp8, w2_scales = precompute_weight_fp8(w2)
+                    # w2_fp8, w2_scales = precompute_weight_fp8(w2)
+                    w2_fp8, w2_scales = _get_fp8_weight_attr(w2, "fp8")
                     prequant = _PREQUANTIZED_SCALES.pop("fwd", None)
                     has_prequant = (
                         prequant is not None
@@ -1580,7 +1599,8 @@ class _DownProjection(torch.autograd.Function):
                         z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
             if _w2_decouple:
                 # Eagerly look up w2 dgated fp8 cache for backward.
-                _w2_dgated_fp8, _w2_dgated_scales = _STASHED_FP8_WEIGHTS.get("w2_dgated", None) or precompute_weight_fp8_for_direct_fused_dgated(w2)
+                # _w2_dgated_fp8, _w2_dgated_scales = _STASHED_FP8_WEIGHTS.get("w2_dgated", None) or precompute_weight_fp8_for_direct_fused_dgated(w2)
+                _w2_dgated_fp8, _w2_dgated_scales = _get_fp8_weight_attr(w2, "transposed_fp8")
                 ctx._w2_dgated_fp8 = _w2_dgated_fp8
                 ctx._w2_dgated_scales = _w2_dgated_scales
                 ctx._w2_shape = w2.shape  # (H, I, E)
