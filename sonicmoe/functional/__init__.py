@@ -1115,6 +1115,19 @@ def clear_all_fp8_weight_caches() -> None:
     clear_sgl_weight_cache()
 
 
+def _get_fp8_weight_attr(
+    weight: torch.Tensor,
+    key: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    attr = getattr(weight, key, None)
+    if attr is None:
+        raise RuntimeError(
+            f"Sonic FP8 forward requires weight.{key} attribute; "
+            "call quant_weight() before FP8 forward"
+        )
+    return attr
+
+
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
     upproj_precision = _upproj_epilogue_precision()
     downproj_mainloop_precision = _downproj_mainloop_precision()
@@ -1243,7 +1256,6 @@ class _UpProjection(torch.autograd.Function):
         is_inference_mode_enabled: bool,
         use_low_precision_postact_buffer: bool = False,
         prequant_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
-        fp8_weight_payload: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -1267,21 +1279,11 @@ class _UpProjection(torch.autograd.Function):
                 cfg.alignment_assumed = aligned
 
                 if aligned and cfg.fused_gated:
-                    if fp8_weight_payload is None:
-                        raise RuntimeError("Sonic FP8 forward requires explicit weight payload; call fp8_quant_weight() before FP8 forward")
                     x_fp8_pre = x_scales_pre = None
                     if prequant_activation_payload is not None:
                         x_fp8_pre, x_scales_pre = prequant_activation_payload
-                    w1_fused_payload = fp8_weight_payload["w1_fused"]
-                    # Gate on 128-alignment so unaligned shapes fall back to the
-                    # standalone y1 quant (else-branch below) instead of asserting.
-                    fuse_y1 = (
-                        _use_fuse_y1_quant()
-                        and not cfg.save_z_fp8
-                        and TK % 128 == 0
-                        and I % 128 == 0
-                    )
-                    z, y1, y1_fp8_fused, y1_scales_fused = _fused_blockscaled_gated_forward(
+                    w1_fused_payload = _get_fp8_weight_attr(w1, "fp8")
+                    z, y1 = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx,
                         w1_fp8_pre=w1_fused_payload,
                         x_fp8_pre=x_fp8_pre, x_scales_pre=x_scales_pre,
@@ -1385,14 +1387,12 @@ class _UpProjection(torch.autograd.Function):
                         else:
                             y1 = _swiglu_forward_interleaved(z)
                 else:
-                    if fp8_weight_payload is None:
-                        raise RuntimeError("Sonic FP8 forward requires explicit weight payload; call fp8_quant_weight() before FP8 forward")
                     # Non-aligned: pad expert segments to 128, use FP8 zero-mat
                     # path.  Overhead is only the extra padded GEMM rows (~5-25%
                     # depending on routing), much cheaper than full BF16 fallback.
                     z, y1 = _padded_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx,
-                        fp8_weight_payload["w1_fused"],
+                        _get_fp8_weight_attr(w1, "fp8"),
                     )
             else:
                 z, y1 = gemm_gated(
@@ -1443,9 +1443,9 @@ class _UpProjection(torch.autograd.Function):
             ctx._w1_shape = w1.shape  # (2I, H, E)
             ctx._w1_dtype = w1.dtype
             ctx._w1_device = w1.device
-            if fp8_weight_payload is None:
-                raise RuntimeError("Sonic FP8 backward requires explicit w1T_varlen payload")
-            ctx._w1T_fp8, ctx._w1T_scales = fp8_weight_payload["w1T_varlen"]
+            ctx._w1T_fp8, ctx._w1T_scales = _get_fp8_weight_attr(
+                w1, "transposed_fp8"
+            )
             if ctx._prequant_activation_payload:
                 x_fp8_pre, x_scales_pre = prequant_activation_payload
                 x_saved = torch.empty(1, dtype=x.dtype, device=x.device).as_strided((T, H), (0, 0))
@@ -1835,6 +1835,8 @@ class _UpProjection(torch.autograd.Function):
         grads.extend([None, None, None, None])
         if ctx._has_num_activated:
             grads.append(None)
+        if ctx._prequant_activation_payload:
+            grads.append((None, None))
         return tuple(grads)
 
 
@@ -1860,7 +1862,6 @@ class _DownProjection(torch.autograd.Function):
         activation_type: ActivationType,
         fp8_protocol: FP8Protocol | None,
         fp8_combine_grad_handle=None,
-        fp8_weight_payload: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         topk_scores_expert_order: torch.Tensor | None = None,
         topk_scores_token_order: torch.Tensor | None = None,
         score_src_idx: torch.Tensor | None = None,
@@ -1875,8 +1876,6 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             cfg = _get_fp8_config()
-            if cfg.enabled and cfg.alignment_assumed and fp8_weight_payload is None:
-                raise RuntimeError("Sonic FP8 down projection requires explicit weight payload; call fp8_quant_weight() before FP8 forward")
             if cfg.enabled and cfg.alignment_assumed:
                 if cfg.fused_gated:
                     # Use pre-quantized y1 from _UpProjection if available
@@ -1891,7 +1890,7 @@ class _DownProjection(torch.autograd.Function):
                     )
                     if has_prequant:
                         _PREQUANT_HIT_COUNT["fwd"] += 1
-                        w2_fp8, w2_scales = fp8_weight_payload["w2_varlen"]
+                        w2_fp8, w2_scales = _get_fp8_weight_attr(w2, "fp8")
                         _, y1_fp8, y1_packed_scales = prequant
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
@@ -1919,7 +1918,7 @@ class _DownProjection(torch.autograd.Function):
                             "prequant entry — refusing to quantize garbage"
                         )
                         # Fallback: inline FP8 quant (prequant cache miss)
-                        w2_fp8, w2_scales = fp8_weight_payload["w2_varlen"]
+                        w2_fp8, w2_scales = _get_fp8_weight_attr(w2, "fp8")
                         y1_fp8, y1_scales = quantize_and_pack_activation(y1)
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
@@ -1932,7 +1931,7 @@ class _DownProjection(torch.autograd.Function):
                 else:
                     # Blockscaled FP8 down-proj: use pre-quantized y1 if available
                     # from fused SwiGLU+quant in _UpProjection.forward.
-                    w2_fp8, w2_scales = fp8_weight_payload["w2_varlen"]
+                    w2_fp8, w2_scales = _get_fp8_weight_attr(w2, "fp8")
                     prequant = _PREQUANTIZED_SCALES.pop("fwd", None)
                     has_prequant = (
                         prequant is not None
@@ -2024,7 +2023,11 @@ class _DownProjection(torch.autograd.Function):
         # PyTorch Function.apply() detach behavior) without providing
         # ctx.needs_input_grad.  Defaulting to True is safe: if the caller truly
         # doesn't need ds, the autograd engine simply discards it.
-        ctx._topk_scores_needs_grad = True
+
+        if not hasattr(topk_scores, "stop_gradient"):
+            ctx._topk_scores_needs_grad = False
+        else:
+            ctx._topk_scores_needs_grad = not topk_scores.stop_gradient
         ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
         ctx._has_topk_scores_expert_order = topk_scores_expert_order is not None
         ctx._has_topk_scores_token_order = topk_scores_token_order is not None
@@ -2096,7 +2099,7 @@ class _DownProjection(torch.autograd.Function):
                     else:
                         z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
             if _w2_decouple:
-                ctx._w2_dgated_fp8, ctx._w2_dgated_scales = fp8_weight_payload["w2_dgated"]
+                ctx._w2_dgated_fp8, ctx._w2_dgated_scales = _get_fp8_weight_attr(w2, "transposed_fp8")
                 ctx._w2_shape = w2.shape  # (H, I, E)
                 ctx._w2_dtype = w2.dtype
                 ctx._w2_device = w2.device
@@ -2801,7 +2804,6 @@ def _moe_tc_softmax_topk_layer_quack_inference(
     activation_type: ActivationType,
     fp8_protocol: FP8Protocol | None,
     use_low_precision_postact_buffer: bool,
-    fp8_weight_payload: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     E = router_w.size(0)
     T = x.size(0)
@@ -2836,9 +2838,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
         else:
             aligned = False
         if _fp8_enabled() and _use_fused_blockscaled_gated() and aligned:
-            if fp8_weight_payload is None:
-                raise RuntimeError("Sonic FP8 inference requires explicit weight payload; call refresh_fp8_shadow_weights() before FP8 forward")
-            w1_fp8, w1_scales = fp8_weight_payload["w1_fused"]
+            w1_fp8, w1_scales = _get_fp8_weight_attr(w1, "fp8")
             x_fp8, x_scales = fast_gather_quantize_and_pack_activation(x, x_gather_idx)
             z, y1 = gemm_gated(
                 x_fp8,
@@ -2934,10 +2934,8 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             y2_for_router = y2.view(-1, H)
         else:
             if _fp8_enabled() and _use_fused_blockscaled_gated() and aligned:
-                if fp8_weight_payload is None:
-                    raise RuntimeError("Sonic FP8 inference requires explicit weight payload; call refresh_fp8_shadow_weights() before FP8 forward")
                 y1_fp8, y1_scales = quantize_and_pack_activation(y1)
-                w2_fp8, w2_scales = fp8_weight_payload["w2_varlen"]
+                w2_fp8, w2_scales = _get_fp8_weight_attr(w2, "fp8")
                 y2 = blockscaled_fp8_gemm_varlen(
                     y1_fp8, w2, expert_frequency_offset,
                     a_scales=y1_scales,
@@ -2986,7 +2984,6 @@ def moe_TC_softmax_topk_layer(
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
     fp8_protocol: FP8Protocol | None = None,
-    fp8_weight_payload: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -3011,7 +3008,6 @@ def moe_TC_softmax_topk_layer(
             activation_type,
             fp8_protocol,
             use_low_precision_postact_buffer,
-            fp8_weight_payload,
         )
 
     E = router_w.size(0)
@@ -3068,7 +3064,6 @@ def moe_TC_softmax_topk_layer(
         is_inference_mode_enabled,
         use_low_precision_postact_buffer,
         None,
-        fp8_weight_payload,
     )
     _log_stage_memory("forward:up-proj")
 
@@ -3145,7 +3140,6 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         fp8_protocol,
         None,
-        fp8_weight_payload,
     )
     _log_stage_memory("forward:down-proj-router")
 

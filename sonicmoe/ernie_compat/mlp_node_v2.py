@@ -498,6 +498,29 @@ class SonicMoEMlpNode:
         self._native_fp8_weight_iso32: bool | None = None
         self._fp8_weight_payload: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
 
+    @staticmethod
+    def _attach_fp8_weight_attrs(
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        payload: dict[str, tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        w1.fp8_weight = {
+            "w1_fused": payload["w1_fused"][0],
+            "w1T_varlen": payload["w1T_varlen"][0],
+        }
+        w1.fp8_scale = {
+            "w1_fused": payload["w1_fused"][1],
+            "w1T_varlen": payload["w1T_varlen"][1],
+        }
+        w2.fp8_weight = {
+            "w2_varlen": payload["w2_varlen"][0],
+            "w2_dgated": payload["w2_dgated"][0],
+        }
+        w2.fp8_scale = {
+            "w2_varlen": payload["w2_varlen"][1],
+            "w2_dgated": payload["w2_dgated"][1],
+        }
+
     # ── Weight layout helpers (instance-scoped) ─────────────────────────────
 
     def _stacked_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -590,6 +613,7 @@ class SonicMoEMlpNode:
                 "w2_varlen": precompute_weight_fp8(w2),
                 "w2_dgated": precompute_weight_fp8_for_direct_fused_dgated(w2),
             }
+        self._attach_fp8_weight_attrs(w1, w2, self._fp8_weight_payload)
         self._warmed_for_step = True
 
     def install_native_fp8_weights(
@@ -719,7 +743,6 @@ class SonicMoEMlpNode:
         # microbatch of the step.
         self.prequantize_weights()
         w1, w2 = self._stacked_weights()
-        fp8_weight_payload = self._fp8_weight_payload
 
         # Tensor-input flags for autograd.
         x.stop_gradient = False
@@ -743,7 +766,6 @@ class SonicMoEMlpNode:
             self._activation_type,
             self._stream_id,
             fp8_payload,
-            fp8_weight_payload,
             _expert_order_scores,
             _router_scores_data,
             score_src_idx,
@@ -848,7 +870,6 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
         fp8_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
-        fp8_weight_payload: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None,
         router_scores_expert_order: torch.Tensor | None = None,
         router_scores_token_order: torch.Tensor | None = None,
         score_src_idx: torch.Tensor | None = None,

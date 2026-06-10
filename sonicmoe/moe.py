@@ -312,6 +312,23 @@ class MoE(nn.Module):
         # Layout 4: w1T for varlen actgrad backward — reads _VARLEN_WEIGHT_CACHE
         self._fp8_w1T_varlen = precompute_weight_fp8(w1_perm.permute(1, 0, 2))  # (H, 2I, E)
 
+        w1.fp8_weight = {
+            "w1_fused": self._fp8_w1_fused[0],
+            "w1T_varlen": self._fp8_w1T_varlen[0],
+        }
+        w1.fp8_scale = {
+            "w1_fused": self._fp8_w1_fused[1],
+            "w1T_varlen": self._fp8_w1T_varlen[1],
+        }
+        w2.fp8_weight = {
+            "w2_varlen": self._fp8_w2_varlen[0],
+            "w2_dgated": self._fp8_w2_dgated[0],
+        }
+        w2.fp8_scale = {
+            "w2_varlen": self._fp8_w2_varlen[1],
+            "w2_dgated": self._fp8_w2_dgated[1],
+        }
+
     @torch.no_grad()
     def has_fp8_shadow_weights(self) -> bool:
         """Check if FP8 shadow weights are fresh (cache entries match current _version)."""
@@ -561,32 +578,32 @@ class MoE(nn.Module):
         with ExitStack() as stack:
             if active_config is not None:
                 stack.enter_context(active_config.activate())
-            fp8_weight_payload = None
             if use_fp8:
                 stack.enter_context(enable_fp8())
                 if not self.has_fp8_shadow_weights():
                     raise RuntimeError("Sonic FP8 forward requires refresh_fp8_shadow_weights() before use_fp8=True")
-                fp8_weight_payload = {
-                    "w1_fused": self._fp8_w1_fused,
-                    "w2_varlen": self._fp8_w2_varlen,
-                    "w2_dgated": self._fp8_w2_dgated,
-                    "w1T_varlen": self._fp8_w1T_varlen,
-                }
 
             if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
+                w1 = self.c_fc.weight.permute(1, 2, 0)
+                w2 = self.c_proj.weight.permute(1, 2, 0)
+                if use_fp8:
+                    for attr_name in ("fp8_weight", "fp8_scale"):
+                        if hasattr(self.c_fc.weight, attr_name):
+                            setattr(w1, attr_name, getattr(self.c_fc.weight, attr_name))
+                        if hasattr(self.c_proj.weight, attr_name):
+                            setattr(w2, attr_name, getattr(self.c_proj.weight, attr_name))
                 hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
                     hidden_states,
                     self.router.weight,
-                    self.c_fc.weight.permute(1, 2, 0),
+                    w1,
                     self.c_fc.bias,
-                    self.c_proj.weight.permute(1, 2, 0),
+                    w2,
                     self.c_proj.bias,
                     self.top_k,
                     self.stream_id,
                     self.activation_function,
                     is_inference_mode or not self.training,
                     fp8_protocol,
-                    fp8_weight_payload,
                 )
             else:
                 # hidden_states -> (total_q, hidden_size)
