@@ -1283,12 +1283,19 @@ class _UpProjection(torch.autograd.Function):
                     if prequant_activation_payload is not None:
                         x_fp8_pre, x_scales_pre = prequant_activation_payload
                     w1_fused_payload = _get_fp8_weight_attr(w1, "fp8")
-                    z, y1 = _fused_blockscaled_gated_forward(
-                        x, w1, expert_frequency_offset, x_gather_idx,
-                        w1_fp8_pre=w1_fused_payload,
-                        x_fp8_pre=x_fp8_pre, x_scales_pre=x_scales_pre,
-                        store_z=not cfg.recompute_z,
-                        fuse_y1_quant=fuse_y1,
+                    fuse_y1 = _use_fuse_y1_quant()
+                    z, y1, y1_fp8_fused, y1_scales_fused = (
+                        _fused_blockscaled_gated_forward(
+                            x,
+                            w1,
+                            expert_frequency_offset,
+                            x_gather_idx,
+                            w1_fp8_pre=w1_fused_payload,
+                            x_fp8_pre=x_fp8_pre,
+                            x_scales_pre=x_scales_pre,
+                            store_z=not cfg.recompute_z,
+                            fuse_y1_quant=fuse_y1,
+                        )
                     )
                     if cfg.recompute_z:
                         # Forward skips preact storage; z is materialized just-in-time
@@ -2053,9 +2060,22 @@ class _DownProjection(torch.autograd.Function):
 
         # w2 decoupling: in FP8+aligned+fused_gated mode, backward doesn't
         # read bf16 w2 data (uses fp8 dgated cache + metadata).  This enables
-        # stash_bf16_to_cpu() to resize_(0) the bf16 param storage.
-        _w2_decouple = z_is_fp8 and cfg.fused_gated
+        # clear_param_storage("moe_expert") to release bf16 expert weight storage
+        # without requiring recompute_z/save_z_fp8.
+        _w2_decouple = (
+            cfg.enabled
+            and use_quack_gemm
+            and cfg.alignment_assumed
+            and cfg.fused_gated
+        )
         ctx._w2_decoupled = _w2_decouple
+        if _w2_decouple:
+            ctx._w2_dgated_fp8, ctx._w2_dgated_scales = _get_fp8_weight_attr(
+                w2, "transposed_fp8"
+            )
+            ctx._w2_shape = w2.shape  # (H, I, E)
+            ctx._w2_dtype = w2.dtype
+            ctx._w2_device = w2.device
 
         if z_is_fp8:
             recompute_args = _PREQUANTIZED_SCALES.pop("z_fp8_recompute", None)
@@ -2099,10 +2119,6 @@ class _DownProjection(torch.autograd.Function):
                     else:
                         z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
             if _w2_decouple:
-                ctx._w2_dgated_fp8, ctx._w2_dgated_scales = _get_fp8_weight_attr(w2, "transposed_fp8")
-                ctx._w2_shape = w2.shape  # (H, I, E)
-                ctx._w2_dtype = w2.dtype
-                ctx._w2_device = w2.device
                 ctx.save_for_backward(
                     z_fp8,
                     z_raw_scales,
@@ -2129,17 +2145,30 @@ class _DownProjection(torch.autograd.Function):
                     s_reverse_scatter_idx,
                 )
         else:
-            ctx.save_for_backward(
-                z,
-                w2,
-                b2,
-                topk_scores,
-                topk_scores_expert_order,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-            )
+            if _w2_decouple:
+                ctx.save_for_backward(
+                    z,
+                    # w2 omitted — backward uses ctx._w2_dgated_fp8 + metadata
+                    b2,
+                    topk_scores,
+                    topk_scores_expert_order,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                )
+            else:
+                ctx.save_for_backward(
+                    z,
+                    w2,
+                    b2,
+                    topk_scores,
+                    topk_scores_expert_order,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                )
 
         # Keep w2 FP8 cache — backward hits cache (~38µs savings) at ~37MB memory cost.
         # The cache auto-invalidates via w._version when optimizer updates weights.
@@ -2201,20 +2230,35 @@ class _DownProjection(torch.autograd.Function):
             # Defer dequantize: FP8 path uses fused kernel, others lazy-dequant
             z = None
         else:
-            (
-                z,
-                w2,
-                b2,
-                topk_scores,
-                topk_scores_expert_order,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-            ) = ctx.saved_tensor()
-            w2_shape = w2.shape
-            w2_dtype = w2.dtype
-            w2_device = w2.device
+            if ctx._w2_decoupled:
+                (
+                    z,
+                    b2,
+                    topk_scores,
+                    topk_scores_expert_order,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                ) = ctx.saved_tensor()
+                w2_shape = ctx._w2_shape
+                w2_dtype = ctx._w2_dtype
+                w2_device = ctx._w2_device
+            else:
+                (
+                    z,
+                    w2,
+                    b2,
+                    topk_scores,
+                    topk_scores_expert_order,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                ) = ctx.saved_tensor()
+                w2_shape = w2.shape
+                w2_dtype = w2.dtype
+                w2_device = w2.device
             z_fp8 = z_raw_scales_u8 = None
             if getattr(ctx, "_needs_z_recompute_bf16", False):
                 # Replace the zero-storage bf16 placeholder with a freshly recomputed

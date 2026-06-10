@@ -504,22 +504,10 @@ class SonicMoEMlpNode:
         w2: torch.Tensor,
         payload: dict[str, tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
-        w1.fp8_weight = {
-            "w1_fused": payload["w1_fused"][0],
-            "w1T_varlen": payload["w1T_varlen"][0],
-        }
-        w1.fp8_scale = {
-            "w1_fused": payload["w1_fused"][1],
-            "w1T_varlen": payload["w1T_varlen"][1],
-        }
-        w2.fp8_weight = {
-            "w2_varlen": payload["w2_varlen"][0],
-            "w2_dgated": payload["w2_dgated"][0],
-        }
-        w2.fp8_scale = {
-            "w2_varlen": payload["w2_varlen"][1],
-            "w2_dgated": payload["w2_dgated"][1],
-        }
+        w1.fp8 = payload["w1_fused"]
+        w1.transposed_fp8 = payload["w1T_varlen"]
+        w2.fp8 = payload["w2_varlen"]
+        w2.transposed_fp8 = payload["w2_dgated"]
 
     # ── Weight layout helpers (instance-scoped) ─────────────────────────────
 
@@ -907,7 +895,6 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
                     False,                          # is_inference_mode_enabled
                     False,                          # use_low_precision_postact_buffer
                     fp8_activation_payload,
-                    fp8_weight_payload,
                 )
 
             # ── DownProjection forward (via FakeCtx) ─────────────────────────
@@ -924,7 +911,6 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
                     activation_type,
                     None,                           # fp8_protocol
                     None,
-                    fp8_weight_payload,
                     router_scores_expert_order,
                     router_scores_token_order,
                     score_src_idx,
