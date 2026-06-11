@@ -2031,10 +2031,7 @@ class _DownProjection(torch.autograd.Function):
         # ctx.needs_input_grad.  Defaulting to True is safe: if the caller truly
         # doesn't need ds, the autograd engine simply discards it.
 
-        if not hasattr(topk_scores, "stop_gradient"):
-            ctx._topk_scores_needs_grad = False
-        else:
-            ctx._topk_scores_needs_grad = not topk_scores.stop_gradient
+        ctx._topk_scores_needs_grad = True
         ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
         ctx._has_topk_scores_expert_order = topk_scores_expert_order is not None
         ctx._has_topk_scores_token_order = topk_scores_token_order is not None
