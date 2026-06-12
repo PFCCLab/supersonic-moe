@@ -47,7 +47,7 @@ def _setup(T, H, I, E, K):
     return TK, total_M, cu_seqlens
 
 
-def _torch_dgated_gold(dout, w2, z_preact, cu_seqlens, E, swiglu_clamp_value=0.0):
+def _torch_dgated_gold(dout, w2, z_preact, cu_seqlens, E):
     """Torch gold: per-expert GEMM + dSwiGLU (interleaved layout).
 
     For each expert: temp[s:e] = dout[s:e] @ w2[:,:,exp]  → (tokens, I)
@@ -65,19 +65,10 @@ def _torch_dgated_gold(dout, w2, z_preact, cu_seqlens, E, swiglu_clamp_value=0.0
     z_f32 = z_preact.float()
     gate = z_f32[:, 0::2]
     up = z_f32[:, 1::2]
-    if swiglu_clamp_value > 0.0:
-        gate_c = gate.clamp(max=swiglu_clamp_value)
-        up_c = up.clamp(min=-swiglu_clamp_value, max=swiglu_clamp_value)
-    else:
-        gate_c = gate
-        up_c = up
-    sig = torch.sigmoid(gate_c)
-    silu_gate = gate_c * sig
-    d_gate = temp * up_c * sig * (1.0 + gate_c * (1.0 - sig))
+    sig = torch.sigmoid(gate)
+    silu_gate = gate * sig
+    d_gate = temp * up * sig * (1.0 + gate * (1.0 - sig))
     d_up = temp * silu_gate
-    if swiglu_clamp_value > 0.0:
-        d_gate = torch.where(gate <= swiglu_clamp_value, d_gate, torch.zeros_like(d_gate))
-        d_up = torch.where(up.abs() <= swiglu_clamp_value, d_up, torch.zeros_like(d_up))
 
     dx = torch.empty(total_M, 2 * I_dim, dtype=torch.bfloat16, device=dout.device)
     dx[:, 0::2] = d_gate.to(torch.bfloat16)
@@ -166,46 +157,3 @@ def test_bf16_postact_vs_torch(T, H, I, E, K, seed):
 
     r, c = _report(postact, gold_y1, "y1s: BF16 vs torch gold SwiGLU")
     assert_bf16_close(postact, gold_y1, atol=1e-2)
-
-
-def _torch_swiglu_y1(z_preact, swiglu_clamp_value=0.0):
-    z_f32 = z_preact.float()
-    gate = z_f32[:, 0::2]
-    up = z_f32[:, 1::2]
-    if swiglu_clamp_value > 0.0:
-        gate = gate.clamp(max=swiglu_clamp_value)
-        up = up.clamp(min=-swiglu_clamp_value, max=swiglu_clamp_value)
-    return (gate * torch.sigmoid(gate) * up).to(torch.bfloat16)
-
-
-def test_dswiglu_clamp_bf16_masks_and_postact(seed):
-    from sonicmoe.quack_utils.gemm_interface import gemm_dgated
-
-    T, H, I, E, K = 256, 128, 128, 2, 1
-    clamp = 0.35
-    TK, total_M, cu_seqlens = _setup(T, H, I, E, K)
-    dout = torch.randn(total_M, H, dtype=torch.bfloat16, device="cuda") * 0.1
-    w2 = torch.randn(H, I, E, dtype=torch.bfloat16, device="cuda") * 0.1
-    z_preact = torch.randn(total_M, 2 * I, dtype=torch.bfloat16, device="cuda") * 0.9
-
-    gold_dx = _torch_dgated_gold(dout, w2, z_preact, cu_seqlens, E, swiglu_clamp_value=clamp)
-    gold_y1 = _torch_swiglu_y1(z_preact, clamp)
-    unclamped_dx = _torch_dgated_gold(dout, w2, z_preact, cu_seqlens, E)
-    assert (gold_dx.float() - unclamped_dx.float()).abs().max().item() > 1e-4
-
-    w2_3d = w2.permute(2, 0, 1).contiguous()
-    dx_out, postact = gemm_dgated(
-        dout, w2_3d, z_preact, activation="swiglu", cu_seqlens_m=cu_seqlens,
-        swiglu_clamp_value=clamp,
-    )
-    _report(dx_out, gold_dx, "dx: clamp BF16 vs torch")
-    _report(postact, gold_y1, "y1s: clamp BF16 vs torch")
-    assert_bf16_close(dx_out, gold_dx, atol=1.5e-2)
-    assert_bf16_close(postact, gold_y1, atol=1e-2)
-
-    gate_sat = z_preact[:, 0::2].float() > clamp
-    up_sat = z_preact[:, 1::2].float().abs() > clamp
-    if gate_sat.any():
-        assert dx_out[:, 0::2].float()[gate_sat].abs().max().item() == 0.0
-    if up_sat.any():
-        assert dx_out[:, 1::2].float()[up_sat].abs().max().item() == 0.0

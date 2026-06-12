@@ -40,7 +40,6 @@ import torch
 import triton
 import triton.language as tl
 
-from ..config import SonicMoEConfig, get_active_config
 from ..enums import ActivationType
 from .deepep_metadata import (
     deepep_topk_to_sonic_metadata,
@@ -53,15 +52,7 @@ from ..functional import (
     clear_all_fp8_weight_caches,
 )
 from ..functional.utils import enable_fp8
-from ..quack_utils import (
-    install_native_fp8_weight_cache,
-    precompute_weight_fp8,
-    precompute_weight_fp8_for_direct_fused_dgated,
-    precompute_weight_fp8_for_fused_gated,
-    precompute_weight_fp8_warmup,
-    quantize_native_fp8_weights,
-)
-from ..quack_utils.blockscaled_fp8_gemm import _iso32_weight_enabled, _storage_per_batch
+from ..quack_utils import precompute_weight_fp8_warmup
 
 
 # ── PyLayer ctx stub ──────────────────────────────────────────────────────────
@@ -86,9 +77,9 @@ class _FakeCtx:
 
 @triton.jit
 def _scatter_router_grad_kernel(
-    GRAD_ptr,
-    IDX_ptr,
-    OUT_ptr,
+    GRAD_ptr,    # [TK] grad_output, contiguous
+    IDX_ptr,     # [TK] int64 gather indices into [N_total]
+    OUT_ptr,     # [N_total] zero-init output
     TK,
     BLOCK: tl.constexpr,
 ):
@@ -107,57 +98,34 @@ def _scatter_router_grad_kernel(
     tl.store(OUT_ptr + idx, v, mask=mask)
 
 
-@triton.jit
-def _gather_router_scores_kernel(
-    PROB_ptr,
-    IDX_ptr,
-    OUT_ptr,
-    TK,
-    HAS_SENTINEL: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < TK
-    idx = tl.load(IDX_ptr + offs, mask=mask, other=0)
-    val = tl.load(PROB_ptr + idx, mask=mask, other=0.0)
-    tl.store(OUT_ptr + offs, val, mask=mask)
-    if HAS_SENTINEL and pid == 0:
-        tl.store(OUT_ptr + TK, 0.0)
-
-
 class _GatherRouterScores(torch.autograd.Function):
+    """Custom-grad replacement for ``flat_probs[gather_idx]``.
+
+    Forward is the same simple gather (a single Paddle indexing kernel).
+    Backward uses a one-shot Triton scatter (no sort, no histogram) instead
+    of the generic ``IndexingBackward`` path, which on Paddle dispatches a
+    full cub::DeviceRadixSort + scatter + reduction cascade per call.
+    """
+
     @staticmethod
-    def forward(ctx, flat_probs: torch.Tensor, gather_idx: torch.Tensor, n_total: int, has_sentinel: bool = False):
+    def forward(ctx, flat_probs: torch.Tensor, gather_idx: torch.Tensor, n_total: int):
         ctx.save_for_backward(gather_idx)
         ctx.n_total = int(n_total)
         ctx.tk = int(gather_idx.shape[0])
-        ctx.has_sentinel = bool(has_sentinel)
-        out = torch.empty(ctx.tk + (1 if ctx.has_sentinel else 0), dtype=flat_probs.dtype, device=flat_probs.device)
-        if ctx.tk > 0:
-            BLOCK = 256
-            grid = (triton.cdiv(ctx.tk, BLOCK),)
-            _gather_router_scores_kernel[grid](
-                flat_probs, gather_idx, out, ctx.tk,
-                HAS_SENTINEL=ctx.has_sentinel, BLOCK=BLOCK,
-            )
-        elif ctx.has_sentinel:
-            out.zero_()
-        return out
+        return flat_probs[gather_idx]
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
         (gather_idx,) = ctx.saved_tensor()
-        d = torch.empty(ctx.n_total, dtype=grad_out.dtype, device=grad_out.device)
-        d.zero_()
+        d = torch.zeros(ctx.n_total, dtype=grad_out.dtype, device=grad_out.device)
         TK = ctx.tk
         if TK > 0:
             BLOCK = 256
             grid = (triton.cdiv(TK, BLOCK),)
             _scatter_router_grad_kernel[grid](
-                grad_out[:TK].contiguous(), gather_idx, d, TK, BLOCK=BLOCK,
+                grad_out.contiguous(), gather_idx, d, TK, BLOCK=BLOCK,
             )
-        return d, None
+        return d, None, None
 
 
 @triton.jit
@@ -224,8 +192,8 @@ def _differentiable_router_scores(
 
     if dispatched_indices.stride(1) != 1:
         raise ValueError("dispatched_indices must be contiguous in last dim")
-    if "int32" not in str(dispatched_indices.dtype) and "int64" not in str(dispatched_indices.dtype):
-        raise ValueError(f"dispatched_indices: expected int32/int64, got {dispatched_indices.dtype}")
+    if "int32" not in str(dispatched_indices.dtype):
+        raise ValueError(f"dispatched_indices: expected int32, got {dispatched_indices.dtype}")
     if naept.stride(0) != 1:
         raise ValueError("naept must be contiguous 1D")
     if naept.shape[0] != N_recv + 1:
@@ -239,7 +207,7 @@ def _differentiable_router_scores(
             raise ValueError(
                 f"score_src_idx: expected shape ({TK},), got {score_src_idx.shape}"
             )
-        gather_idx = score_src_idx
+        gather_idx = score_src_idx.to(torch.int64)
     else:
         built = torch.empty(TK, dtype=torch.int64, device=device)
         work = torch.empty_like(dispatched_indices)
@@ -253,13 +221,20 @@ def _differentiable_router_scores(
     # under Paddle proxy. Use .size (int property) directly. See PR#22.
     # Gated by tests/test_no_memcpy_sync.py.
     if isinstance(dispatched_probs.size, int):
-        dispatched_probs_numel = dispatched_probs.size
+        dispatched_probs_numel = torch.to_tensor(dispatched_probs.size, place="cpu")
     else:
         dispatched_probs_numel = dispatched_probs.numel()
 
-    return _GatherRouterScores.apply(
-        dispatched_probs.reshape(-1), gather_idx, dispatched_probs_numel, TK_padded > TK
-    )
+    gathered = _GatherRouterScores.apply(
+        dispatched_probs.reshape(-1), gather_idx, dispatched_probs_numel
+    )  # [TK]
+
+    if TK_padded > TK:
+        padding = torch.zeros(
+            TK_padded - TK, dtype=gathered.dtype, device=device,
+        )
+        return torch.cat([gathered, padding])
+    return gathered
 
 
 # ── Module-level back-compat helpers (legacy tests / jit_warmup only) ────────
@@ -468,8 +443,6 @@ class SonicMoEMlpNode:
         Activation function (default SWIGLU).
     stream_id
         CUDA stream index for FP8 ops.
-    swiglu_clamp_value
-        User-controlled SwiGLU clamp value; 0.0 disables the clamp.
     """
 
     def __init__(
@@ -480,7 +453,6 @@ class SonicMoEMlpNode:
         intermediate_size: int,
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
-        swiglu_clamp_value: float = 0.0,
     ):
         self._experts = list(experts)
         self._E = n_experts
@@ -488,38 +460,11 @@ class SonicMoEMlpNode:
         self._I = intermediate_size
         self._activation_type = activation_type
         self._stream_id = stream_id
-        self._swiglu_clamp_value = max(float(swiglu_clamp_value), 0.0)
 
         # Per-instance state — no module-level globals.
         self._w_cache: dict[tuple, torch.Tensor] = {}
         self._pending_flush: bool = False
         self._warmed_for_step: bool = False
-        self._native_fp8_weight_payload: dict[str, object] | None = None
-        self._native_fp8_weight_iso32: bool | None = None
-        self._fp8_weight_payload: dict[str, tuple[torch.Tensor, torch.Tensor]] | None = None
-
-    @staticmethod
-    def _attach_fp8_weight_attrs(
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        payload: dict[str, tuple[torch.Tensor, torch.Tensor]],
-    ) -> None:
-        w1.fp8_weight = {
-            "w1_fused": payload["w1_fused"][0],
-            "w1T_varlen": payload["w1T_varlen"][0],
-        }
-        w1.fp8_scale = {
-            "w1_fused": payload["w1_fused"][1],
-            "w1T_varlen": payload["w1T_varlen"][1],
-        }
-        w2.fp8_weight = {
-            "w2_varlen": payload["w2_varlen"][0],
-            "w2_dgated": payload["w2_dgated"][0],
-        }
-        w2.fp8_scale = {
-            "w2_varlen": payload["w2_varlen"][1],
-            "w2_dgated": payload["w2_dgated"][1],
-        }
 
     # ── Weight layout helpers (instance-scoped) ─────────────────────────────
 
@@ -584,53 +529,8 @@ class SonicMoEMlpNode:
         if self._warmed_for_step:
             return
         w1, w2 = self._stacked_weights()
-        if self._native_fp8_weight_payload is not None:
-            if self._native_fp8_weight_payload.get("format") == "1x32":
-                w1_fused_fp8, w1_fused_scales, w1T_varlen_fp8, w1T_varlen_scales = self._native_fp8_weight_payload["w1"]
-                w2_varlen_fp8, w2_varlen_scales, w2_dgated_fp8, w2_dgated_scales = self._native_fp8_weight_payload["w2"]
-                self._fp8_weight_payload = {
-                    "w1_fused": (w1_fused_fp8.mT, w1_fused_scales),
-                    "w1T_varlen": (w1T_varlen_fp8, w1T_varlen_scales),
-                    "w2_varlen": (w2_varlen_fp8, w2_varlen_scales),
-                    "w2_dgated": (w2_dgated_fp8, w2_dgated_scales),
-                }
-            else:
-                install_native_fp8_weight_cache(
-                    w1, w2, self._native_fp8_weight_payload,
-                    iso32=self._native_fp8_weight_iso32,
-                )
-                self._fp8_weight_payload = {
-                    "w1_fused": precompute_weight_fp8_for_fused_gated(w1),
-                    "w1T_varlen": precompute_weight_fp8(w1.permute(1, 0, 2)),
-                    "w2_varlen": precompute_weight_fp8(w2),
-                    "w2_dgated": precompute_weight_fp8_for_direct_fused_dgated(w2),
-                }
-        else:
-            precompute_weight_fp8_warmup(w1, w2)
-            self._fp8_weight_payload = {
-                "w1_fused": precompute_weight_fp8_for_fused_gated(w1),
-                "w1T_varlen": precompute_weight_fp8(w1.permute(1, 0, 2)),
-                "w2_varlen": precompute_weight_fp8(w2),
-                "w2_dgated": precompute_weight_fp8_for_direct_fused_dgated(w2),
-            }
-        self._attach_fp8_weight_attrs(w1, w2, self._fp8_weight_payload)
+        precompute_weight_fp8_warmup(w1, w2)
         self._warmed_for_step = True
-
-    def install_native_fp8_weights(
-        self,
-        payload: dict[str, object] | None = None,
-        *,
-        iso32: bool | None = None,
-    ) -> dict[str, object]:
-        w1, w2 = self._stacked_weights()
-        active_iso32 = _iso32_weight_enabled() if iso32 is None else iso32
-        if payload is None:
-            payload = quantize_native_fp8_weights(w1, w2, iso32=active_iso32)
-        self._native_fp8_weight_payload = payload
-        self._native_fp8_weight_iso32 = active_iso32
-        self._warmed_for_step = False
-        self.prequantize_weights()
-        return payload
 
     def warmup(self, total_K_list: list[int] | None = None, max_workers: int = 0):
         """Pre-compile all JIT kernels.  Call once after model construction."""
@@ -649,10 +549,6 @@ class SonicMoEMlpNode:
         tokens_per_expert: list[int] | torch.Tensor,
         dispatched_indices: torch.Tensor | None = None,
         dispatched_probs: torch.Tensor | None = None,
-        *,
-        dispatched_hidden_states_fp8: torch.Tensor | None = None,
-        dispatched_hidden_states_scales: torch.Tensor | None = None,
-        dispatched_hidden_states_scale_layout: str = "sonic_1x32_isa",
     ) -> torch.Tensor:
         """Run FP8 expert FFN on DeepEP-dispatched tokens.
 
@@ -677,33 +573,6 @@ class SonicMoEMlpNode:
         H = self._H
         I = self._I
 
-        fp8_payload = None
-        if dispatched_hidden_states_fp8 is not None or dispatched_hidden_states_scales is not None:
-            if dispatched_hidden_states_fp8 is None or dispatched_hidden_states_scales is None:
-                raise ValueError("FP8 activation data and scales must be provided together")
-            if dispatched_hidden_states_scale_layout != "sonic_1x32_isa":
-                raise ValueError(
-                    "SonicMoEMlpNode only accepts sonic_1x32_isa activation scales; "
-                    f"got {dispatched_hidden_states_scale_layout!r}"
-                )
-            if dispatched_hidden_states_fp8.dtype != torch.float8_e4m3fn:
-                raise ValueError(
-                    f"dispatched_hidden_states_fp8 must be torch.float8_e4m3fn, got {dispatched_hidden_states_fp8.dtype}"
-                )
-            if tuple(dispatched_hidden_states_fp8.shape) != tuple(x.shape):
-                raise ValueError(
-                    f"dispatched_hidden_states_fp8 shape {dispatched_hidden_states_fp8.shape} != x shape {x.shape}"
-                )
-            if dispatched_hidden_states_fp8.device != x.device or dispatched_hidden_states_scales.device != x.device:
-                raise ValueError("FP8 activation payload must be on the same device as dispatched_hidden_states")
-            expected_scale_shape = (1, _storage_per_batch(int(x.shape[0]), int(x.shape[1])))
-            if tuple(dispatched_hidden_states_scales.shape) != expected_scale_shape:
-                raise ValueError(
-                    "dispatched_hidden_states_scales must be Sonic ISA-packed 1x32 scales "
-                    f"with shape {expected_scale_shape}, got {dispatched_hidden_states_scales.shape}"
-                )
-            fp8_payload = (dispatched_hidden_states_fp8, dispatched_hidden_states_scales)
-
         # Topk path: real DeepEP dispatch with multi-expert routing.
         # Identity layout (K=1, pre-sorted) was removed — it had an
         # unfixable dx bug due to expert-sorted ↔ token-order mismatch
@@ -714,9 +583,6 @@ class SonicMoEMlpNode:
         assert dispatched_probs is not None, (
             "dispatched_probs required when dispatched_indices is given"
         )
-
-        topk = dispatched_indices.shape[1]
-
         (
             expert_frequency_offset,
             x_gather_idx,
@@ -728,16 +594,22 @@ class SonicMoEMlpNode:
             total_pad_rows,
             N_recv,
             score_src_idx,
-            _expert_order_scores,
         ) = deepep_topk_to_sonic_metadata(
             dispatched_indices, dispatched_probs,
             tokens_per_expert, E, device=x.device,
         )
 
-        router_scores = dispatched_probs
+        # Build router_scores differentiably from dispatched_probs so that
+        # ds gradients flow back to the caller (e.g. DeepEP's gate).
+        router_scores = _differentiable_router_scores(
+            dispatched_probs, dispatched_indices,
+            num_activated_expert_per_token_offset,
+            TK_padded - total_pad_rows, TK_padded, E,
+            score_src_idx=score_src_idx,
+        )
         # T_down = N_recv for the topk path.
         T_down = N_recv
-        # topk already set above before repair
+        topk = dispatched_indices.shape[1]
 
         # Stack weights (per-instance cache) + fused FP8 prequantize on first
         # microbatch of the step.
@@ -765,10 +637,6 @@ class SonicMoEMlpNode:
             E, N_recv, T_down, TK_padded, topk,
             self._activation_type,
             self._stream_id,
-            fp8_payload,
-            _expert_order_scores,
-            _router_scores_data,
-            score_src_idx,
         )
 
     def step(self) -> None:
@@ -809,9 +677,6 @@ class SonicMoEMlpNode:
         clear_all_fp8_weight_caches()
         invalidate_topk_cache()
         self._warmed_for_step = False
-        self._native_fp8_weight_payload = None
-        self._native_fp8_weight_iso32 = None
-        self._fp8_weight_payload = None
 
     def __call__(
         self,
@@ -819,17 +684,10 @@ class SonicMoEMlpNode:
         tokens_per_expert: list[int] | torch.Tensor,
         dispatched_indices: torch.Tensor | None = None,
         dispatched_probs: torch.Tensor | None = None,
-        *,
-        dispatched_hidden_states_fp8: torch.Tensor | None = None,
-        dispatched_hidden_states_scales: torch.Tensor | None = None,
-        dispatched_hidden_states_scale_layout: str = "sonic_1x32_isa",
     ) -> torch.Tensor:
         return self.forward(
             dispatched_hidden_states, tokens_per_expert,
             dispatched_indices, dispatched_probs,
-            dispatched_hidden_states_fp8=dispatched_hidden_states_fp8,
-            dispatched_hidden_states_scales=dispatched_hidden_states_scales,
-            dispatched_hidden_states_scale_layout=dispatched_hidden_states_scale_layout,
         )
 
 
@@ -869,10 +727,6 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         topk: int = 1,
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
-        fp8_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
-        router_scores_expert_order: torch.Tensor | None = None,
-        router_scores_token_order: torch.Tensor | None = None,
-        score_src_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # ── Determine FP8 vs BF16 mode ──────────────────────────────────
         # Respect the global FP8 mode setting:
@@ -885,50 +739,34 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
 
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
-        active_cfg = get_active_config()
-        if active_cfg is not None:
-            cfg = (
-                active_cfg.replace(swiglu_clamp_value=node._swiglu_clamp_value)
-                if node._swiglu_clamp_value > 0.0 else active_cfg
+        with enable_fp8(use_fp8):
+            _refresh_fp8_config()
+            y1, z = _UpProjection.forward(
+                up_ctx,
+                hidden_states, w1, None,        # x, w1, b1
+                expert_frequency_offset, TK_padded, None, stream_id,
+                x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+                True,                           # is_varlen_K
+                activation_type,
+                False,                          # is_inference_mode_enabled
+                False,                          # use_low_precision_postact_buffer
             )
-        else:
-            cfg = SonicMoEConfig(swiglu_clamp_value=node._swiglu_clamp_value)
-        with cfg.activate():
-            with enable_fp8(use_fp8):
-                _refresh_fp8_config()
-                y1, z = _UpProjection.forward(
-                    up_ctx,
-                    hidden_states, w1, None,        # x, w1, b1
-                    expert_frequency_offset, TK_padded, None, stream_id,
-                    x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                    True,                           # is_varlen_K
-                    activation_type,
-                    False,                          # is_inference_mode_enabled
-                    False,                          # use_low_precision_postact_buffer
-                    fp8_activation_payload,
-                    fp8_weight_payload,
-                )
 
-            # ── DownProjection forward (via FakeCtx) ─────────────────────────
-            down_ctx = _FakeCtx()
-            with enable_fp8(use_fp8):
-                out = _DownProjection.forward(
-                    down_ctx,
-                    y1, z, w2, None,                # y1, z, w2, b2
-                    router_scores, s_scatter_idx, expert_frequency_offset,
-                    T_down, topk, stream_id,
-                    x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                    True,                           # is_varlen_K
-                    activation_type,
-                    None,                           # fp8_protocol
-                    None,
-                    fp8_weight_payload,
-                    router_scores_expert_order,
-                    router_scores_token_order,
-                    score_src_idx,
-                )
+        # ── DownProjection forward (via FakeCtx) ─────────────────────────
+        down_ctx = _FakeCtx()
+        with enable_fp8(use_fp8):
+            out = _DownProjection.forward(
+                down_ctx,
+                y1, z, w2, None,                # y1, z, w2, b2
+                router_scores, s_scatter_idx, expert_frequency_offset,
+                T_down, topk, stream_id,
+                x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+                True,                           # is_varlen_K
+                activation_type,
+                None,                           # fp8_protocol
+            )
 
         ctx._up_ctx = up_ctx
         ctx._down_ctx = down_ctx
@@ -982,6 +820,5 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         )
 
         # Tensor inputs: hidden_states, router_scores, efo, x_gather, s_scatter,
-        #                s_reverse_scatter, naept_offset, w1, w2,
-        #                router_scores_expert_order, router_scores_token_order, score_src_idx
-        return dx, ds, None, None, None, None, None, None, None, None, None, None
+        #                s_reverse_scatter, naept_offset, w1, w2
+        return dx, ds, None, None, None, None, None, None, None
