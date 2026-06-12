@@ -53,6 +53,7 @@ from .blockscaled_fp8_gemm import (
     precompute_weight_fp8_for_fused_gated,
     precompute_weight_fp8_warmup,
     quantize_and_pack_activation,
+    quantize_activation_blockscaled_fast,
 )
 from .gemm_interface import gemm_dgated, gemm_gated
 from ._legacy.sgl_mxfp8_gemm import clear_sgl_weight_cache

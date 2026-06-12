@@ -77,6 +77,11 @@ from ..quack_utils.blockscaled_fp8_gemm import (
     _run_cutlass_blockscaled_gemm_varlen_k_tma_add,
     colwise_quantize_and_pack,
     fused_z_save_y1_quant,
+    pack_blockscaled_1x32_scales_fast,
+    dequant_colwise_quantize_and_pack_from_isa,
+    gather_raw_blockscaled_1x32_scales_to_isa,
+    dual_quantize_varlen,
+    _gather_router_scores_i32,
 )
 from ..quack_utils import (
     clear_blockscaled_fp8_weight_cache as _clear_blockscaled_fp8_weight_cache,
@@ -125,6 +130,58 @@ def _swiglu_backward_interleaved(
     """Backward SwiGLU + router score weighting on interleaved layout."""
     return swiglu_backward_triton(dy1, z, s)
 
+def _is_raw_1x32_scale_layout(scales: torch.Tensor, rows: int, cols: int) -> bool:
+    return scales.ndim == 2 and tuple(scales.shape) == (rows, _div_up(cols, _SF_VEC_SIZE))
+
+def _ensure_isa_1x32_scales(scales: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    if _is_raw_1x32_scale_layout(scales, rows, cols):
+        return pack_blockscaled_1x32_scales_fast(scales, cols).view(_E8M0_DTYPE)
+    return scales
+
+
+def _is_raw_1x32_scale_layout(scales: torch.Tensor, rows: int, cols: int) -> bool:
+    return scales.ndim == 2 and tuple(scales.shape) == (rows, _div_up(cols, _SF_VEC_SIZE))
+
+def _gather_1x32_scales_to_isa(
+    scales: torch.Tensor,
+    gather_idx: torch.Tensor,
+    rows: int,
+    cols: int,
+    *,
+    fill_value: int = 127,
+) -> torch.Tensor:
+    if _is_raw_1x32_scale_layout(scales, rows, cols):
+        return gather_raw_blockscaled_1x32_scales_to_isa(
+            scales, gather_idx, cols
+        ).view(_E8M0_DTYPE)
+
+    TK = gather_idx.shape[0]
+    k_tiles = _div_up(cols, _SF_TILE_K)
+    per_batch_tk = _storage_per_batch(TK, cols)
+    out = (
+        torch.empty((1, per_batch_tk), dtype=torch.uint8, device=scales.device)
+        if (TK % _SF_TILE_M == 0 and cols % _SF_TILE_K == 0)
+        else torch.full((1, per_batch_tk), fill_value, dtype=torch.uint8, device=scales.device)
+    )
+    block_rows = 128
+    _gather_isa_packed_scales_kernel[(_div_up(TK, block_rows), k_tiles)](
+        scales.view(torch.uint8), gather_idx, out, TK,
+        src_k_tiles=k_tiles, dst_k_tiles=k_tiles,
+        SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK_ROWS=block_rows, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
+    )
+    return out.view(_E8M0_DTYPE)
+
+def _is_fp8_e4m3_dtype(dtype) -> bool:
+    return dtype == torch.float8_e4m3fn or str(dtype) == "paddle.float8_e4m3fn"
+
+def _raw_1x32_scale_bytes(scales: torch.Tensor) -> torch.Tensor:
+    if str(scales.dtype) in ("torch.uint8", "paddle.uint8", "uint8"):
+        return scales
+    if str(scales.dtype) in ("torch.int32", "paddle.int32", "int32"):
+        return scales.to(torch.uint8)
+    return scales.view(torch.uint8)
+
 
 def _fused_blockscaled_gated_forward(
     x: torch.Tensor,
@@ -132,7 +189,9 @@ def _fused_blockscaled_gated_forward(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     *,
+    x_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
     w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
+    store_z: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
@@ -153,32 +212,22 @@ def _fused_blockscaled_gated_forward(
 
     if w1_fp8_pre is not None:
         w1_fp8, w1_scales = w1_fp8_pre
-    elif "w1_fused" in _STASHED_FP8_WEIGHTS:
-        w1_fp8, w1_scales = _STASHED_FP8_WEIGHTS["w1_fused"]
     else:
-        w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
+        raise RuntimeError("Sonic FP8 fused gated forward requires explicit w1_fused payload")
 
     # Step 1: Quantize at T-size (NOT TK)
-    x_fp8, x_scales_t = quantize_and_pack_activation(x)
+    if x_fp8_pre is not None:
+        x_fp8, x_scales_t = x_fp8_pre
+        _PREQUANT_HIT_COUNT["activation_fwd"] += 1
+    else:
+        x_fp8, x_scales_t = quantize_and_pack_activation(x)
 
-    # Step 2: Gather ISA-packed scales T->TK (~3-8µs)
+    # Step 2: Gather scales T->TK in ISA layout (~3-8µs)
     TK = x_gather_idx.shape[0]
     K = x.shape[1]
-    k_tiles = _div_up(K, _SF_TILE_K)
-    per_batch_tk = _storage_per_batch(TK, K)
-    x_scales_tk = (
-        torch.empty((1, per_batch_tk), dtype=torch.uint8, device=x.device)
-        if (TK % _SF_TILE_M == 0 and K % _SF_TILE_K == 0)
-        else torch.full((1, per_batch_tk), 127, dtype=torch.uint8, device=x.device)
+    x_scales_tk_e8m0 = _gather_1x32_scales_to_isa(
+        x_scales_t, x_gather_idx, int(x_fp8.shape[0]), K
     )
-    BLOCK_ROWS = 128
-    _gather_isa_packed_scales_kernel[(_div_up(TK, BLOCK_ROWS), k_tiles)](
-        x_scales_t.view(torch.uint8), x_gather_idx, x_scales_tk, TK,
-        src_k_tiles=k_tiles, dst_k_tiles=k_tiles,
-        SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
-        BLOCK_ROWS=BLOCK_ROWS, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
-    )
-    x_scales_tk_e8m0 = x_scales_tk.view(_E8M0_DTYPE)
     del x_scales_t
 
     # Step 3: Zero-materialization GEMM via standard interface.
@@ -214,6 +263,7 @@ def _fused_blockscaled_gated_forward(
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
         b_scales=w1_scales,
+        store_preact=store_z,
         dynamic_scheduler=False,
         tuned=False,
         z_scale_out=z_scale_out,
@@ -233,6 +283,10 @@ def _fused_blockscaled_gated_forward(
         # momentary peak from allocating a full-size bf16 tensor.
         z = torch.empty(1, dtype=torch.bfloat16, device=z_fp8.device).as_strided(
             z_fp8.shape, (0, 0)
+        )
+    elif not store_z:
+        z = torch.empty(1, dtype=torch.bfloat16, device=y1.device).as_strided(
+            (TK, w1.shape[0]), (0, 0)
         )
 
     return z, y1
@@ -864,6 +918,7 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         use_low_precision_postact_buffer: bool = False,
+        prequant_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -886,10 +941,10 @@ class _UpProjection(torch.autograd.Function):
                 _ALIGNMENT_ASSUMED = aligned
                 cfg.alignment_assumed = aligned
 
-                if aligned and cfg.fused_gated:
+                if aligned and cfg.fused_gated: 
                     w1_fp8 = _get_fp8_weight_attr(w1, "fp8")
                     z, y1 = _fused_blockscaled_gated_forward(
-                        x, w1, expert_frequency_offset, x_gather_idx, w1_fp8_pre=w1_fp8
+                        x, w1, expert_frequency_offset, x_gather_idx, x_fp8_pre=prequant_activation_payload, w1_fp8_pre=w1_fp8
                     )
                     if cfg.save_z_fp8 and cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);
@@ -999,12 +1054,15 @@ class _UpProjection(torch.autograd.Function):
         # Track which optional tensor inputs were actually provided (for Paddle backward return count)
         ctx._has_b1 = b1 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
+        ctx._prequant_activation_payload = prequant_activation_payload is not None
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
         # resize_(0) the bf16 param storage without breaking backward.
         _fp8_aligned = (use_quack_gemm and cfg.enabled and cfg.alignment_assumed)
         ctx._w1_decoupled = _fp8_aligned
+        if _fp8_aligned and ctx._prequant_activation_payload and not cfg.fp8_wgrad:
+            raise RuntimeError("prequant activation payload requires FP8 wgrad because BF16 x is not retained")
         if _fp8_aligned:
             # Store metadata needed for dw1 allocation
             ctx._w1_shape = w1.shape  # (2I, H, E)
@@ -1018,8 +1076,14 @@ class _UpProjection(torch.autograd.Function):
             ctx._w1T_fp8, ctx._w1T_scales = _get_fp8_weight_attr(
                 w1, "transposed_fp8"
             )
+            x_fp8_pre, x_scales_pre = None, None
+            x_saved = x
+            if prequant_activation_payload is not None:
+                x_fp8_pre, x_scales_pre = prequant_activation_payload
+                x_saved = torch.empty(1, dtype=x.dtype, device=x.device).as_strided((T, H), (0, 0))
+
             ctx.save_for_backward(
-                x,
+                x_saved,
                 # w1 omitted — backward uses ctx._w1T_fp8 + metadata
                 b1,
                 expert_frequency_offset,
@@ -1027,6 +1091,8 @@ class _UpProjection(torch.autograd.Function):
                 None if use_quack_gemm else s_scatter_idx,
                 s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
+                x_fp8_pre,
+                x_scales_pre,
             )
         else:
             ctx.save_for_backward(
@@ -1075,6 +1141,8 @@ class _UpProjection(torch.autograd.Function):
                 s_scatter_idx,
                 s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
+                x_fp8_pre,
+                x_scales_pre,
             ) = ctx.saved_tensor()
             w1_shape = ctx._w1_shape   # (2I, H, E)
             w1_dtype = ctx._w1_dtype
@@ -1137,10 +1205,22 @@ class _UpProjection(torch.autograd.Function):
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
 
                     # Sequential quant pipeline (all on default stream):
-                    x_col_fp8, x_col_scales = colwise_quantize_and_pack(
-                        x, logical_rows=H, logical_cols=TK,
-                        gather_idx=x_gather_idx,
-                    )
+                    if ctx._prequant_activation_payload:
+                        assert x_fp8_pre is not None and x_scales_pre is not None, "Pre-quantized input is None."
+                        x_scales_pre_isa = _ensure_isa_1x32_scales(
+                            x_scales_pre, int(x_fp8_pre.shape[0]), int(x_fp8_pre.shape[1])
+                        )
+                        x_col_fp8, x_col_scales = dequant_colwise_quantize_and_pack_from_isa(
+                            x_fp8_pre, x_scales_pre_isa,
+                            logical_rows=H, logical_cols=TK,
+                            gather_idx=x_gather_idx,
+                        )
+                        del x_fp8_pre, x_scales_pre, x_scales_pre_isa
+                    else:
+                        x_col_fp8, x_col_scales = colwise_quantize_and_pack(
+                            x, logical_rows=H, logical_cols=TK,
+                            gather_idx=x_gather_idx,
+                        )
 
                     if bwd_col is not None:
                         # Use pre-computed col-fp8 from dual quant (zero extra HBM read)
@@ -1365,6 +1445,8 @@ class _UpProjection(torch.autograd.Function):
         grads.extend([None, None, None, None])
         if ctx._has_num_activated:
             grads.append(None)
+        if ctx._prequant_activation_payload:
+            grads.append((None, None))
         return tuple(grads)
 
 
@@ -1389,6 +1471,7 @@ class _DownProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
         fp8_protocol: FP8Protocol | None,
+        fp8_combine_grad_handle=None,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -1528,6 +1611,7 @@ class _DownProjection(torch.autograd.Function):
         # Track which optional tensor inputs were actually provided (for Paddle backward return count)
         ctx._has_b2 = b2 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
+        ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
         # Always compute ds (topk_scores gradient) — needed for router training.
         # NOTE: topk_scores.stop_gradient is unreliable inside .apply() because
         # Paddle's torch-proxy resets stop_gradient=True on inputs (mirroring
@@ -1654,6 +1738,7 @@ class _DownProjection(torch.autograd.Function):
         is_varlen_K = ctx.is_varlen_K
         activation_type = ctx.activation_type
         use_quack_gemm = ctx.use_quack_gemm
+        fp8_combine_grad_handle = ctx._fp8_combine_grad_handle
 
         # Ensure dout is contiguous (expanded tensors from e.g. sum().backward()
         # have stride (0,0) which violates GEMM k-major assertions)
@@ -1724,7 +1809,7 @@ class _DownProjection(torch.autograd.Function):
             # assert not torch.compiler.is_compiling()  # Paddle compat
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
-            s = topk_scores[s_scatter_idx]
+            s = _gather_router_scores_i32(topk_scores, s_scatter_idx)
             if ctx._fp8_enabled_flag and ctx._alignment_assumed_flag:
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
@@ -1738,32 +1823,12 @@ class _DownProjection(torch.autograd.Function):
 
                     if not use_fp8_preact:
                         # Standalone dequant (when z is already bf16) — all on default stream.
-                        s_float = s.float()
+                        s_float = s if str(s.dtype) in ("torch.float32", "paddle.float32", "float32") else s.float()
                         if z is None:
                             z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
                             del z_fp8, z_raw_scales_u8
                     else:
-                        s_float = s.float()
-
-                    # dout-quant + scale_gather (all on default stream).
-                    dout_fp8, dout_scales_t = quantize_and_pack_activation(dout)
-                    TK_bwd = x_gather_idx.shape[0]
-                    K_bwd = dout.shape[1]
-                    k_tiles_bwd = _div_up(K_bwd, _SF_TILE_K)
-                    per_batch_bwd = _storage_per_batch(TK_bwd, K_bwd)
-                    dout_scales_tk = (
-                        torch.empty((1, per_batch_bwd), dtype=torch.uint8, device=dout.device)
-                        if (TK_bwd % _SF_TILE_M == 0 and K_bwd % _SF_TILE_K == 0)
-                        else torch.full((1, per_batch_bwd), 127, dtype=torch.uint8, device=dout.device)
-                    )
-                    _gather_isa_packed_scales_kernel[(_div_up(TK_bwd, 128), k_tiles_bwd)](
-                        dout_scales_t.view(torch.uint8), x_gather_idx, dout_scales_tk, TK_bwd,
-                        src_k_tiles=k_tiles_bwd, dst_k_tiles=k_tiles_bwd,
-                        SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
-                        BLOCK_ROWS=128, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
-                    )
-                    dout_scales = dout_scales_tk.view(_E8M0_DTYPE)
-                    del dout_scales_t, dout_scales_tk
+                        s_float = s if str(s.dtype) in ("torch.float32", "paddle.float32", "float32") else s.float()
 
                     if ctx._w2_decoupled:
                         w2_fp8_enk = ctx._w2_dgated_fp8
@@ -1781,6 +1846,41 @@ class _DownProjection(torch.autograd.Function):
                         dtype=torch.float32,
                         device=dout.device,
                     )
+
+                    K_bwd = dout.shape[1]
+                    combine_grad_data = (
+                        fp8_combine_grad_handle.get("data")
+                        if fp8_combine_grad_handle is not None else None
+                    )
+                    combine_grad_scale = (
+                        fp8_combine_grad_handle.get("scale")
+                        if fp8_combine_grad_handle is not None else None
+                    )
+                    dout_has_comm_fp8_payload = combine_grad_data is not None and combine_grad_scale is not None
+                    if dout_has_comm_fp8_payload:
+                        if str(combine_grad_scale.dtype) in ("torch.uint8", "paddle.uint8", "uint8"):
+                            dout_raw_scales_t = combine_grad_scale
+                        elif str(combine_grad_scale.dtype) in ("torch.int32", "paddle.int32", "int32"):
+                            dout_raw_scales_t = combine_grad_scale
+                        else:
+                            dout_raw_scales_t = combine_grad_scale.to(device=combine_grad_scale.device, dtype=torch.uint8)
+                        if not _is_fp8_e4m3_dtype(combine_grad_data.dtype):
+                            raise RuntimeError("Sonic FP8 combine backward requires FP8 combine grad payload")
+                        dout_comm_fp8 = combine_grad_data
+                        dout_fp8 = dout_comm_fp8
+                        if not ctx._fp8_cfg.fp8_wgrad:
+                            dout_dequant_scales = _raw_1x32_scale_bytes(dout_raw_scales_t)
+                            dout = dequantize_blockscaled_fp8(dout_comm_fp8, dout_dequant_scales)
+                    else:
+                        dout_fp8, dout_raw_scales_t = quantize_activation_blockscaled_fast(dout)
+                    source_rows_bwd = int(dout_fp8.shape[0])
+                    dout_scales = _gather_1x32_scales_to_isa(
+                        dout_raw_scales_t,
+                        x_gather_idx,
+                        source_rows_bwd,
+                        K_bwd,
+                    )
+
                     gemm_dgated_kernel(
                         dout_fp8,
                         w2_fp8_enk,
@@ -1839,11 +1939,27 @@ class _DownProjection(torch.autograd.Function):
                         # Step 2: Fused dual(dz) + colwise(dout, gather)
                         # API-level fusion: pre-alloc all outputs, back-to-back
                         # kernel launch, zero Python overhead between the two.
-                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales, \
-                            dout_col_fp8, dout_col_sc = fused_dual_colwise_quantize(
-                                dz, dout, x_gather_idx,
-                                TK_wgrad, dz.shape[1], dout.shape[1],
+                        if dout_has_comm_fp8_payload:
+                            dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales = dual_quantize_varlen(
+                                dz, TK_wgrad, dz.shape[1]
                             )
+                            dout_packed_scales_t = _ensure_isa_1x32_scales(
+                                dout_raw_scales_t,
+                                source_rows_bwd,
+                                K_bwd,
+                            )
+                            dout_col_fp8, dout_col_sc = dequant_colwise_quantize_and_pack_from_isa(
+                                dout_comm_fp8, dout_packed_scales_t,
+                                logical_rows=dout.shape[1], logical_cols=TK_wgrad,
+                                gather_idx=x_gather_idx,
+                            )
+                            del dout_packed_scales_t
+                        else:
+                            dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales, \
+                                dout_col_fp8, dout_col_sc = fused_dual_colwise_quantize(
+                                    dz, dout, x_gather_idx,
+                                    TK_wgrad, dz.shape[1], dout.shape[1],
+                                )
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
 
@@ -2111,6 +2227,9 @@ class _DownProjection(torch.autograd.Function):
         elif not is_varlen_K:
             ds = ds.view(T, K)
 
+        if fp8_combine_grad_handle is not None:
+            fp8_combine_grad_handle.pop("data", None)
+            fp8_combine_grad_handle.pop("scale", None)
         # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum/None)
         # Tensor inputs: y1, z, w2, [b2], topk_scores, selected_experts, expert_frequency_offset,
         #   x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, [num_activated_expert_per_token_offset]
