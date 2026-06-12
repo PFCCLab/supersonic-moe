@@ -454,6 +454,7 @@ def _quantize_flat_v2_kernel(
     GROUP_SIZE: tl.constexpr,       # 32
     TILE_ROWS: tl.constexpr,        # 128
     TILE_COLS: tl.constexpr,        # 256
+    SCALE_OUT_INT32: tl.constexpr = False,
     SAFE_INT64: tl.constexpr = False,
 ):
     """High-BW blockscaled quantize: large tiles, vectorized, pipelined.
@@ -504,15 +505,18 @@ def _quantize_flat_v2_kernel(
         dst_ptrs = dst_fp8_ptr + row_offs[:, None] * dst_stride_row + col_offs[None, :] * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
 
-        # Store scale byte
         group_id = (col_base // GROUP_SIZE) + g
         scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
-        tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
+        if SCALE_OUT_INT32:
+            tl.store(scale_ptrs, e8m0_byte.to(tl.int32), mask=row_mask)
+        else:
+            tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
 
 
 def quantize_activation_blockscaled_fast(
     x: torch.Tensor,
     group_size: int = 32,
+    scale_dtype=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fast fused 1×group_size blockscaled quantization using a single Triton kernel.
 
@@ -524,7 +528,8 @@ def quantize_activation_blockscaled_fast(
     num_groups = _div_up(K, group_size)
 
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
-    scale_out = torch.empty(M, num_groups, dtype=torch.uint8, device=x.device)
+    scale_out_int32 = str(scale_dtype) in ("torch.int32", "paddle.int32", "int32")
+    scale_out = torch.empty(M, num_groups, dtype=(torch.int32 if scale_out_int32 else torch.uint8), device=x.device)
 
     TILE_ROWS = 128  # Larger tile: fewer CTAs, better wave occupancy
     TILE_COLS = min(K, 256)
@@ -548,6 +553,7 @@ def quantize_activation_blockscaled_fast(
         GROUP_SIZE=group_size,
         TILE_ROWS=TILE_ROWS,
         TILE_COLS=TILE_COLS,
+        SCALE_OUT_INT32=scale_out_int32,
         SAFE_INT64=_needs_int64,
     )
     return fp8_out, scale_out
@@ -1810,6 +1816,10 @@ def colwise_quantize_and_pack(
 # Dual row+col quantize for fused actgrad+wgrad data prep
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Dual row+col quantize for fused actgrad+wgrad data prep
+# ---------------------------------------------------------------------------
+
 @wrap_triton_kernel
 @triton.jit
 def _dual_varlen_quantize_kernel(
@@ -1850,10 +1860,9 @@ def _dual_varlen_quantize_kernel(
     src_ptrs = src_ptr + tk_offs[:, None].to(tl.int64) * src_stride_row + dim_offs[None, :].to(tl.int64) * src_stride_col
     values = tl.load(src_ptrs, mask=mask_2d, other=0.0).to(tl.float32)  # (32, 128)
 
-    # ── Col-major quantize: groups of 32 along TK ──
-    # For each of the 128 dim elements, find amax across 32 TK rows
-    values_t = tl.trans(values)   # (128, 32)
-    col_amax = tl.max(tl.abs(values_t), axis=1)  # (128,)
+    # ── Col-major quantize: groups of 32 along TK (amax over the 32 TK rows) ──
+    # No transpose: reduce over axis=0 (TK rows) directly.
+    col_amax = tl.max(tl.abs(values), axis=0)  # (128,)
     col_bits = col_amax.to(tl.int32, bitcast=True)
     col_bexp = (col_bits >> 23) & 0xFF
     col_mant = col_bits & 0x7FFFFF
@@ -1862,12 +1871,11 @@ def _dual_varlen_quantize_kernel(
     col_e8m0 = tl.maximum(col_e8m0, 0).to(tl.uint8)
     col_qexp = tl.maximum(tl.minimum(254 - col_e8m0.to(tl.int32), 254), 1)
     col_qscale = (col_qexp << 23).to(tl.float32, bitcast=True)
-    col_fp8 = (values_t * col_qscale[:, None]).to(tl.float8e4nv)  # (128, 32)
+    col_fp8 = (values * col_qscale[None, :]).to(tl.float8e4nv)  # (32, 128)
 
-    # Write col fp8: same physical (TK, dim) layout, just different quant
-    col_fp8_t = tl.trans(col_fp8)  # (32, 128) — back to (TK, dim) order
+    # Write col fp8: same physical (TK, dim) layout (no transpose back)
     col_out_ptrs = col_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + dim_offs[None, :].to(tl.int64)
-    tl.store(col_out_ptrs, col_fp8_t, mask=mask_2d)
+    tl.store(col_out_ptrs, col_fp8, mask=mask_2d)
 
     # Write col ISA scales (dim rows, TK cols in logical layout)
     GROUPS_PER_K: tl.constexpr = SF_TILE_K // GROUP_SIZE
@@ -1881,39 +1889,33 @@ def _dual_varlen_quantize_kernel(
     tl.store(col_scales_ptr + col_isa_offs.to(tl.int64), col_e8m0, mask=dim_mask)
 
     # ── Row-major quantize: groups of 32 along dim ──
-    # Process 4 groups of 32 within the 128-dim block.
-    # Re-reads from source (L2 cache hot from the initial load above).
+    # Reuse the already-loaded `values` (32,128) registers — no re-read, no loop.
+    # Reshape (32, 128) -> (32, 4, 32): [tk, g, j] = values[tk, g*32 + j].
     GROUPS_PER_DIM: tl.constexpr = BLOCK_DIM // GROUP_SIZE  # 4
     row_row_tiles = tk_offs // SF_TILE_M
     row_row_in_tile = tk_offs % SF_TILE_M
     row_row_base = (row_row_in_tile % 32) * 16 + (row_row_in_tile // 32) * 4
 
-    packed_i32 = tl.zeros([GROUP_SIZE], dtype=tl.int32)
+    vr = tl.reshape(values, (GROUP_SIZE, GROUPS_PER_DIM, GROUP_SIZE))  # (32,4,32)
+    row_amax = tl.max(tl.abs(vr), axis=2)  # (32,4)
+    row_bits = row_amax.to(tl.int32, bitcast=True)
+    row_bexp = (row_bits >> 23) & 0xFF
+    row_mant = row_bits & 0x7FFFFF
+    row_carry = tl.where(row_mant > 0x600000, 1, 0)
+    row_e8m0 = tl.where(row_bexp > 0, row_bexp - 8 + row_carry, 0)
+    row_e8m0 = tl.maximum(row_e8m0, 0)  # (32,4) int32
+    row_qexp = tl.maximum(tl.minimum(254 - row_e8m0, 254), 1)
+    row_qscale = (row_qexp << 23).to(tl.float32, bitcast=True)  # (32,4)
+    row_fp8 = (vr * row_qscale[:, :, None]).to(tl.float8e4nv)   # (32,4,32)
+    row_fp8 = tl.reshape(row_fp8, (GROUP_SIZE, BLOCK_DIM))      # (32,128)
 
-    for g in tl.range(0, GROUPS_PER_DIM):
-        g_dim_offs = pid_dim_block * BLOCK_DIM + g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        g_mask = tk_mask[:, None] & (g_dim_offs[None, :] < dim)
-        g_ptrs = src_ptr + tk_offs[:, None].to(tl.int64) * src_stride_row + g_dim_offs[None, :].to(tl.int64) * src_stride_col
-        g_vals = tl.load(g_ptrs, mask=g_mask, other=0.0).to(tl.float32)
+    # Write row fp8: full (32,128) block at once
+    row_out_ptrs = row_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + dim_offs[None, :].to(tl.int64)
+    tl.store(row_out_ptrs, row_fp8, mask=mask_2d)
 
-        # E8M0 quant per TK row (amax over 32 dim cols)
-        row_amax = tl.max(tl.abs(g_vals), axis=1)  # (32,)
-        row_bits = row_amax.to(tl.int32, bitcast=True)
-        row_bexp = (row_bits >> 23) & 0xFF
-        row_mant = row_bits & 0x7FFFFF
-        row_carry = tl.where(row_mant > 0x600000, 1, 0)
-        row_e8m0 = tl.where(row_bexp > 0, row_bexp - 8 + row_carry, 0)
-        row_e8m0 = tl.maximum(row_e8m0, 0)
-        row_qexp = tl.maximum(tl.minimum(254 - row_e8m0, 254), 1)
-        row_qscale = (row_qexp << 23).to(tl.float32, bitcast=True)
-        row_fp8_g = (g_vals * row_qscale[:, None]).to(tl.float8e4nv)
-
-        # Write row fp8
-        row_out_ptrs = row_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + g_dim_offs[None, :].to(tl.int64)
-        tl.store(row_out_ptrs, row_fp8_g, mask=g_mask)
-
-        # Pack ISA scale byte
-        packed_i32 = packed_i32 | ((row_e8m0 & 0xFF) << (g * 8))
+    # Pack the 4 e8m0 bytes per TK row into a uint32 (disjoint byte positions => sum == OR)
+    shifts = tl.arange(0, GROUPS_PER_DIM) * 8  # (4,)
+    packed_i32 = tl.sum((row_e8m0 & 0xFF) << shifts[None, :], axis=1)  # (32,)
 
     # Write row ISA packed scales as uint32
     row_tile_base = (row_row_tiles * row_k_tiles + pid_dim_block) * SF_TILE_STORAGE
@@ -1972,7 +1974,8 @@ def dual_quantize_varlen(
     col_k_tiles = _div_up(TK, _SF_TILE_K)
 
     grid = (_div_up(TK, GROUP_SIZE), _div_up(dim, BLOCK_DIM))
-    # NCU-guided: num_warps=1 gives 2× speedup (157µs vs 314µs at TK=65536).
+    # NCU-guided: num_warps=1 optimal (single-pass read; 2/4/8 fragment the
+    # (32,128)/32-group tile and regress). Real dz (262144,1536): 389.63us ncu.
     _dual_varlen_quantize_kernel[grid](
         src,
         row_fp8, row_scales,
@@ -5106,3 +5109,390 @@ def blockscaled_fp8_weight_grad_gemm_fast(
         out.copy_(grouped_out)
         return out
     return grouped_out
+
+
+def quantize_native_fp8_weights(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    iso32: Optional[bool] = None,
+) -> dict[str, object]:
+    if iso32 is None:
+        iso32 = _iso32_weight_enabled()
+    if iso32:
+        return {
+            "format": "iso32",
+            "w1": iso32_dual_quantize_weight_3d(w1.permute(2, 0, 1)),
+            "w2": iso32_dual_quantize_weight_3d(w2.permute(2, 0, 1)),
+        }
+    return {
+        "format": "1x32",
+        "w1": _quantize_weight_pair_3d_triton(w1.permute(2, 0, 1)),
+        "w2": _quantize_weight_pair_3d_triton(w2.permute(2, 0, 1)),
+    }
+
+
+@wrap_triton_kernel
+@triton.jit
+def _dequant_colwise_quantize_and_pack_from_isa_kernel(
+    src_fp8_ptr,
+    src_packed_ptr,
+    gather_idx_ptr,
+    dst_fp8_ptr,
+    dst_packed_ptr,
+    total_K,
+    dim,
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    src_k_tiles,
+    dst_k_tiles,
+    HAS_GATHER: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_K: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr = 1,
+):
+    pid_group_blk = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+
+    groups_per_k_tile: tl.constexpr = SF_TILE_K // GROUP_SIZE
+    dim_groups_per_block: tl.constexpr = BLOCK_DIM // GROUP_SIZE
+
+    for g_local in tl.static_range(0, GROUPS_PER_BLOCK):
+        pid_group = (pid_group_blk * GROUPS_PER_BLOCK + g_local).to(tl.int64)
+        k_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE).to(tl.int64)
+        k_mask = k_offs < total_K
+
+        if HAS_GATHER:
+            src_rows = tl.load(gather_idx_ptr + k_offs, mask=k_mask, other=0).to(tl.int64)
+        else:
+            src_rows = k_offs.to(tl.int64)
+
+        src_row_tiles = src_rows // SF_TILE_M
+        src_row_in_tile = src_rows % SF_TILE_M
+        src_row_base = (src_row_in_tile % 32) * 16 + (src_row_in_tile // 32) * 4
+
+        dst_k_tiles_idx = pid_group // groups_per_k_tile
+        dst_k_in_tile = pid_group % groups_per_k_tile
+
+        for d_local in tl.static_range(0, dim_groups_per_block):
+            dim_offs = (pid_dim * BLOCK_DIM + d_local * GROUP_SIZE + tl.arange(0, GROUP_SIZE)).to(tl.int64)
+            dim_mask = dim_offs < dim
+            mask = k_mask[:, None] & dim_mask[None, :]
+
+            src_group_id = (pid_dim * dim_groups_per_block + d_local).to(tl.int64)
+            src_k_tiles_idx = src_group_id // groups_per_k_tile
+            src_k_in_tile = src_group_id % groups_per_k_tile
+            src_scale_offsets = (
+                (src_row_tiles * src_k_tiles + src_k_tiles_idx) * SF_TILE_STORAGE
+                + src_row_base
+                + src_k_in_tile
+            ).to(tl.int64)
+            src_scale_u8 = tl.load(src_packed_ptr + src_scale_offsets, mask=k_mask, other=0)
+            src_scale = (src_scale_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+
+            fp8_ptrs = src_fp8_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :].to(tl.int64) * src_stride_col
+            fp8_vals = tl.load(fp8_ptrs, mask=mask, other=0.0)
+            values = fp8_vals.to(tl.float32) * src_scale[:, None]
+
+            block_amax = tl.max(tl.abs(values), axis=0)
+            amax_bits = block_amax.to(tl.int32, bitcast=True)
+            biased_exp = (amax_bits >> 23) & 0xFF
+            carry = (amax_bits & 0x7FFFFF) > 0x600000
+            e8m0_i32 = tl.maximum(biased_exp + carry.to(tl.int32) - 8, 0)
+            e8m0_byte = e8m0_i32.to(tl.uint8)
+            quant_scale = ((254 - e8m0_i32).to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            quantized = (values * quant_scale[None, :]).to(tl.float8e4nv)
+
+            dst_ptrs = dst_fp8_ptr + k_offs[:, None].to(tl.int64) * dst_stride_row + dim_offs[None, :].to(tl.int64) * dst_stride_col
+            tl.store(dst_ptrs, quantized, mask=mask)
+
+            dst_row_tiles = dim_offs // SF_TILE_M
+            dst_row_in_tile = dim_offs % SF_TILE_M
+            dst_row_base = (dst_row_in_tile % 32) * 16 + (dst_row_in_tile // 32) * 4
+            dst_scale_offsets = (
+                (dst_row_tiles * dst_k_tiles + dst_k_tiles_idx) * SF_TILE_STORAGE
+                + dst_row_base
+                + dst_k_in_tile
+            )
+            tl.store(dst_packed_ptr + dst_scale_offsets.to(tl.int64), e8m0_byte, mask=dim_mask)
+
+def dequant_colwise_quantize_and_pack_from_isa(
+    src_fp8: torch.Tensor,
+    src_packed_scales: torch.Tensor,
+    logical_rows: int,
+    logical_cols: int,
+    *,
+    gather_idx: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_tensor(src_fp8, "src_fp8", dtype=torch.float8_e4m3fn, ndim=2)
+    if src_packed_scales.dtype not in (torch.uint8, _E8M0_DTYPE):
+        raise ValueError(f"src_packed_scales must be uint8/e8m0, got {src_packed_scales.dtype}")
+    T, H_src = src_fp8.shape
+    H = logical_rows
+    TK = logical_cols
+    if H_src != H:
+        raise ValueError(f"src_fp8 second dim {H_src} != logical_rows {H}")
+    expected_src_scales = (1, _storage_per_batch(T, H))
+    if tuple(src_packed_scales.shape) != expected_src_scales:
+        raise ValueError(
+            f"src_packed_scales shape {tuple(src_packed_scales.shape)} != expected {expected_src_scales}"
+        )
+    if gather_idx is not None:
+        check_tensor(gather_idx, "gather_idx", ndim=1, stride0_1=True)
+        if gather_idx.shape[0] != TK:
+            raise ValueError(f"gather_idx length {gather_idx.shape[0]} != logical_cols {TK}")
+    elif T != TK:
+        raise ValueError(f"without gather_idx, src rows {T} must equal logical_cols {TK}")
+
+    GROUP_SIZE = _SF_VEC_SIZE
+    BLOCK_DIM = 64
+    fp8_out = torch.empty(TK, H, dtype=torch.float8_e4m3fn, device=src_fp8.device)
+    per_batch_storage = _storage_per_batch(H, TK)
+    if H % _SF_TILE_M == 0 and TK % _SF_TILE_K == 0:
+        packed_scales = torch.empty((1, per_batch_storage), dtype=torch.uint8, device=src_fp8.device)
+    else:
+        packed_scales = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=src_fp8.device)
+
+    if TK == 0 or H == 0:
+        return fp8_out, packed_scales.view(_E8M0_DTYPE)
+
+    num_groups = _div_up(TK, GROUP_SIZE)
+    src_k_tiles = _div_up(H, _SF_TILE_K)
+    dst_k_tiles = _div_up(TK, _SF_TILE_K)
+    GROUPS_PER_BLOCK = 2 if (num_groups % 2 == 0) else 1
+    grid = (num_groups // GROUPS_PER_BLOCK, _div_up(H, BLOCK_DIM))
+    has_gather = gather_idx is not None
+    gather_ptr = gather_idx if has_gather else src_fp8
+
+    _dequant_colwise_quantize_and_pack_from_isa_kernel[grid](
+        src_fp8, src_packed_scales.view(torch.uint8), gather_ptr,
+        fp8_out, packed_scales,
+        TK, H,
+        src_fp8.stride(0), src_fp8.stride(1),
+        fp8_out.stride(0), fp8_out.stride(1),
+        src_k_tiles, dst_k_tiles,
+        HAS_GATHER=has_gather,
+        GROUP_SIZE=GROUP_SIZE,
+        BLOCK_DIM=BLOCK_DIM,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_K=_SF_TILE_K,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
+        num_warps=1,
+    )
+    return fp8_out, packed_scales.view(_E8M0_DTYPE)
+
+
+@wrap_triton_kernel
+@triton.jit
+def _pack_scales_1x32_isa_kernel(
+    scales_ptr,
+    packed_ptr,
+    total_storage,
+    rows,
+    scale_cols,
+    k_tiles,
+    per_batch_storage,
+    scale_stride_batch,
+    scale_stride_row,
+    scale_stride_col,
+    SF_TILE_STORAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_storage
+
+    within_batch = offs % per_batch_storage
+    batch = offs // per_batch_storage
+    tile = within_batch // SF_TILE_STORAGE
+    tile_offset = within_batch % SF_TILE_STORAGE
+
+    row_tile = tile // k_tiles
+    k_tile = tile % k_tiles
+    row_mod32 = tile_offset // 16
+    row_quad = (tile_offset % 16) // 4
+    k_in_tile = tile_offset % 4
+
+    row = row_tile * 128 + row_quad * 32 + row_mod32
+    scale_col = k_tile * 4 + k_in_tile
+    valid_value = mask & (row < rows) & (scale_col < scale_cols)
+    src = (
+        batch * scale_stride_batch
+        + row * scale_stride_row
+        + scale_col * scale_stride_col
+    )
+    v = tl.load(scales_ptr + src, mask=valid_value, other=1).to(tl.uint8)
+    tl.store(packed_ptr + offs, v, mask=mask)
+
+
+def pack_blockscaled_1x32_scales_fast(scales: torch.Tensor, cols: int) -> torch.Tensor:
+    if scales.ndim not in (2, 3):
+        raise ValueError(f"expected 2D or 3D scales, got shape {tuple(scales.shape)}")
+    if scales.device.type != "cuda":
+        raise ValueError("blockscaled scale packing requires CUDA tensors")
+    if str(scales.dtype) not in (
+        "torch.uint8", "paddle.uint8", "uint8",
+        "torch.int32", "paddle.int32", "int32",
+    ):
+        return pack_blockscaled_1x32_scales(scales, cols)
+
+    if scales.ndim == 2:
+        scales = scales.unsqueeze(0)
+
+    batches, rows, scale_cols = scales.shape
+    expected_scale_cols = _div_up(cols, _SF_VEC_SIZE)
+    if scale_cols != expected_scale_cols:
+        raise ValueError(
+            f"scale cols mismatch: expected {expected_scale_cols} for cols={cols}, got {scale_cols}"
+        )
+
+    per_batch_storage = _storage_per_batch(rows, cols)
+    packed = torch.empty((batches, per_batch_storage), dtype=torch.uint8, device=scales.device)
+    total_storage = batches * per_batch_storage
+    BLOCK = 256
+    grid = (_div_up(total_storage, BLOCK),)
+    _pack_scales_1x32_isa_kernel[grid](
+        scales,
+        packed,
+        total_storage,
+        rows,
+        scale_cols,
+        _div_up(cols, _SF_TILE_K),
+        per_batch_storage,
+        scales.stride(0),
+        scales.stride(1),
+        scales.stride(2),
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK=BLOCK,
+    )
+    return packed
+
+
+@wrap_triton_kernel
+@triton.jit
+def _gather_raw_scales_1x32_to_isa_kernel(
+    raw_scale_ptr,
+    gather_idx_ptr,
+    dst_scale_ptr,
+    TK,
+    scale_cols,
+    dst_k_tiles: tl.constexpr,
+    raw_stride_row,
+    raw_stride_col,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    GROUPS_PER_K_TILE: tl.constexpr,
+):
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    k_tile_idx = tl.program_id(1)
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    k_in = tl.arange(0, GROUPS_PER_K_TILE)
+    row_mask = row_ids < TK
+
+    gather_ids = tl.load(gather_idx_ptr + row_ids, mask=row_mask, other=0)
+    src_cols = k_tile_idx * GROUPS_PER_K_TILE + k_in
+    src = raw_scale_ptr + gather_ids[:, None] * raw_stride_row + src_cols[None, :] * raw_stride_col
+    valid = row_mask[:, None] & (src_cols[None, :] < scale_cols)
+    vals = tl.load(src, mask=valid, other=1).to(tl.uint8)
+
+    dst_row_tiles = row_ids // SF_TILE_M
+    dst_row_in_tile = row_ids % SF_TILE_M
+    dst_row_base_offset = (dst_row_in_tile % 32) * 16 + (dst_row_in_tile // 32) * 4
+    dst_tile_base = (dst_row_tiles * dst_k_tiles + k_tile_idx) * SF_TILE_STORAGE
+    dst = dst_scale_ptr + dst_tile_base[:, None] + dst_row_base_offset[:, None] + k_in[None, :]
+    tl.store(dst, vals, mask=row_mask[:, None])
+
+
+def gather_raw_blockscaled_1x32_scales_to_isa(
+    raw_scales: torch.Tensor,
+    gather_idx: torch.Tensor,
+    cols: int,
+) -> torch.Tensor:
+    if raw_scales.ndim == 3:
+        if raw_scales.shape[0] != 1:
+            raise ValueError(f"expected batch=1 raw scales, got shape {tuple(raw_scales.shape)}")
+        raw_scales = raw_scales.squeeze(0)
+    if raw_scales.ndim != 2:
+        raise ValueError(f"expected 2D raw scales, got shape {tuple(raw_scales.shape)}")
+
+    TK = int(gather_idx.shape[0])
+    scale_cols = int(raw_scales.shape[1])
+    expected_scale_cols = _div_up(cols, _SF_VEC_SIZE)
+    if scale_cols != expected_scale_cols:
+        raise ValueError(
+            f"scale cols mismatch: expected {expected_scale_cols} for cols={cols}, got {scale_cols}"
+        )
+
+    per_batch_storage = _storage_per_batch(TK, cols)
+    if TK % _SF_TILE_M == 0 and cols % _SF_TILE_K == 0:
+        packed = torch.empty((1, per_batch_storage), dtype=torch.uint8, device=raw_scales.device)
+    else:
+        packed = torch.full((1, per_batch_storage), 1, dtype=torch.uint8, device=raw_scales.device)
+    block_rows = 128
+    k_tiles = _div_up(cols, _SF_TILE_K)
+    _gather_raw_scales_1x32_to_isa_kernel[(_div_up(TK, block_rows), k_tiles)](
+        raw_scales,
+        gather_idx,
+        packed,
+        TK,
+        scale_cols,
+        dst_k_tiles=k_tiles,
+        raw_stride_row=raw_scales.stride(0),
+        raw_stride_col=raw_scales.stride(1),
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK_ROWS=block_rows,
+        GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
+    )
+    return packed
+
+
+@triton.jit
+def _gather_router_scores_i32_kernel(src, idx, dst, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    src_idx = tl.load(idx + offs, mask=mask, other=0)
+    vals = tl.load(src + src_idx, mask=mask, other=0.0)
+    tl.store(dst + offs, vals, mask=mask)
+
+
+@triton.jit
+def _scatter_router_scores_i32_kernel(src, idx, dst, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    dst_idx = tl.load(idx + offs, mask=mask, other=0)
+    vals = tl.load(src + offs, mask=mask, other=0.0)
+    tl.store(dst + dst_idx, vals, mask=mask)
+
+
+def _gather_router_scores_i32(scores: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    n = int(idx.shape[0])
+    out = scores.new_empty((n,))
+    if n > 0:
+        block = 256
+        _gather_router_scores_i32_kernel[(triton.cdiv(n, block),)](
+            scores, idx, out, n, BLOCK=block,
+        )
+    return out
+
+
+def _scatter_router_scores_i32(scores: torch.Tensor, idx: torch.Tensor, n_total: int) -> torch.Tensor:
+    out = scores.new_empty((n_total,))
+    n = int(idx.shape[0])
+    if n < n_total:
+        out.zero_()
+    if n > 0:
+        block = 256
+        _scatter_router_scores_i32_kernel[(triton.cdiv(n, block),)](
+            scores, idx, out, n, BLOCK=block,
+        )
+    return out
