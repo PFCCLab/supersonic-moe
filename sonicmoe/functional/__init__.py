@@ -1256,6 +1256,7 @@ class _UpProjection(torch.autograd.Function):
         is_inference_mode_enabled: bool,
         use_low_precision_postact_buffer: bool = False,
         prequant_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
+        fp8_allgather_grad_handle=None,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -1437,6 +1438,7 @@ class _UpProjection(torch.autograd.Function):
         ctx._has_b1 = b1 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._prequant_activation_payload = prequant_activation_payload is not None
+        ctx._fp8_allgather_grad_handle = fp8_allgather_grad_handle
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
@@ -1833,6 +1835,14 @@ class _UpProjection(torch.autograd.Function):
             is_varlen_K=is_varlen_K,
         )
         _log_stage_memory("backward:token-reduce")
+
+        # Side-channel for AllGather fp8 dispatcher: forward output to dispatcher
+        # is fp8, which forces Paddle PyLayer to cast grad to fp8 dtype.  We write
+        # the native bf16 dx_reduced to a shared handle so the dispatcher backward
+        # can ReduceScatter bf16 directly (avoiding fp8 NCCL reduction and any
+        # bf16<->fp8 cast).
+        if ctx._fp8_allgather_grad_handle is not None:
+            ctx._fp8_allgather_grad_handle["dx_global"] = dx_reduced
 
         # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum)
         grads = [dx_reduced, dw1]
