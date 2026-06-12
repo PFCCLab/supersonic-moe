@@ -61,7 +61,7 @@ class SonicMoEConfig:
         fused_gated: Use fused gemm_gated/dgated CUTLASS kernels.
             Env: ``SONIC_MOE_FP8_FUSED_GATED``. Default: True.
         save_z_fp8: Save z tensor in FP8 to reduce memory.
-            Env: ``SONIC_MOE_FP8_SAVE_Z_FP8``. Default: False (precision first).
+            Env: ``SONIC_MOE_FP8_SAVE_Z_FP8``. Default: True.
         fused_swiglu_quant: Use fused SwiGLU+quantize kernels.
             Env: ``SONIC_MOE_FP8_FUSED_SWIGLU_QUANT``. Default: True.
         epilogue_quant: Enable epilogue blockscaled quant of z.
@@ -72,12 +72,6 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_FP8_ASSUME_ALIGNED``. Default: False.
         stagewise_memory: Enable per-stage memory logging.
             Env: ``SONIC_MOE_STAGEWISE_MEMORY``. Default: False.
-        iso32_weight: Use ISO32 single-FP8-buffer quantization for weights.
-            Env: ``SONIC_MOE_FP8_ISO32_WEIGHT``. Default: False; set True/1 for the legacy iso32 path.
-        dz_iso32: Use ISO32 single-FP8-buffer quantization for backward dz.
-            Env: ``SONIC_MOE_DZ_ISO32``. Default: False (precision-first 1x32 dual path); set True/1 for the legacy iso32 path.
-        swiglu_clamp_value: Optional user-controlled SwiGLU clamp value.
-            Default: 0.0 (disabled).
     """
 
     use_fp8: Optional[bool] = None
@@ -92,8 +86,6 @@ class SonicMoEConfig:
     assume_aligned: Optional[bool] = None
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
-    dz_iso32: Optional[bool] = None
-    swiglu_clamp_value: Optional[float] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -126,20 +118,19 @@ class SonicMoEConfig:
     def resolve_save_z_fp8(self) -> bool:
         if self.save_z_fp8 is not None:
             return self.save_z_fp8
-        return _env_bool("SONIC_MOE_FP8_SAVE_Z_FP8", False) or False
+        return _env_bool("SONIC_MOE_FP8_SAVE_Z_FP8", True) or False
 
     def resolve_recompute_z(self) -> bool:
-        """Recompute z in DownProj backward (skip storing in forward).
+        """Recompute z_fp8 in DownProj backward (skip storing in forward).
 
-        When True, ``_UpProjection.forward`` does NOT populate the z prequant
-        cache and ``_DownProjection.forward`` saves a recompute closure to ctx
-        instead of the z tensor.  Backward re-runs the up-proj GEMM (gather-A
-        + epilogue) just-in-time and discards the recomputed y1 (SwiGLU /
+        When True, ``_UpProjection.forward`` does NOT populate the
+        ``z_fp8`` prequant cache and ``_DownProjection.forward`` saves a
+        recompute closure to ctx instead of the fp8 z tensor.  Backward
+        re-runs the up-proj GEMM (gather-A + epilogue blockscaled fp8
+        quant) just-in-time and discards the recomputed y1 (SwiGLU /
         PostAct write are wasted, ~5-15% of an up-proj fwd cost).
-
-        Precision-first: the recompute emits BF16 z (no z quant) by default;
-        it only emits FP8 z when ``save_z_fp8`` is explicitly enabled.  This is
-        now independent of ``save_z_fp8`` (no longer implies it).
+        Saves ~213 MiB peak (fp8 z) per active layer at ERNIE shape.
+        Implies save_z_fp8=True semantically.
         """
         if self.recompute_z is not None:
             return self.recompute_z
@@ -174,16 +165,6 @@ class SonicMoEConfig:
         if self.iso32_weight is not None:
             return self.iso32_weight
         return _env_bool("SONIC_MOE_FP8_ISO32_WEIGHT", False) or False
-
-    def resolve_dz_iso32(self) -> bool:
-        if self.dz_iso32 is not None:
-            return self.dz_iso32
-        return _env_bool("SONIC_MOE_DZ_ISO32", False) or False
-
-    def resolve_swiglu_clamp_value(self) -> float:
-        if self.swiglu_clamp_value is not None:
-            return max(float(self.swiglu_clamp_value), 0.0)
-        return 0.0
 
     # --- Context manager for temporary activation ----------------------------
 

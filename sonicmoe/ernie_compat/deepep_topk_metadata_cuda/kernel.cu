@@ -37,10 +37,10 @@ static constexpr int MAX_TOPK = 16;
 //  at scatter_blocks ≈ 1358, observed via cuda-gdb on the legacy combined
 //  kernel at kernel.cu:121).
 // ============================================================================
-template <typename IndexT, int TOPK>
+template <int TOPK>
 __global__ __launch_bounds__(BLOCK_DIM)
 void histogram_kernel(
-    const IndexT* __restrict__ dispatched_indices,  // [N_recv, topk]
+    const int*   __restrict__ dispatched_indices,   // [N_recv, topk]
     int*         __restrict__ block_hist,            // [E * scatter_blocks] output
     int*         __restrict__ block_naept_sum,       // [scatter_blocks] output: sum of valid_counts in this block
     int          N_recv,
@@ -70,12 +70,11 @@ void histogram_kernel(
     #pragma unroll
     for (int col = 0; col < TOPK; col++) {
         if (col >= topk_param) break;
-        int64_t expert_wide = -1;
+        int expert = -1;
         if (row_valid) {
-            expert_wide = static_cast<int64_t>(dispatched_indices[global_row * topk_param + col]);
+            expert = dispatched_indices[global_row * topk_param + col];
         }
-        if (expert_wide >= 0 && expert_wide < static_cast<int64_t>(num_experts)) {
-            int expert = static_cast<int>(expert_wide);
+        if (expert >= 0 && expert < num_experts) {
             // Use warp-distributed atomicOr to reduce contention
             if (col % warp_num == warp_id) {
                 atomicOr(&expert_bitmask[expert], 1u << lane_id);
@@ -146,9 +145,8 @@ static __device__ __forceinline__ int warp_exclusive_scan(int v) {
 
 __global__ __launch_bounds__(BLOCK_DIM)
 void block_offset_scan_kernel(
-    const int* __restrict__ block_hist,          // [E * scatter_blocks]
-    int*       __restrict__ block_offset,        // [E * scatter_blocks]
-    int*       __restrict__ tokens_per_expert,   // [E] optional output, may be nullptr
+    const int* __restrict__ block_hist,    // [E * scatter_blocks]
+    int*       __restrict__ block_offset,  // [E * scatter_blocks]
     int scatter_blocks)
 {
     const int expert = blockIdx.x;
@@ -187,11 +185,6 @@ void block_offset_scan_kernel(
         int t = (lane < warp_num) ? warp_totals[lane] : 0;
         int e = warp_exclusive_scan(t);
         if (lane < warp_num) warp_totals[lane] = e;
-        int last_e = __shfl_sync(0xFFFFFFFF, e, warp_num - 1);
-        int last_t = __shfl_sync(0xFFFFFFFF, t, warp_num - 1);
-        if (lane == 0 && tokens_per_expert != nullptr) {
-            tokens_per_expert[expert] = last_e + last_t;
-        }
     }
     __syncthreads();
 
@@ -316,10 +309,10 @@ void prefix_sums_kernel(
 //  then processes a chunk of TK_padded for fixup.
 //  All data needed (block_offset, expert_offsets, naept) is precomputed.
 // ============================================================================
-template <typename IndexT, int TOPK>
+template <int TOPK>
 __global__ __launch_bounds__(BLOCK_DIM)
 void scatter_and_fixup_kernel(
-    const IndexT* __restrict__ dispatched_indices,  // [N_recv, topk]
+    const int*   __restrict__ dispatched_indices,   // [N_recv, topk]
     const float* __restrict__ dispatched_probs,     // [N_recv, topk]
     const int*   __restrict__ block_offset,          // [E * scatter_blocks]
     const int*   __restrict__ block_naept_base,      // [scatter_blocks] (Fusion v2)
@@ -330,8 +323,7 @@ void scatter_and_fixup_kernel(
     int*         __restrict__ x_gather_idx,          // [TK_padded] output
     int*         __restrict__ s_scatter_idx,         // [TK_padded] output
     int*         __restrict__ s_reverse_scatter_idx, // [TK] output
-    float*       __restrict__ topk_scores,           // [TK_padded] token-major output
-    float*       __restrict__ expert_order_scores,   // [TK_padded] expert-order output
+    float*       __restrict__ topk_scores,           // [TK_padded] output
     int*         __restrict__ score_src_idx,         // [TK] output (int32: row*topk + col)
     int          N_recv,
     int          num_experts,
@@ -376,14 +368,13 @@ void scatter_and_fixup_kernel(
         #pragma unroll
         for (int col = 0; col < TOPK; col++) {
             if (col >= topk_param) break;
-            int64_t expert_wide = -1;
+            int expert = -1;
             float prob = 0.0f;
             if (row_valid) {
-                expert_wide = static_cast<int64_t>(dispatched_indices[global_row * topk_param + col]);
+                expert = dispatched_indices[global_row * topk_param + col];
                 prob = dispatched_probs[global_row * topk_param + col];
             }
-            if (expert_wide >= 0 && expert_wide < static_cast<int64_t>(num_experts)) {
-                int expert = static_cast<int>(expert_wide);
+            if (expert >= 0 && expert < num_experts) {
                 if (col % warp_num == warp_id) {
                     atomicOr(&expert_bitmask[expert], 1u << lane_id);
                 }
@@ -469,12 +460,7 @@ void scatter_and_fixup_kernel(
                     x_gather_idx[padded_pos] = global_row;
                     s_scatter_idx[padded_pos] = token_major_pos;
                     s_reverse_scatter_idx[token_major_pos] = padded_pos;
-                    if (topk_scores != nullptr) {
-                        topk_scores[token_major_pos] = reg_prob[k];
-                    }
-                    if (expert_order_scores != nullptr) {
-                        expert_order_scores[padded_pos] = reg_prob[k];
-                    }
+                    topk_scores[token_major_pos] = reg_prob[k];
                     // Score-source flat index: token-major rank → original
                     // (row * topk + col) flat index into dispatched_probs.
                     // Bit-exact replacement for _build_score_src_idx_kernel.
@@ -485,19 +471,15 @@ void scatter_and_fixup_kernel(
     }
 
     // ═══════════ Phase 2: Pad-fill (vectorized, coalesced) ════════════════════
-    // Fill expert-order padding positions: x_gather_idx=0, s_scatter_idx=TK.
+    // Fill padding positions: x_gather_idx=0, s_scatter_idx=TK, topk_scores=0
     // Process all TK_padded positions, skip real ones.
     // Use grid-stride loop for full coverage.
 
     const int total_threads = gridDim.x * BLOCK_DIM;
     const int global_tid = blockIdx.x * BLOCK_DIM + threadIdx.x;
-    const int actual_TK_padded = expert_offsets[num_experts];
-    const int actual_TK = naept[N_recv];
-    if (topk_scores != nullptr && global_tid == 0 && actual_TK < actual_TK_padded) {
-        topk_scores[actual_TK] = 0.0f;
-    }
 
-    for (int pos = global_tid; pos < actual_TK_padded; pos += total_threads) {
+    for (int pos = global_tid; pos < TK_padded; pos += total_threads) {
+        // Binary search for expert
         int lo = 0, hi = num_experts;
         while (lo < hi) {
             int mid = (lo + hi) >> 1;
@@ -509,11 +491,10 @@ void scatter_and_fixup_kernel(
         const int local_pos = pos - seg_start;
 
         if (local_pos >= real_count) {
+            // Padding position: fill defaults
             x_gather_idx[pos] = 0;
-            s_scatter_idx[pos] = actual_TK;
-            if (expert_order_scores != nullptr) {
-                expert_order_scores[pos] = 0.0f;
-            }
+            s_scatter_idx[pos] = TK;  // points to topk_scores[TK]=0
+            // topk_scores[pos] already 0 from zero-init
         }
     }
 }
@@ -521,8 +502,7 @@ void scatter_and_fixup_kernel(
 // ============================================================================
 //  C++ entry point
 // ============================================================================
-template <typename IndexT>
-void launch_deepep_topk_metadata_cuda(
+void deepep_topk_metadata_cuda(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
     torch::Tensor& tokens_per_expert,
@@ -533,7 +513,6 @@ void launch_deepep_topk_metadata_cuda(
     torch::Tensor& s_scatter_idx,
     torch::Tensor& s_reverse_scatter_idx,
     torch::Tensor& topk_scores,
-    torch::Tensor& expert_order_scores,
     torch::Tensor& naept,
     torch::Tensor& global_block_cumsum,  // reused as workspace
     torch::Tensor& score_src_idx,
@@ -546,16 +525,8 @@ void launch_deepep_topk_metadata_cuda(
     int64_t stream_ptr)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    float* topk_scores_ptr = topk_scores.numel() <= 1 ? nullptr : topk_scores.data_ptr<float>();
-    float* expert_order_scores_ptr = expert_order_scores.numel() <= 1 ? nullptr : expert_order_scores.data_ptr<float>();
-    const bool derive_counts = alignment < 0;
-    const int actual_alignment = derive_counts ? -static_cast<int>(alignment) : static_cast<int>(alignment);
 
     if (N_recv == 0 || TK == 0) {
-        if (derive_counts) {
-            cudaMemsetAsync(tokens_per_expert.data_ptr<int>(), 0, E * sizeof(int), stream);
-            cudaMemsetAsync(expert_offsets.data_ptr<int>(), 0, 3 * sizeof(int), stream);
-        }
         cudaMemsetAsync(naept.data_ptr<int>(), 0, (N_recv + 1) * sizeof(int), stream);
         return;
     }
@@ -588,8 +559,8 @@ void launch_deepep_topk_metadata_cuda(
 
     // ── Kernel 1a: Phase A — per-block histogram + per-block naept sum ───────
     #define LAUNCH_HIST(TV) \
-        histogram_kernel<IndexT, TV><<<grid1, block1, smem_hist, stream>>>( \
-            dispatched_indices.data_ptr<IndexT>(), \
+        histogram_kernel<TV><<<grid1, block1, smem_hist, stream>>>( \
+            dispatched_indices.data_ptr<int>(), \
             block_hist, \
             block_naept_sum, \
             static_cast<int>(N_recv), static_cast<int>(E), \
@@ -602,9 +573,7 @@ void launch_deepep_topk_metadata_cuda(
 
     // ── Kernel 1b: Per-expert column scan of block_hist (parallel grid=E) ────
     block_offset_scan_kernel<<<dim3(static_cast<int>(E)), block1, smem_scan, stream>>>(
-        block_hist, block_offset,
-        derive_counts ? tokens_per_expert.data_ptr<int>() : nullptr,
-        scatter_blocks);
+        block_hist, block_offset, scatter_blocks);
 
     // ── Kernel 1c: Tail prefix sums (B.1 expert_offsets + scan over per-block sums) ──
     prefix_sums_kernel<<<dim3(1), block_prefix, smem_prefix, stream>>>(
@@ -616,7 +585,7 @@ void launch_deepep_topk_metadata_cuda(
         block_naept_base,
         naept.data_ptr<int>(),
         static_cast<int>(N_recv), scatter_blocks, static_cast<int>(E),
-        actual_alignment);
+        static_cast<int>(alignment));
 
     // ── Kernel 2: Scatter + fixup ────────────────────────────────────────────
     // Grid must cover ALL scatter blocks: scatter phase relies on blockIdx.x
@@ -640,8 +609,8 @@ void launch_deepep_topk_metadata_cuda(
     dim3 block2(BLOCK_DIM);
 
     #define LAUNCH_K2(TV) \
-        scatter_and_fixup_kernel<IndexT, TV><<<grid2, block2, smem_k2, stream>>>( \
-            dispatched_indices.data_ptr<IndexT>(), \
+        scatter_and_fixup_kernel<TV><<<grid2, block2, smem_k2, stream>>>( \
+            dispatched_indices.data_ptr<int>(), \
             dispatched_probs.data_ptr<float>(), \
             block_offset, \
             block_naept_base, \
@@ -652,8 +621,7 @@ void launch_deepep_topk_metadata_cuda(
             x_gather_idx.data_ptr<int>(), \
             s_scatter_idx.data_ptr<int>(), \
             s_reverse_scatter_idx.data_ptr<int>(), \
-            topk_scores_ptr, \
-            expert_order_scores_ptr, \
+            topk_scores.data_ptr<float>(), \
             score_src_idx.data_ptr<int>(), \
             static_cast<int>(N_recv), static_cast<int>(E), \
             static_cast<int>(topk), static_cast<int>(TK), \
@@ -663,48 +631,6 @@ void launch_deepep_topk_metadata_cuda(
     else if (topk <= 8) { LAUNCH_K2(8); }
     else { LAUNCH_K2(16); }
     #undef LAUNCH_K2
-}
-
-void deepep_topk_metadata_cuda(
-    torch::Tensor& dispatched_indices,
-    torch::Tensor& dispatched_probs,
-    torch::Tensor& tokens_per_expert,
-    torch::Tensor& expert_offsets,
-    torch::Tensor& seg_starts,
-    torch::Tensor& real_bases,
-    torch::Tensor& x_gather_idx,
-    torch::Tensor& s_scatter_idx,
-    torch::Tensor& s_reverse_scatter_idx,
-    torch::Tensor& topk_scores,
-    torch::Tensor& expert_order_scores,
-    torch::Tensor& naept,
-    torch::Tensor& global_block_cumsum,
-    torch::Tensor& score_src_idx,
-    int64_t N_recv,
-    int64_t E,
-    int64_t topk,
-    int64_t TK,
-    int64_t TK_padded,
-    int64_t alignment,
-    int64_t stream_ptr)
-{
-    if (dispatched_indices.scalar_type() == torch::kInt32) {
-        launch_deepep_topk_metadata_cuda<int>(
-            dispatched_indices, dispatched_probs, tokens_per_expert,
-            expert_offsets, seg_starts, real_bases, x_gather_idx,
-            s_scatter_idx, s_reverse_scatter_idx, topk_scores, expert_order_scores,
-            naept, global_block_cumsum, score_src_idx, N_recv, E, topk, TK,
-            TK_padded, alignment, stream_ptr);
-    } else if (dispatched_indices.scalar_type() == torch::kInt64) {
-        launch_deepep_topk_metadata_cuda<int64_t>(
-            dispatched_indices, dispatched_probs, tokens_per_expert,
-            expert_offsets, seg_starts, real_bases, x_gather_idx,
-            s_scatter_idx, s_reverse_scatter_idx, topk_scores, expert_order_scores,
-            naept, global_block_cumsum, score_src_idx, N_recv, E, topk, TK,
-            TK_padded, alignment, stream_ptr);
-    } else {
-        TORCH_CHECK(false, "dispatched_indices must be int32 or int64");
-    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -721,7 +647,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("s_scatter_idx"),
           py::arg("s_reverse_scatter_idx"),
           py::arg("topk_scores"),
-          py::arg("expert_order_scores"),
           py::arg("naept"),
           py::arg("global_block_cumsum"),
           py::arg("score_src_idx"),

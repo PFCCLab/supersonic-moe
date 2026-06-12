@@ -41,7 +41,6 @@
 | `test_dequant.py` | Unit tests for dequantize_blockscaled_fp8. | — |
 | `test_dual_quant.py` | Unit tests for dual_quantize_varlen (fused row+col quant). | — |
 | `test_e2e_mlpnode.py` | End-to-end SonicMoEMlpNode benchmark simulating real DeepEP pre-training. | — |
-| `test_dgated_true2cta_stress.py` | Stress + int32/uint32-overflow + skew + memcheck safety tests for the dgated true-2CTA (tile_m=256) default lever; asserts bit-identity vs tile_m=128. | — |
 | `test_fused_quant.py` | Correctness + performance test for fused_dual_colwise_quantize. | — |
 | `test_fused_zy1_quant.py` | Unit tests for fused_z_save_y1_quant. | — |
 | `test_gemm_dgated.py` | Unit tests for gemm_dgated (bwd): torch ↔ BF16 3-way cross-validation. | — |

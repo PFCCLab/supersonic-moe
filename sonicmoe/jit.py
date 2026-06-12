@@ -13,8 +13,6 @@ from uuid import uuid4
 import torch
 from filelock import FileLock
 
-from ._quack_compat import install_quack_paddle_compat
-
 
 _CPP_MODULE_PREFIX = "sonicmoe"
 # _GLOBAL_RANK = int(os.getenv("RANK", 0))
@@ -46,34 +44,22 @@ def _resolve_cpp_extension_load() -> Callable:
     return _load
 
 
-def _try_import_prebuilt(module_name: str, build_directory: str, source_files: list[str]):
+def _try_import_prebuilt(module_name: str, build_directory: str):
     """Fast-path: re-use a successfully built extension on disk.
 
-    Prefer Paddle's generated Python wrapper when present because it accepts
-    Paddle Tensor objects under torch-proxy. Fall back to the pybind ``.so`` for
-    raw-torch callers or older build artifacts.
+    Production model: every rank is its own process and they all share the
+    same GPFS-backed ``build_directory``. Once any one rank has produced a
+    valid ``<dir>/<name>/<name>.so``, all other ranks should import it
+    directly instead of racing into paddle's ``load()`` (which wipes the
+    build dir and recompiles, corrupting the rank that already finished).
+
+    The ``.so`` is a PYBIND11 module — importing it via
+    ``spec_from_file_location`` exposes ``m.def(...)`` symbols directly.
+
+    Returns ``None`` when artifacts are absent or import fails (cold start,
+    mid-rebuild, partial cleanup, ABI mismatch).
     """
-    wrapper_path = os.path.join(build_directory, module_name, f"{module_name}.py")
     so_path = os.path.join(build_directory, module_name, f"{module_name}.so")
-    artifact_paths = [p for p in (wrapper_path, so_path) if os.path.exists(p)]
-    if not artifact_paths:
-        return None
-    if source_files:
-        newest_source = max(os.path.getmtime(p) for p in source_files)
-        newest_artifact = max(os.path.getmtime(p) for p in artifact_paths)
-        if newest_artifact < newest_source:
-            return None
-
-    if os.path.exists(wrapper_path):
-        try:
-            spec = importlib.util.spec_from_file_location(module_name, wrapper_path)
-            if spec is not None and spec.loader is not None:
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                return mod
-        except Exception:
-            pass
-
     if not os.path.exists(so_path):
         return None
     try:
@@ -129,12 +115,13 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
         # guarantees the blocker is live by the time paddle's
         # ``cpp_extension.load()`` looks up ``torch.utils.hipify``.
         try:
+            from sonicmoe._quack_compat import install_quack_paddle_compat
             install_quack_paddle_compat()
         except Exception:
             pass
 
-        mod = _try_import_prebuilt(module_name, build_directory, source_files)
-        if mod is not None and hasattr(mod, function_name):
+        mod = _try_import_prebuilt(module_name, build_directory)
+        if mod is not None:
             _ALL_COMPILED_MODULES[module_name] = mod
             return getattr(mod, function_name)
 
@@ -161,13 +148,13 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
                 build_directory=build_directory,
                 verbose=True,
             )
-        # Prefer paddle's load() wrapper when it exposes the requested symbol:
-        # it accepts Paddle Tensor objects under torch-proxy.  A direct pybind
-        # import is only a fallback for raw-torch callers or missing wrappers.
-        if not hasattr(mod, function_name):
-            prebuilt = _try_import_prebuilt(module_name, build_directory, source_files)
-            if prebuilt is not None and hasattr(prebuilt, function_name):
-                mod = prebuilt
+        # paddle's load() returns a wrapper whose attributes lazily dlopen
+        # a sibling ``.so``. Re-import via the on-disk fast-path so we get a
+        # module object whose binary location is unambiguous and survives
+        # any later cleanup of ``build_directory`` by another process.
+        prebuilt = _try_import_prebuilt(module_name, build_directory)
+        if prebuilt is not None:
+            mod = prebuilt
         _ALL_COMPILED_MODULES[module_name] = mod
         return getattr(mod, function_name)
 
