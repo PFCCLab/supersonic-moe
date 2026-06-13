@@ -44,9 +44,9 @@ except ImportError:
     sgl_kernel = None
     _HAS_SGL = False
 
-from sonicmoe.functional.fp8_quant import quantize_activation_blockwise
-from sonicmoe.functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity
-from sonicmoe.quack_utils.blockscaled_fp8_gemm import quantize_activation_blockscaled_fast
+from ...functional.fp8_quant import quantize_activation_blockwise
+from ...functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity
+from ..blockscaled_fp8_gemm import quantize_activation_blockscaled_fast
 
 # ──────────────────────────────────────────────────────────────────────
 # Weight FP8 cache (keyed by (data_ptr, shape) to survive ptr reuse)

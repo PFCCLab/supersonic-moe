@@ -86,7 +86,7 @@ def warmup_jit(
         except Exception:
             dev_id = 0
         device = f"cuda:{int(dev_id)}"
-    from sonicmoe.cache_manager import setup_cache, is_warm, mark_warm
+    from .cache_manager import setup_cache, is_warm, mark_warm
 
     if cache_dir:
         setup_cache(cache_dir)
@@ -166,8 +166,8 @@ import os
 os.environ.setdefault('SONIC_MOE_JIT_VERBOSE', '1')
 import paddle
 paddle.compat.enable_torch_proxy(scope={'sonicmoe','quack','triton'}, silent=True)
-from sonicmoe.cache_manager import setup_cache; setup_cache()
-from sonicmoe.jit_warmup import warmup_jit
+from paddlefleet_ops.sonicmoe.cache_manager import setup_cache; setup_cache()
+from paddlefleet_ops.sonicmoe.jit_warmup import warmup_jit
 warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, force=True, skip_if_warm=False)
 """
     env_base = os.environ.copy()
@@ -231,13 +231,13 @@ def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool):
         scope={"sonicmoe", "quack", "triton"}, silent=True,
     )
 
-    from sonicmoe.enums import ActivationType
-    from sonicmoe.functional import clear_all_fp8_weight_caches, _refresh_fp8_config
-    from sonicmoe.functional.utils import enable_fp8
-    from sonicmoe.ernie_compat.mlp_node_v2 import (
+    from .enums import ActivationType
+    from .functional import clear_all_fp8_weight_caches, _refresh_fp8_config
+    from .functional.utils import enable_fp8
+    from .ernie_compat.mlp_node_v2 import (
         SonicMoEMlpNode, invalidate_weight_caches, flush_native_grads,
     )
-    import sonicmoe.functional as functional
+    from . import functional
     functional._ALIGNMENT_ASSUMED = True
 
     topk = min(E, 8)

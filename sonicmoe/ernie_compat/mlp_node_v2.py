@@ -622,7 +622,7 @@ class SonicMoEMlpNode:
 
     def warmup(self, total_K_list: list[int] | None = None, max_workers: int = 0):
         """Pre-compile all JIT kernels.  Call once after model construction."""
-        from sonicmoe.jit_warmup import warmup_jit
+        from ..jit_warmup import warmup_jit
         warmup_jit(
             self._E, self._H, self._I,
             device=f"cuda:{torch.cuda.current_device()}",
@@ -868,7 +868,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         #   SONIC_MOE_FP8_MODE="" or unset → true BF16 path (CuTe DSL BF16 GEMMs)
         # The BF16 path uses the same zero-materialization, varlen, and wgrad
         # accumulator infrastructure — just without FP8 quantization.
-        from sonicmoe.functional.utils import is_fp8_active
+        from ..functional.utils import is_fp8_active
         use_fp8 = is_fp8_active()
 
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
