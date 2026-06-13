@@ -711,7 +711,7 @@ def _use_fuse_y1_quant() -> bool:
     # step time, precision-neutral; eliminates the standalone y1 quant kernel
     # (~132us/step) + bf16 y1 HBM (~814 MiB/layer).  Unaligned shapes fall back
     # gracefully at the call site (alignment gate); z stays bf16 (save_z OFF).
-    return os.getenv("SONIC_MOE_FUSE_Y1_QUANT", "1").lower() in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FUSE_Y1_QUANT", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fp8_wgrad() -> bool | None:
