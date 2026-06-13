@@ -33,14 +33,14 @@ import torch
 # Try to import the JIT-compiled CUDA kernels
 _HAS_CUDA_KERNEL = False
 try:
-    from sonicmoe.ernie_compat.deepep_metadata_cuda import deepep_metadata_cuda
+    from .deepep_metadata_cuda import deepep_metadata_cuda
     _HAS_CUDA_KERNEL = True
 except Exception:
     pass
 
 _HAS_TOPK_CUDA_KERNEL = False
 try:
-    from sonicmoe.ernie_compat.deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
+    from .deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
     _HAS_TOPK_CUDA_KERNEL = True
 except Exception:
     pass
@@ -131,7 +131,19 @@ def deepep_topk_to_sonic_metadata(
     E: int,
     device: str | torch.device = "cuda",
     block: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    int,
+    torch.Tensor | None,
+    torch.Tensor,
+]:
     """Convert real DeepEP topk dispatch results to SonicMoE routing metadata.
 
     Unlike ``deepep_to_sonic_metadata`` which assumes tokens are already sorted
@@ -176,8 +188,8 @@ def deepep_topk_to_sonic_metadata(
     topk = dispatched_indices.shape[1]
     device = _normalize_device(device)
 
-    if "int32" not in str(dispatched_indices.dtype):
-        raise ValueError(f"dispatched_indices: expected int32, got {dispatched_indices.dtype}")
+    if "int32" not in str(dispatched_indices.dtype) and "int64" not in str(dispatched_indices.dtype):
+        raise ValueError(f"dispatched_indices: expected int32/int64, got {dispatched_indices.dtype}")
     if "float32" not in str(dispatched_probs.dtype):
         raise ValueError(f"dispatched_probs: expected float32, got {dispatched_probs.dtype}")
     if dispatched_indices.ndim != 2 or dispatched_probs.ndim != 2:
@@ -208,7 +220,7 @@ def deepep_topk_to_sonic_metadata(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None, empty_f
 
     # ── Phase 2: Sort by expert (argsort) ──────────────────────────────
     # sort_perm: expert-sorted position → token-major position
@@ -292,6 +304,7 @@ def deepep_topk_to_sonic_metadata(
         total_pad_rows,
         N_recv,
         None,  # score_src_idx unavailable in Python fallback; caller will rebuild
+        topk_scores[s_scatter_idx],
     )
 
 
@@ -417,7 +430,19 @@ def _deepep_topk_to_sonic_metadata_cuda(
     E: int,
     device: str | torch.device = "cuda",
     block: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    int,
+    torch.Tensor | None,
+    torch.Tensor,
+]:
     """CUDA fused topk metadata conversion (warp-ballot, zero argsort).
 
     Uses Paddle moe_permute-style progressive cumsum for stable ordering.
@@ -469,7 +494,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None, empty_f
 
     # NOTE: ``seg_starts`` / ``real_bases`` and the kernel scratch buffers are
     # allocated below alongside the device-typed outputs. An earlier draft
@@ -488,10 +513,11 @@ def _deepep_topk_to_sonic_metadata_cuda(
     expert_offsets = torch.empty(E + 1, dtype=torch.int32, device=device)
     seg_starts = torch.empty(E, dtype=torch.int32, device=device)
     real_bases = torch.empty(E, dtype=torch.int32, device=device)
-    x_gather_idx = torch.zeros(TK_padded, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK_padded, dtype=torch.int32, device=device)
     s_scatter_idx = torch.empty(TK_padded, dtype=torch.int32, device=device)
     s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    topk_scores = torch.zeros(TK_padded, dtype=torch.float32, device=device)
+    topk_scores = torch.empty(TK_padded, dtype=torch.float32, device=device)
+    expert_order_scores = torch.empty(TK_padded, dtype=torch.float32, device=device)
     naept = torch.empty(N_recv + 1, dtype=torch.int32, device=device)
     score_src_idx = torch.empty(TK, dtype=torch.int32, device=device)
 
@@ -522,6 +548,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         s_scatter_idx=s_scatter_idx,
         s_reverse_scatter_idx=s_reverse_scatter_idx,
         topk_scores=topk_scores,
+        expert_order_scores=expert_order_scores,
         naept=naept,
         global_block_cumsum=cumsum_workspace,
         score_src_idx=score_src_idx,
@@ -551,6 +578,136 @@ def _deepep_topk_to_sonic_metadata_cuda(
         total_pad_rows,
         N_recv,
         score_src_idx,
+        expert_order_scores,
+    )
+
+
+def deepep_topk_to_sonic_metadata_from_topk(
+    dispatched_indices: torch.Tensor,
+    dispatched_probs: torch.Tensor,
+    E: int,
+    device: str | torch.device = "cuda",
+    block: int = 128,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    int,
+    torch.Tensor | None,
+    torch.Tensor,
+]:
+    """DeepEP topk metadata without caller-side bincount/masked-select.
+
+    The CUDA path derives per-expert counts from the same histogram used for
+    routing metadata via negative alignment mode. It keeps exact-size tensors by slicing capacity outputs
+    after a tiny summary readback; this removes Paddle hot-path bincount kernels
+    while preserving downstream shape contracts.
+    """
+    N_recv = dispatched_indices.shape[0]
+    topk = dispatched_indices.shape[1]
+    device = _normalize_device(device)
+
+    if "int32" not in str(dispatched_indices.dtype) and "int64" not in str(dispatched_indices.dtype):
+        raise ValueError(f"dispatched_indices: expected int32/int64, got {dispatched_indices.dtype}")
+    if "float32" not in str(dispatched_probs.dtype):
+        raise ValueError(f"dispatched_probs: expected float32, got {dispatched_probs.dtype}")
+    if dispatched_indices.ndim != 2 or dispatched_probs.ndim != 2:
+        raise ValueError("dispatched_indices and dispatched_probs must be 2D")
+    if dispatched_probs.shape != dispatched_indices.shape:
+        raise ValueError(f"shape mismatch: indices={dispatched_indices.shape} vs probs={dispatched_probs.shape}")
+
+    if not _HAS_TOPK_CUDA_KERNEL:
+        raise RuntimeError("deepep_topk_metadata_cuda is required for from-topk metadata")
+
+    if os.environ.get("SONIC_MOE_VALIDATE_DISPATCH") == "1" and N_recv > 0 and topk > 1:
+        sorted_idx, _ = dispatched_indices.sort(dim=-1)
+        dup_mask = (sorted_idx[:, 1:] == sorted_idx[:, :-1]) & (sorted_idx[:, 1:] >= 0)
+        if dup_mask.any():
+            bad_row = int(dup_mask.any(dim=-1).nonzero()[0].item())
+            raise ValueError(
+                f"dispatched_indices contract violation: row {bad_row} has "
+                f"duplicate expert IDs {dispatched_indices[bad_row].tolist()}. "
+                "Each token's topk slots must be unique experts."
+            )
+
+    TK_capacity = int(N_recv * topk)
+    if TK_capacity == 0:
+        efo = torch.zeros(E + 1, dtype=torch.int32, device=device)
+        empty_i = torch.empty(0, dtype=torch.int32, device=device)
+        empty_f = torch.empty(0, dtype=torch.float32, device=device)
+        naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None, empty_f
+
+    TK_padded_capacity = TK_capacity + E * (block - 1)
+
+    tokens_per_expert = torch.empty(E, dtype=torch.int32, device=device)
+    expert_offsets = torch.empty(E + 1, dtype=torch.int32, device=device)
+    seg_starts = torch.empty(E, dtype=torch.int32, device=device)
+    real_bases = torch.empty(E, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK_padded_capacity, dtype=torch.int32, device=device)
+    s_scatter_idx = torch.empty(TK_padded_capacity, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK_capacity, dtype=torch.int32, device=device)
+    topk_scores = torch.empty(1, dtype=torch.float32, device=device)
+    expert_order_scores = torch.empty(TK_padded_capacity, dtype=torch.float32, device=device)
+    naept = torch.empty(N_recv + 1, dtype=torch.int32, device=device)
+    score_src_idx = torch.empty(TK_capacity, dtype=torch.int32, device=device)
+
+    num_blocks = (N_recv + 31) // 32
+    cumsum_workspace = torch.empty([2 * num_blocks * (E + 1)], dtype=torch.int32, device=device)
+
+    _stream_obj = torch.cuda.current_stream(device)
+    stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
+
+    deepep_topk_metadata_cuda(
+        dispatched_indices=dispatched_indices.contiguous(),
+        dispatched_probs=dispatched_probs.contiguous(),
+        tokens_per_expert=tokens_per_expert,
+        expert_offsets=expert_offsets,
+        seg_starts=seg_starts,
+        real_bases=real_bases,
+        x_gather_idx=x_gather_idx,
+        s_scatter_idx=s_scatter_idx,
+        s_reverse_scatter_idx=s_reverse_scatter_idx,
+        topk_scores=topk_scores,
+        expert_order_scores=expert_order_scores,
+        naept=naept,
+        global_block_cumsum=cumsum_workspace,
+        score_src_idx=score_src_idx,
+        N_recv=N_recv,
+        E=E,
+        topk=topk,
+        TK=TK_capacity,
+        TK_padded=TK_padded_capacity,
+        alignment=-block,
+        stream=stream,
+    )
+
+    TK = int(naept[N_recv].cpu().item())
+    TK_padded = int(expert_offsets[E].cpu().item())
+    total_pad_rows = TK_padded - TK
+
+    if TK == 0:
+        empty_i = torch.empty(0, dtype=torch.int32, device=device)
+        empty_f = torch.empty(0, dtype=torch.float32, device=device)
+        return expert_offsets, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None, empty_f
+
+    return (
+        expert_offsets,
+        x_gather_idx[:TK_padded],
+        s_scatter_idx[:TK_padded],
+        s_reverse_scatter_idx[:TK],
+        naept,
+        topk_scores[:TK_padded],
+        TK_padded,
+        total_pad_rows,
+        N_recv,
+        score_src_idx[:TK],
+        expert_order_scores[:TK_padded],
     )
 
 

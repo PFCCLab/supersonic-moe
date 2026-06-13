@@ -3,6 +3,7 @@
 # ********************************************************************************
 
 from functools import partial
+import os
 from typing import Callable, NamedTuple, Optional
 
 import cutlass
@@ -42,14 +43,25 @@ from ._gated_epilogues import (
     FP8PreActLoad,
     GemmDGatedFP8PreActMixin,
     GemmDGatedFP8CLoadMixin,
+    dswiglu_te_exp2,
 )
 
 from .gemm_sm100_fp8_zeromat import (
     GemmDGatedSm100ZeroMat,
     GemmDGatedFP8CLoadSm100ZeroMat,
+    GemmDGatedFP8CLoadIso32QuantSm100ZeroMat,
+    GemmDGatedFP8CLoadY1sColQuantSm100ZeroMat,
 )
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+_DGATED_FAST_PATH: dict[tuple, tuple] = {}
+_MAX_DGATED_FAST_PATH_ENTRIES = 32
+
+
+def _current_cu_stream() -> cuda.CUstream:
+    stream = torch.cuda.current_stream()
+    raw = stream.stream_base.raw_stream if hasattr(stream, "stream_base") else stream.cuda_stream
+    return cuda.CUstream(raw)
 
 
 class GemmDGatedSm90(GemmDGatedMixin, GemmSm90):
@@ -65,7 +77,7 @@ class GemmDGatedFP8CLoadSm100(GemmDGatedFP8CLoadMixin, GemmSm100):
 
 
 dgate_fn_map = {
-    "swiglu": quack.activation.dswiglu_precise,
+    "swiglu": quack.activation.dswiglu,
     "swiglu_oai": quack.activation.dswiglu_oai,
     "reglu": quack.activation.dreglu,
     "geglu": quack.activation.dgeglu,
@@ -97,9 +109,106 @@ def gemm_dgated(
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     preact_fp8: Optional[Tensor] = None,  # (total_m, 2n) fp8 — replaces PreAct when provided
     preact_scales: Optional[Tensor] = None,  # (total_m, 2n//32) uint8 — blockscaled scales for preact_fp8
+    iso32_dz_fp8: Optional[Tensor] = None,  # (total_m, 2n) fp8 — side-channel iso32 FP8 dXY output
+    iso32_dz_row_scales: Optional[Tensor] = None,  # ISA-pack row-axis SF (num_m_tiles, k_tiles, 512) uint8
+    iso32_dz_col_scales: Optional[Tensor] = None,  # ISA-pack col-axis SF (num_n_tiles, col_k_tiles, 512) uint8
+    y1s_col_fp8: Optional[Tensor] = None,  # (total_m, n) fp8 — side-channel FP8 y1s output
+    y1s_col_scales: Optional[Tensor] = None,  # ISA-pack col-axis SF (num_n_tiles, col_k_tiles, 512) uint8
+    swiglu_clamp_value: float = 0.0,
 ) -> None:
     """If tile_count_semaphore is provided, it must already be zero'ed out."""
+    if activation != "swiglu":
+        swiglu_clamp_value = 0.0
     fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
+    iso32_dz_mode = (
+        iso32_dz_fp8 is not None
+        or iso32_dz_row_scales is not None
+        or iso32_dz_col_scales is not None
+    )
+    y1s_col_quant_mode = y1s_col_fp8 is not None or y1s_col_scales is not None
+    blockscaled = a_scales is not None and b_scales is not None
+    gather_A = A_idx is not None
+    fast_key = None
+    if (
+        cu_seqlens_m is not None
+        and gather_A
+        and blockscaled
+        and colvec_scale is not None
+        and colvec_reduce is not None
+        and tile_count_semaphore is None
+        and persistent
+        and cluster_N == 1
+    ):
+        fast_key = (
+            A.dtype, B.dtype, Out.dtype, PostAct.dtype, activation,
+            tile_M, tile_N, cluster_M, cluster_N, pingpong, max_swizzle_size,
+            fp8_preact_mode, iso32_dz_mode, y1s_col_quant_mode, float(swiglu_clamp_value),
+            A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
+        )
+        cached = _DGATED_FAST_PATH.get(fast_key)
+        if cached is not None:
+            compiled, GemmCls, act_fn, scheduler_args, implicit_dtype = cached
+            AB_swapped = not Out.stride(-1) == 1
+            out_tensor = Out
+            preact_tensor = PreAct
+            if fp8_preact_mode:
+                if cu_seqlens_m is not None or not AB_swapped:
+                    out_tensor = Out.view(torch.float32)
+                else:
+                    out_tensor = Out.mT.view(torch.float32).mT
+                preact_tensor = preact_fp8.view(torch.int16)
+            else:
+                if cu_seqlens_m is not None or not AB_swapped:
+                    out_tensor = Out.view(torch.float32)
+                    preact_tensor = PreAct.view(torch.float32)
+                else:
+                    out_tensor = Out.mT.view(torch.float32).mT
+                    preact_tensor = PreAct.mT.view(torch.float32).mT
+            a_cute = _make_cute_tensor_dynamic(A, 1)
+            b_tensor = B.permute(1, 2, 0)
+            b_leading_dim = 1 if b_tensor.stride(1) == 1 else 0
+            b_cute = _make_cute_tensor_dynamic(b_tensor, b_leading_dim)
+            out_cute = _make_cute_tensor_dynamic(out_tensor, 1)
+            preact_cute = _make_cute_tensor_dynamic(preact_tensor, 1)
+            post_cute = _make_cute_tensor_dynamic(PostAct, 1)
+            epi_kwargs = {}
+            if fp8_preact_mode:
+                epi_kwargs["mFP8PreAct_fp8"] = _make_cute_tensor_dynamic(preact_fp8, leading_dim=1)
+                epi_kwargs["mFP8PreAct_scales"] = _make_cute_tensor_dynamic(preact_scales, leading_dim=1)
+            if iso32_dz_mode:
+                if iso32_dz_fp8 is not None:
+                    epi_kwargs["mDZFp8Iso32_fp8"] = _make_cute_tensor_dynamic(iso32_dz_fp8, leading_dim=1)
+                if iso32_dz_row_scales is not None:
+                    epi_kwargs["mDZFp8Iso32_row"] = _make_cute_tensor_dynamic(iso32_dz_row_scales, leading_dim=2)
+                if iso32_dz_col_scales is not None:
+                    epi_kwargs["mDZFp8Iso32_col"] = _make_cute_tensor_dynamic(iso32_dz_col_scales, leading_dim=2)
+            if y1s_col_quant_mode:
+                if y1s_col_fp8 is not None:
+                    epi_kwargs["mY1sColQuant_fp8"] = _make_cute_tensor_dynamic(y1s_col_fp8, leading_dim=1)
+                if y1s_col_scales is not None:
+                    epi_kwargs["mY1sColQuant_col"] = _make_cute_tensor_dynamic(y1s_col_scales, leading_dim=2)
+            epi_args = GemmCls.EpilogueArguments(
+                post_cute,
+                act_fn,
+                implicit_dtype=implicit_dtype,
+                swiglu_clamp_value=float(swiglu_clamp_value),
+                mColVecBroadcast=from_dlpack(colvec_scale.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0),
+                mColVecReduce=from_dlpack(colvec_reduce.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1),
+                **epi_kwargs,
+            )
+            varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+            a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+            b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+            compiled(
+                a_cute, b_cute, out_cute, preact_cute,
+                epi_args, scheduler_args, varlen_args, _current_cu_stream(),
+                a_scale_cute, b_scale_cute,
+            )
+            return
+    if iso32_dz_mode:
+        assert fp8_preact_mode, "iso32_dz fusion requires fp8_preact_mode"
+    if y1s_col_quant_mode:
+        assert fp8_preact_mode, "y1s_col fusion requires fp8_preact_mode"
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
@@ -168,7 +277,12 @@ def gemm_dgated(
     if fp8_preact_mode:
         assert device_capacity[0] > 9, "FP8 PreAct only supported on SM100+"
         if gather_A and blockscaled_runtime:
-            GemmCls = GemmDGatedFP8CLoadSm100ZeroMat
+            if y1s_col_quant_mode:
+                GemmCls = GemmDGatedFP8CLoadY1sColQuantSm100ZeroMat
+            elif iso32_dz_mode:
+                GemmCls = GemmDGatedFP8CLoadIso32QuantSm100ZeroMat
+            else:
+                GemmCls = GemmDGatedFP8CLoadSm100ZeroMat
         else:
             GemmCls = GemmDGatedFP8CLoadSm100
     elif device_capacity[0] > 9 and gather_A and blockscaled_runtime:
@@ -198,15 +312,32 @@ def gemm_dgated(
                 info.tensor,
                 leading_dim=1 if info.major == major_configs[name][1] else 0,
             )
-    act_fn = dgate_fn_map[activation]
+    act_fn = dswiglu_te_exp2 if (
+        activation == "swiglu"
+        and os.environ.get("SONIC_MOE_DSWIGLU_TE_EXP2", "0") == "1"
+        and float(swiglu_clamp_value) <= 0.0
+    ) else dgate_fn_map[activation]
     epi_kwargs = {}
     if fp8_preact_mode:
         epi_kwargs["mFP8PreAct_fp8"] = _make_cute_tensor_dynamic(preact_fp8, leading_dim=1)
         epi_kwargs["mFP8PreAct_scales"] = _make_cute_tensor_dynamic(preact_scales, leading_dim=1)
+    if iso32_dz_mode:
+        if iso32_dz_fp8 is not None:
+            epi_kwargs["mDZFp8Iso32_fp8"] = _make_cute_tensor_dynamic(iso32_dz_fp8, leading_dim=1)
+        if iso32_dz_row_scales is not None:
+            epi_kwargs["mDZFp8Iso32_row"] = _make_cute_tensor_dynamic(iso32_dz_row_scales, leading_dim=2)
+        if iso32_dz_col_scales is not None:
+            epi_kwargs["mDZFp8Iso32_col"] = _make_cute_tensor_dynamic(iso32_dz_col_scales, leading_dim=2)
+    if y1s_col_quant_mode:
+        if y1s_col_fp8 is not None:
+            epi_kwargs["mY1sColQuant_fp8"] = _make_cute_tensor_dynamic(y1s_col_fp8, leading_dim=1)
+        if y1s_col_scales is not None:
+            epi_kwargs["mY1sColQuant_col"] = _make_cute_tensor_dynamic(y1s_col_scales, leading_dim=2)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
         implicit_dtype=implicit_dtype,
+        swiglu_clamp_value=float(swiglu_clamp_value),
         mColVecBroadcast=(
             from_dlpack(colvec_scale.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=1 if cu_seqlens_m is None else 0
@@ -232,8 +363,7 @@ def gemm_dgated(
         A_idx,
     )
 
-    _stream_obj = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(_stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream)
+    current_stream = _current_cu_stream()
 
     blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None
@@ -260,6 +390,9 @@ def gemm_dgated(
         A_idx is not None,
         blockscaled,
         fp8_preact_mode,
+        iso32_dz_mode,
+        y1s_col_quant_mode,
+        float(swiglu_clamp_value),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dgated.compile_cache
@@ -287,7 +420,12 @@ def gemm_dgated(
             a_scale_cute,
             b_scale_cute,
         )
-    cache[compile_key](
+    compiled = cache[compile_key]
+    if fast_key is not None:
+        if len(_DGATED_FAST_PATH) > _MAX_DGATED_FAST_PATH_ENTRIES:
+            _DGATED_FAST_PATH.clear()
+        _DGATED_FAST_PATH[fast_key] = (compiled, GemmCls, act_fn, scheduler_args, implicit_dtype)
+    compiled(
         tensor_infos["A"].cute_tensor,
         tensor_infos["B"].cute_tensor,
         tensor_infos["D"].cute_tensor,  # Out
@@ -301,5 +439,5 @@ def gemm_dgated(
     )
 
 
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 gemm_dgated.compile_cache = _ICC("dgated")
