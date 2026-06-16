@@ -95,19 +95,28 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
     if module is not None:
         return getattr(module, function_name)
 
+    # Warm-cache fast path: importing an existing extension is read-only and
+    # safe to do concurrently. Do this before the build lock so healthy workers
+    # are not serialized behind a rank that is compiling or stuck in dlopen.
+    mod = _try_import_prebuilt(module_name, build_directory)
+    if mod is not None:
+        _ALL_COMPILED_MODULES[module_name] = mod
+        return getattr(mod, function_name)
+
     # Stable lock path that survives a wipe of build_directory.
     # Using the parent ``build/`` dir means the lock inode is preserved even
     # if a sibling process clears ``build/<module>/`` mid-cycle.
     parent_dir = os.path.dirname(os.path.normpath(build_directory)) or "."
     os.makedirs(parent_dir, exist_ok=True)
     lock_path = os.path.join(parent_dir, f".{module_name}.lock")
+    lock_timeout = float(os.getenv("SONIC_MOE_JIT_LOCK_TIMEOUT", "600"))
 
     # Production model: one process per rank, exclusive ownership of
     # ``build_directory`` (or a shared dir populated by a single warmup
     # process before workers fork). FileLock guards the rare case where two
     # producers race to create the artifacts. The fast-path import after lock
     # acquisition handles the case where another process already built it.
-    with FileLock(lock_path):
+    with FileLock(lock_path, timeout=lock_timeout):
         # Re-arm the paddle/torch-proxy blockers (idempotent). The initial
         # ``import sonicmoe`` may have happened BEFORE the consumer called
         # ``paddle.enable_compat()``; in that order our hipify blocker is
@@ -120,43 +129,51 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
         except Exception:
             pass
 
-        mod = _try_import_prebuilt(module_name, build_directory)
-        if mod is not None:
+        if os.path.exists(os.path.join(build_directory, module_name, f"{module_name}.so")):
+            # Another process finished while we were waiting. Leave the lock and
+            # import outside it: dlopen is read-only and may touch CUDA/runtime
+            # state, so it must not block other ranks from observing the built
+            # artifact.
+            pass
+        else:
+            os.makedirs(build_directory, exist_ok=True)
+            load_cpp_extension = _resolve_cpp_extension_load()
+            try:
+                mod = load_cpp_extension(
+                    module_name,
+                    sources=source_files,
+                    extra_cxx_cflags=extra_cflags,
+                    extra_cuda_cflags=extra_cuda_cflags,
+                    extra_include_paths=extra_include_paths,
+                    build_directory=build_directory,
+                    verbose=True,
+                )
+            except TypeError:
+                # Paddle compat shim only accepts the older `extra_cflags`.
+                mod = load_cpp_extension(
+                    module_name,
+                    sources=source_files,
+                    extra_cflags=extra_cflags,
+                    extra_cuda_cflags=extra_cuda_cflags,
+                    extra_include_paths=extra_include_paths,
+                    build_directory=build_directory,
+                    verbose=True,
+                )
+            # paddle's load() returns a wrapper whose attributes lazily dlopen
+            # a sibling ``.so``. Re-import via the on-disk fast-path so we get a
+            # module object whose binary location is unambiguous and survives
+            # any later cleanup of ``build_directory`` by another process.
+            prebuilt = _try_import_prebuilt(module_name, build_directory)
+            if prebuilt is not None:
+                mod = prebuilt
             _ALL_COMPILED_MODULES[module_name] = mod
             return getattr(mod, function_name)
 
-        os.makedirs(build_directory, exist_ok=True)
-        load_cpp_extension = _resolve_cpp_extension_load()
-        try:
-            mod = load_cpp_extension(
-                module_name,
-                sources=source_files,
-                extra_cxx_cflags=extra_cflags,
-                extra_cuda_cflags=extra_cuda_cflags,
-                extra_include_paths=extra_include_paths,
-                build_directory=build_directory,
-                verbose=True,
-            )
-        except TypeError:
-            # Paddle compat shim only accepts the older `extra_cflags`.
-            mod = load_cpp_extension(
-                module_name,
-                sources=source_files,
-                extra_cflags=extra_cflags,
-                extra_cuda_cflags=extra_cuda_cflags,
-                extra_include_paths=extra_include_paths,
-                build_directory=build_directory,
-                verbose=True,
-            )
-        # paddle's load() returns a wrapper whose attributes lazily dlopen
-        # a sibling ``.so``. Re-import via the on-disk fast-path so we get a
-        # module object whose binary location is unambiguous and survives
-        # any later cleanup of ``build_directory`` by another process.
-        prebuilt = _try_import_prebuilt(module_name, build_directory)
-        if prebuilt is not None:
-            mod = prebuilt
+    mod = _try_import_prebuilt(module_name, build_directory)
+    if mod is not None:
         _ALL_COMPILED_MODULES[module_name] = mod
         return getattr(mod, function_name)
+    raise RuntimeError(f"{module_name} build completed but prebuilt extension is unavailable")
 
 
 def cpp_jit(
