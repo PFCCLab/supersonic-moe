@@ -3,7 +3,6 @@
 # ********************************************************************************
 
 import math
-import os
 from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda
@@ -18,14 +17,6 @@ from .grouped_gemm import HopperWgmma_MoE_kernel
 
 
 LIBRARY_NAME = "cutedsl_kernels"
-
-
-def _disable_2cta() -> bool:
-    return os.environ.get("SONIC_MOE_DISABLE_2CTA", "0").lower() in {"1", "true", "yes", "on"}
-
-
-def _one_cta_cluster(shape: tuple[int, int]) -> tuple[int, int]:
-    return (1, 1) if _disable_2cta() else shape
 
 
 def ceil_div(a: int, b: int):
@@ -62,7 +53,7 @@ class HopperWgmma_MoE_Up_proj_Fwd:
         if (I >= 128 and is_glu_activation) or (I >= 256 and not is_glu_activation):
             up_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=(32 if not inference_mode else 64),
                 is_pingpong=False,
                 initial_d_epi_stage=2,
@@ -171,7 +162,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
         if I >= 1024:
             down_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=32,
                 is_pingpong=False,
                 initial_d_epi_stage=4,
@@ -180,7 +171,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
         elif I >= 256:
             down_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 192, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=(96 if H % 96 == 0 else 64),
                 is_pingpong=True,
                 initial_d_epi_stage=5,
@@ -189,7 +180,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
         elif I >= 64:
             down_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 192, 64),
-                cluster_shape_mnk=_one_cta_cluster((1, 2)),
+                cluster_shape_mnk=(1, 2),
                 epi_tile_size=64,
                 is_pingpong=True,
                 initial_d_epi_stage=8,
@@ -260,7 +251,7 @@ class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
         #   effectively no alternatives to this config
         dz_partial_ds_config = HopperGEMMConfig(
             tile_shape_mnk=(128, 128, 64),
-            cluster_shape_mnk=_one_cta_cluster((2, 1)),
+            cluster_shape_mnk=(2, 1),
             epi_tile_size=32,
             initial_d_epi_stage=4,
             is_pingpong=True,
@@ -370,7 +361,7 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
         if I >= 128:
             dw2_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=16,
                 is_pingpong=False,
                 initial_d_epi_stage=6,
@@ -379,7 +370,7 @@ class HopperWgmma_MoE_Down_proj_WeightGrad_Bwd:
         elif I == 64:
             dw2_config = HopperGEMMConfig(
                 tile_shape_mnk=(64, 192, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=32,
                 is_pingpong=True,
                 initial_d_epi_stage=6,
@@ -448,7 +439,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
         if (I >= 512 and is_glu_activation) or (I >= 1024 and not is_glu_activation):
             dx_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=32,
                 is_pingpong=False,
                 initial_d_epi_stage=4,
@@ -457,7 +448,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
         elif (I >= 64 and is_glu_activation) or (I >= 128 and not is_glu_activation):
             dx_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 192, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=64,
                 is_pingpong=True,
                 initial_d_epi_stage=8,
@@ -529,7 +520,7 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
         if (I >= 128 and is_glu_activation) or (I >= 256 and not is_glu_activation):
             dw1_config = HopperGEMMConfig(
                 tile_shape_mnk=(128, 256, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=16,
                 is_pingpong=False,
                 initial_d_epi_stage=6,
@@ -538,7 +529,7 @@ class HopperWgmma_MoE_Up_proj_WeightGrad_Bwd:
         elif (I == 64 and is_glu_activation) or (I == 128 and not is_glu_activation):
             dw1_config = HopperGEMMConfig(
                 tile_shape_mnk=(256, 128, 64),
-                cluster_shape_mnk=_one_cta_cluster((2, 1)),
+                cluster_shape_mnk=(2, 1),
                 epi_tile_size=16,
                 is_pingpong=False,
                 initial_d_epi_stage=6,

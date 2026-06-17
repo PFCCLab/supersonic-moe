@@ -40,44 +40,14 @@ from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
 default_device_capacity = get_device_capacity(paddle.device("cuda"))
 
 
-# SM103 (B300) backward dgated blockscaled GEMM: above this expert count we
-# keep the conservative 1-CTA tile. cluster_m=2 gives no measured speedup at
-# E=128 small-hidden (+1.4% regression) and E>64 is exactly the regime the
-# original stability override targeted ("avoid 2CTA-M varlen gather on SM103";
-# illegal-instruction fault under skewed expert load), which has NOT been
-# re-qualified for skew at E>64 on the current toolchain.
-_DGATED_2CTA_MAX_EXPERTS = 64
-
-
-def default_config(device, num_experts: int = 1) -> GemmConfig:
+def default_config(device) -> GemmConfig:
     config = quack_default_config(device)
     cap = get_device_capacity(device)
     if cap[0] == 10 and cap[1] >= 3:
-        # SM103 (B300) backward dgated blockscaled GEMM. cluster_m=2 enables
-        # 2-CTA cooperative tiling (TE-style 2cta) which the prior cluster_m=1
-        # override disabled.  Empirically (nsys GPU-projection, fresh proc/cfg):
-        # cluster_m=2 is ~6-14% faster on the dgated kernel at production shapes
-        # (E<=64, e.g. Qwen3-30B-A3B H2048 I1024 E64: 459->421us, -8.4%) and
-        # bit-identical (rrmse=0; tile/cluster partition does not change the
-        # K-reduction order) with zero extra memory. Verified finite+bit-
-        # identical under 80%-skewed and extreme single-expert routing at E=64.
-        # E>64 stays 1-CTA: no measured win there and it is the historical
-        # skew-fault regime (see _DGATED_2CTA_MAX_EXPERTS above).
-        cluster_m = 2 if num_experts <= _DGATED_2CTA_MAX_EXPERTS else 1
-        # tile_m=256 + cluster_m=2 => true 2-CTA tcgen05 MMA (use_2cta_instrs).
-        # Session-38 ncu (B300, E64 H2048 I1024 TK262144): -4.7% on the dgated
-        # kernel vs tile_m=128 (1,111,392->1,059,136 ns base-clock; tensor-pipe
-        # 38.77->40.74%), BIT-IDENTICAL dz/colvec/y1s (max_abs_diff=0; M-tiling
-        # does not change the K-reduction) and compute-sanitizer memcheck-clean
-        # (0 errors) under 80%-skew + single-dominant routing at E=64.  Gated to
-        # the real dgated expert range [2, 64]: num_experts==1 is the weight-grad
-        # caller (it cannot see the real E, so it stays tile_m=128 to avoid the
-        # unvalidated E>64 true-2CTA regime), and E>64 stays tile_m=128 cm=1.
-        tile_m = 256 if 2 <= num_experts <= _DGATED_2CTA_MAX_EXPERTS else 128
         return GemmConfig(
-            tile_m=tile_m,
+            tile_m=128,
             tile_n=128,
-            cluster_m=cluster_m,
+            cluster_m=1,
             cluster_n=1,
             pingpong=False,
             is_dynamic_persistent=config.is_dynamic_persistent,
@@ -121,8 +91,6 @@ def gemm_gated_tuned(
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # epilogue quant scale output
-    postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
-    swiglu_clamp_value: float = 0.0,
 ) -> None:
     if config is None:
         config = quack_default_config(A.device)
@@ -169,8 +137,6 @@ def gemm_gated_tuned(
         a_scales=a_scales,
         b_scales=b_scales,
         z_scale_out=z_scale_out,
-        postact_scale_out=postact_scale_out,
-        swiglu_clamp_value=swiglu_clamp_value,
     )
 
 
@@ -205,11 +171,9 @@ def gemm_dgated_tuned(
     config: Optional[GemmConfig] = None,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
-    swiglu_clamp_value: float = 0.0,
 ) -> Optional[Tensor]:
     if config is None:
-        # B is (K, N) or (L, K, N); L == num_experts for the grouped path.
-        config = default_config(A.device, num_experts=(B.shape[0] if B.ndim == 3 else 1))
+        config = default_config(A.device)
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
@@ -266,7 +230,6 @@ def gemm_dgated_tuned(
         A_idx=A_idx,
         a_scales=a_scales,
         b_scales=b_scales,
-        swiglu_clamp_value=swiglu_clamp_value,
     )
     if colvec_reduce:
         colvec_reduce_final = colvec_reduce_partial.sum(dim=-1)
@@ -295,8 +258,6 @@ def gemm_gated(
     b_scales: Optional[Tensor] = None,
     tuned: bool = True,
     z_scale_out: Optional[Tensor] = None,
-    postact_scale_out: Optional[Tensor] = None,
-    swiglu_clamp_value: float = 0.0,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -315,16 +276,15 @@ def gemm_gated(
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    if z_scale_out is not None or postact_scale_out is not None:
-        # Epilogue quant (z or postact/y1): bypass custom_op, call tuned fn directly (untuned for blockscaled).
+    if z_scale_out is not None:
+        # Epilogue quant: bypass custom_op, call tuned fn directly (untuned for blockscaled).
         fn = partial(gemm_gated_tuned.fn, config=None)
         fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx,
-           dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out,
-           postact_scale_out=postact_scale_out, swiglu_clamp_value=swiglu_clamp_value)
+           dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out)
     else:
         gemm_gated_out(
             A, B, preact_out, postact_out, C, bias, activation,
-            cu_seqlens_m, A_idx, dynamic_scheduler, tuned, a_scales, b_scales, swiglu_clamp_value,
+            cu_seqlens_m, A_idx, dynamic_scheduler, tuned, a_scales, b_scales,
         )
     return preact_out, postact_out
 
@@ -333,7 +293,7 @@ def gemm_gated(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None, float swiglu_clamp_value=0.0) -> ()",
+    schema="(Tensor A, Tensor B, Tensor(a2!)? preact_out, Tensor(a3!) postact_out, Tensor? C=None, Tensor? bias=None, str activation='swiglu', Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=False, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None) -> ()",
 )
 def gemm_gated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -349,7 +309,6 @@ def gemm_gated_out(
     tuned: bool = True,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
-    swiglu_clamp_value: float = 0.0,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     # Blockscaled fused gated kernels run correctly with the default config on SM100,
@@ -359,7 +318,7 @@ def gemm_gated_out(
     safe_tuned = tuned and not _uses_blockscaled_runtime(a_scales, b_scales)
     fn = gemm_gated_tuned if safe_tuned else partial(gemm_gated_tuned.fn, config=None)
     fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler,
-       a_scales=a_scales, b_scales=b_scales, swiglu_clamp_value=swiglu_clamp_value)
+       a_scales=a_scales, b_scales=b_scales)
 
 
 def gemm_dgated(
@@ -379,7 +338,6 @@ def gemm_dgated(
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
     tuned: bool = True,
-    swiglu_clamp_value: float = 0.0,
 ) -> Tuple[Tensor, Tensor]:
     """GEMM with gated activation gradient and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -413,7 +371,6 @@ def gemm_dgated(
         tuned,
         a_scales,
         b_scales,
-        swiglu_clamp_value,
     )
     if not colvec_reduce:
         return dx_out, postact_out
@@ -428,7 +385,7 @@ gemm_dgated.default_config = default_config
     "quack::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None, float swiglu_clamp_value=0.0) -> Tensor?",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None) -> Tensor?",
 )
 def gemm_dgated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -445,7 +402,6 @@ def gemm_dgated_out(
     tuned: bool = True,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
-    swiglu_clamp_value: float = 0.0,
 ) -> Optional[Tensor]:
     """GEMM with gated activation gradient and pre-allocated output tensors."""
     safe_tuned = tuned and not _uses_blockscaled_runtime(a_scales, b_scales)
@@ -464,7 +420,6 @@ def gemm_dgated_out(
         dynamic_scheduler,
         a_scales=a_scales,
         b_scales=b_scales,
-        swiglu_clamp_value=swiglu_clamp_value,
     )
 
 
@@ -484,7 +439,6 @@ def gemm_dgated_out_fake(
     tuned: bool = True,
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
-    swiglu_clamp_value: float = 0.0,
 ) -> Optional[Tensor]:
     if not colvec_reduce:
         return None
