@@ -48,7 +48,7 @@ def _topk_fwd(
     _topk_fwd.compile_cache[compile_key](x_tensor, values_tensor, indices_tensor, current_stream)
 
 
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 _topk_fwd.compile_cache = _ICC("topk_fwd")
 
 
