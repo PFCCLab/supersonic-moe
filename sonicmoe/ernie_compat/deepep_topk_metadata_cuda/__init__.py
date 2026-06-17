@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import torch
 
-from ...enums import LIBRARY_NAME
-from ...jit import cpp_jit
+from sonicmoe.enums import LIBRARY_NAME
+from sonicmoe.jit import cpp_jit
 
 
 @torch.library.custom_op(
@@ -31,7 +31,6 @@ from ...jit import cpp_jit
         "s_scatter_idx",
         "s_reverse_scatter_idx",
         "topk_scores",
-        "expert_order_scores",
         "naept",
         "global_block_cumsum",
         "score_src_idx",
@@ -49,7 +48,6 @@ def deepep_topk_metadata_cuda(
     s_scatter_idx: torch.Tensor,
     s_reverse_scatter_idx: torch.Tensor,
     topk_scores: torch.Tensor,
-    expert_order_scores: torch.Tensor,
     naept: torch.Tensor,
     global_block_cumsum: torch.Tensor,
     score_src_idx: torch.Tensor,
