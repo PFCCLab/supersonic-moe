@@ -440,7 +440,7 @@ _gate_fn_map = {
     "swiglu": quack.activation.swiglu,
 }
 
-from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+from ..cache_manager import InstrumentedCompileCache as _ICC
 _zeromat_compile_cache = _ICC("zeromat")
 
 
