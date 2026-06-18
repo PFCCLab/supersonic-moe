@@ -44,6 +44,57 @@ def _resolve_cpp_extension_load() -> Callable:
     return _load
 
 
+def _is_false_env(value: str | None) -> bool:
+    return value is not None and value.strip().lower() in {"0", "false", "no", "off"}
+
+
+def _distributed_local_rank_tag() -> str | None:
+    """Return a stable local-rank tag for rank-private cold JIT builds.
+
+    Runtime JIT is only a fallback; production should prefer prebuilt artifacts.
+    When a cold cache is hit by many training ranks at the same time, sharing one
+    build directory also shares one FileLock.  If the lock owner is slow compiling
+    on GPFS, every other rank can time out and the job looks deadlocked.  We avoid
+    that failure mode by keeping the hot shared-artifact fast path, but redirecting
+    cold builds to a per-local-rank directory.
+    """
+    world = os.getenv("PADDLE_TRAINERS_NUM") or os.getenv("WORLD_SIZE") or os.getenv("OMPI_COMM_WORLD_SIZE")
+    try:
+        if world is None or int(world) <= 1:
+            return None
+    except ValueError:
+        return None
+
+    rank = (
+        os.getenv("PADDLE_LOCAL_RANK")
+        or os.getenv("PADDLE_RANK_IN_NODE")
+        or os.getenv("LOCAL_RANK")
+        or os.getenv("FLAGS_selected_gpus", "").split(",")[0]
+        or os.getenv("OMPI_COMM_WORLD_LOCAL_RANK")
+        or os.getenv("RANK")
+        or os.getenv("PADDLE_TRAINER_ID")
+    )
+    if rank is None or rank == "":
+        return None
+    return "".join(c if c.isalnum() or c in {"-", "_"} else "_" for c in rank)
+
+
+def _rank_private_build_directory(build_directory: str) -> str:
+    """Use a rank-private build dir for cold distributed JIT fallback.
+
+    Set ``SONIC_MOE_JIT_RANK_PRIVATE=0`` to restore the historical single shared
+    build directory behavior.
+    """
+    if _is_false_env(os.getenv("SONIC_MOE_JIT_RANK_PRIVATE")):
+        return build_directory
+    rank_tag = _distributed_local_rank_tag()
+    if rank_tag is None:
+        return build_directory
+    parent_dir = os.path.dirname(os.path.normpath(build_directory)) or "."
+    leaf = os.path.basename(os.path.normpath(build_directory))
+    return os.path.join(parent_dir, f"rank_{rank_tag}", leaf)
+
+
 def _try_import_prebuilt(module_name: str, build_directory: str, source_files: list[str]):
     """Fast-path: re-use a successfully built extension on disk.
 
@@ -107,23 +158,38 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
     if module is not None:
         return getattr(module, function_name)
 
+    shared_build_directory = build_directory
+
+    # Hot path: always prefer the shared prebuilt artifact.  This preserves the
+    # benefit of an offline/manual warmup and avoids duplicate per-rank builds.
+    mod = _try_import_prebuilt(module_name, shared_build_directory, source_files)
+    if mod is not None and hasattr(mod, function_name):
+        _ALL_COMPILED_MODULES[module_name] = mod
+        return getattr(mod, function_name)
+
+    # Cold distributed fallback: build under a rank-private directory so that
+    # ranks do not all wait on the same GPFS FileLock during first forward.
+    # The shared directory remains read-only fast path above.
+    build_directory = _rank_private_build_directory(shared_build_directory)
+
     # Stable lock path that survives a wipe of build_directory.
-    # Using the parent ``build/`` dir means the lock inode is preserved even
-    # if a sibling process clears ``build/<module>/`` mid-cycle.
+    # Using the parent dir means the lock inode is preserved even if a sibling
+    # process clears ``build/<module>/`` mid-cycle.  With rank-private cold
+    # builds this parent is ``build/rank_<local_rank>/``.
     parent_dir = os.path.dirname(os.path.normpath(build_directory)) or "."
     os.makedirs(parent_dir, exist_ok=True)
     lock_path = os.path.join(parent_dir, f".{module_name}.lock")
 
+    # The rank may have already compiled privately in an earlier run.
     mod = _try_import_prebuilt(module_name, build_directory, source_files)
     if mod is not None and hasattr(mod, function_name):
         _ALL_COMPILED_MODULES[module_name] = mod
         return getattr(mod, function_name)
 
-    # Production model: one process per rank, exclusive ownership of
-    # ``build_directory`` (or a shared dir populated by a single warmup
-    # process before workers fork). FileLock guards the rare case where two
-    # producers race to create the artifacts. The fast-path import after lock
-    # acquisition handles the case where another process already built it.
+    # Production model: one process per rank.  FileLock guards the rare case
+    # where two producers for the same rank-private directory race to create the
+    # artifacts. The fast-path imports after lock acquisition handle either a
+    # shared warmup completing concurrently or this rank already building it.
     lock_timeout = float(os.getenv("SONIC_MOE_JIT_LOCK_TIMEOUT", "600"))
     with FileLock(lock_path, timeout=lock_timeout):
         # Re-arm the paddle/torch-proxy blockers (idempotent). The initial
@@ -137,6 +203,13 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
             install_quack_paddle_compat()
         except Exception:
             pass
+
+        # Re-check shared first: a manual/offline warmup may have completed
+        # while this rank was waiting for its private lock.
+        mod = _try_import_prebuilt(module_name, shared_build_directory, source_files)
+        if mod is not None and hasattr(mod, function_name):
+            _ALL_COMPILED_MODULES[module_name] = mod
+            return getattr(mod, function_name)
 
         mod = _try_import_prebuilt(module_name, build_directory, source_files)
         if mod is not None and hasattr(mod, function_name):
