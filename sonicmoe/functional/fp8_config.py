@@ -112,7 +112,7 @@ class _FP8Config:
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
-        "iso32_weight",
+        "iso32_weight", "swiglu_clamp_value",
     )
 
     def __init__(self) -> None:
@@ -126,6 +126,10 @@ class _FP8Config:
         self.fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
         self.alignment_assumed: bool = False
         self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
+        _active = get_active_config()
+        self.swiglu_clamp_value: float = (
+            _active.resolve_swiglu_clamp_value() if _active is not None else 0.0
+        )
 
     # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
     _WGRAD_FP8_I_THRESHOLD = 0
@@ -151,6 +155,7 @@ class _FP8Config:
         cfg._fp8_wgrad_setting = False
         cfg.alignment_assumed = False
         cfg.iso32_weight = False
+        cfg.swiglu_clamp_value = 0.0
         return cfg
 
 

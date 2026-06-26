@@ -72,6 +72,8 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_FP8_ASSUME_ALIGNED``. Default: False.
         stagewise_memory: Enable per-stage memory logging.
             Env: ``SONIC_MOE_STAGEWISE_MEMORY``. Default: False.
+        swiglu_clamp_value: Optional user-controlled SwiGLU clamp value.
+            Default: 0.0 (disabled).
     """
 
     use_fp8: Optional[bool] = None
@@ -86,6 +88,7 @@ class SonicMoEConfig:
     assume_aligned: Optional[bool] = None
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
+    swiglu_clamp_value: Optional[float] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -165,6 +168,11 @@ class SonicMoEConfig:
         if self.iso32_weight is not None:
             return self.iso32_weight
         return _env_bool("SONIC_MOE_FP8_ISO32_WEIGHT", False) or False
+
+    def resolve_swiglu_clamp_value(self) -> float:
+        if self.swiglu_clamp_value is not None:
+            return max(float(self.swiglu_clamp_value), 0.0)
+        return 0.0
 
     # --- Context manager for temporary activation ----------------------------
 
