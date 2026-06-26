@@ -97,7 +97,10 @@ def gemm_gated(
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # (total_m, N//32) uint8 — epilogue quant scale output
+    swiglu_clamp_value: float = 0.0,
 ) -> None:
+    if activation != "swiglu":
+        swiglu_clamp_value = 0.0
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
@@ -188,6 +191,7 @@ def gemm_gated(
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
+        swiglu_clamp_value=float(swiglu_clamp_value),
         mRowVecBroadcast=(
             from_dlpack(rowvec_bias.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
             if rowvec_bias is not None
@@ -245,6 +249,7 @@ def gemm_gated(
         A_idx is not None,
         blockscaled,
         epilogue_quant,
+        float(swiglu_clamp_value),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_gated.compile_cache

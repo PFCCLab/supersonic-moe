@@ -97,8 +97,11 @@ def gemm_dgated(
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     preact_fp8: Optional[Tensor] = None,  # (total_m, 2n) fp8 — replaces PreAct when provided
     preact_scales: Optional[Tensor] = None,  # (total_m, 2n//32) uint8 — blockscaled scales for preact_fp8
+    swiglu_clamp_value: float = 0.0,
 ) -> None:
     """If tile_count_semaphore is provided, it must already be zero'ed out."""
+    if activation != "swiglu":
+        swiglu_clamp_value = 0.0
     fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
@@ -207,6 +210,7 @@ def gemm_dgated(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
         implicit_dtype=implicit_dtype,
+        swiglu_clamp_value=float(swiglu_clamp_value),
         mColVecBroadcast=(
             from_dlpack(colvec_scale.detach(), assumed_align=4).mark_layout_dynamic(
                 leading_dim=1 if cu_seqlens_m is None else 0
@@ -260,6 +264,7 @@ def gemm_dgated(
         A_idx is not None,
         blockscaled,
         fp8_preact_mode,
+        float(swiglu_clamp_value),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dgated.compile_cache
