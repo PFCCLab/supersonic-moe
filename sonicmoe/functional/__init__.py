@@ -7,6 +7,7 @@ from __future__ import annotations
 import collections
 import os
 
+import paddle
 import torch
 import torch.nn.functional as F
 from ..count_cumsum import count_cumsum
@@ -1307,7 +1308,6 @@ class _UpProjection(torch.autograd.Function):
         # allocates its own output).  BF16 path allocates below.
         dw1_base = dw1 = None
         db1 = None if b1 is None else torch.empty_like(b1)
-        _reset_stage_memory_probe()
 
         if use_quack_gemm:
             assert not is_compiling
@@ -1563,8 +1563,6 @@ class _UpProjection(torch.autograd.Function):
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
             )
 
-        _log_stage_memory("backward:up-proj-core")
-        _reset_stage_memory_probe()
         dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
 
         _token_broadcast_backward(
@@ -1576,7 +1574,6 @@ class _UpProjection(torch.autograd.Function):
             H=H,
             is_varlen_K=is_varlen_K,
         )
-        _log_stage_memory("backward:token-reduce")
 
         # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum)
         grads = [dx_reduced, dw1]
@@ -1778,7 +1775,7 @@ class _DownProjection(torch.autograd.Function):
         # w2 decoupling: in FP8+aligned+fused_gated mode, backward doesn't
         # read bf16 w2 data (uses fp8 dgated cache + metadata).  This enables
         # stash_bf16_to_cpu() to resize_(0) the bf16 param storage.
-        _w2_decouple = z_is_fp8 and cfg.fused_gated
+        _w2_decouple = cfg.enabled and cfg.alignment_assumed and cfg.fused_gated
         ctx._w2_decoupled = _w2_decouple
 
         if z_is_fp8:
@@ -1855,16 +1852,33 @@ class _DownProjection(torch.autograd.Function):
                     s_reverse_scatter_idx,
                 )
         else:
-            ctx.save_for_backward(
-                z,
-                w2,
-                b2,
-                topk_scores,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-            )
+            if _w2_decouple:
+                _w2_dgated_fp8, _w2_dgated_scales = _get_fp8_weight_attr(w2, "transposed_fp8")
+                ctx._w2_dgated_fp8 = _w2_dgated_fp8
+                ctx._w2_dgated_scales = _w2_dgated_scales
+                ctx._w2_shape = w2.shape
+                ctx._w2_dtype = w2.dtype
+                ctx._w2_device = w2.device
+                ctx.save_for_backward(
+                    z,
+                    b2,
+                    topk_scores,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                )
+            else:
+                ctx.save_for_backward(
+                    z,
+                    w2,
+                    b2,
+                    topk_scores,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                )
 
         # Keep w2 FP8 cache — backward hits cache (~38µs savings) at ~37MB memory cost.
         # The cache auto-invalidates via w._version when optimizer updates weights.
@@ -1924,19 +1938,37 @@ class _DownProjection(torch.autograd.Function):
             # Defer dequantize: FP8 path uses fused kernel, others lazy-dequant
             z = None
         else:
-            (
-                z,
-                w2,
-                b2,
-                topk_scores,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-            ) = ctx.saved_tensor()
-            w2_shape = w2.shape
-            w2_dtype = w2.dtype
-            w2_device = w2.device
+            if ctx._w2_decoupled:
+                (
+                    z,
+                    b2,
+                    topk_scores,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                ) = ctx.saved_tensor()
+                w2_shape = ctx._w2_shape
+                w2_dtype = ctx._w2_dtype
+                w2_device = ctx._w2_device
+            else:
+                (
+                    z,
+                    w2,
+                    b2,
+                    topk_scores,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                ) = ctx.saved_tensor()
+                w2_shape = w2.shape
+                w2_dtype = w2.dtype
+                w2_device = w2.device
+            if getattr(ctx, "_needs_z_bf16_recompute", False):
+                # Recompute z bf16 from saved args (re-run up-proj GEMM + SwiGLU)
+                z = _recompute_z_bf16(*ctx._z_bf16_recompute_args)
+                ctx._z_bf16_recompute_args = None
             z_fp8 = z_raw_scales_u8 = None
 
         # Defer dw2 allocation: in the fused_gated path, dw2 is not needed
@@ -1944,7 +1976,6 @@ class _DownProjection(torch.autograd.Function):
         # Allocating here adds 72 MiB to the dgated peak unnecessarily.
         dw2_base = dw2 = None  # allocated just before wgrad in each path
         db2 = None if b2 is None else torch.empty_like(b2)
-        _reset_stage_memory_probe()
 
         if use_quack_gemm:
             # assert not torch.compiler.is_compiling()  # Paddle compat
@@ -2090,8 +2121,6 @@ class _DownProjection(torch.autograd.Function):
                     # Don't free stash entries either — they may alias cache tensors.
 
                     # Weight-grad: dw2 = dout.T @ y1s (per expert).
-                    _log_stage_memory("backward:down-proj-dgated")
-                    _reset_stage_memory_probe()
                     TK_wgrad = x_gather_idx.shape[0]
                     if ctx._fp8_cfg.fp8_wgrad:
 
@@ -2222,7 +2251,6 @@ class _DownProjection(torch.autograd.Function):
                             )
                             del y1s_wgrad
                             del y1s
-                    _log_stage_memory("backward:down-proj-weight")
 
                     # Pre-quantize dz for UpProj.backward (non-wgrad path only;
                     # wgrad path already did this above before dw2 allocation).
@@ -2287,8 +2315,6 @@ class _DownProjection(torch.autograd.Function):
                             dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
                     del dy1
 
-                    _log_stage_memory("backward:down-proj-dgated")
-                    _reset_stage_memory_probe()
 
                     # Weight-grad: BF16 varlen GEMM
                     dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
@@ -2307,7 +2333,6 @@ class _DownProjection(torch.autograd.Function):
                         device=dout.device,
                     )
                     del y1s_wgrad
-                    _log_stage_memory("backward:down-proj-weight")
                     ds = ds[s_reverse_scatter_idx]
             elif ctx._fp8_enabled_flag and not ctx._alignment_assumed_flag:
                 # FP8 enabled but non-aligned: unreachable in production
@@ -2337,8 +2362,6 @@ class _DownProjection(torch.autograd.Function):
                     tuned=False,
                     swiglu_clamp_value=ctx._fp8_cfg.swiglu_clamp_value,
                 )
-                _log_stage_memory("backward:down-proj-dgated")
-                _reset_stage_memory_probe()
 
                 y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
                 _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
@@ -2385,16 +2408,13 @@ class _DownProjection(torch.autograd.Function):
                         num_experts=w2.shape[2],
                         device=dout.device,
                     )
-                _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
         else:
             raise RuntimeError(
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
             )
 
-        _reset_stage_memory_probe()
         y1s = None  # may already be freed by fused dgated path
-        _log_stage_memory("backward:down-proj-postact-release")
         # TC top-K routing
         # When route-level padding is active, topk_scores input was (T*K+N_pad,)
         # flat, but ds is (T*K,) after s_reverse_scatter_idx indexing.  Pad with
