@@ -715,8 +715,19 @@ class FP8PreActLoad(EpiOp):
             # Compute varlen M offset
             if const_expr(ctx.varlen_manager.varlen_m):
                 m_offset = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                # Upper bound on valid absolute M rows for this batch/expert. The
+                # fp8-preact reads below (fp8_tensor[m_abs], scales_tensor[m_abs])
+                # are manual LDGs with no TMA predication, unlike D. Under a 2-CTA
+                # cluster (cluster_m=2) the scheduler can hand a CTA a phantom
+                # upper-half M-tile whose rows extend past this expert's segment
+                # (and, for the last expert, past total_M), so m_abs must be
+                # bounds-checked or the LDG reads past the allocation (observed
+                # CUDA-700 illegal global read). cluster_m=1 never produces such a
+                # phantom tile, so this guard is a no-op there.
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3] + Int32(1)]
             else:
                 m_offset = Int32(0)
+                m_limit = fp8_tensor.shape[0]  # total_M
             m_base = ctx.tile_coord_mnkl[0] * tile_M
 
             # Identity tensor partitioned for this thread's epilogue elements
@@ -728,16 +739,16 @@ class FP8PreActLoad(EpiOp):
             # N base in fp8 logical coordinates (tile_N f32 = 2*tile_N bf16 = 2*tile_N fp8)
             n_base_logical = ctx.tile_coord_mnkl[1] * tile_N * 2
 
-            return (fp8_tensor, scales_tensor, tDcD, m_offset, m_base, n_base_logical)
+            return (fp8_tensor, scales_tensor, tDcD, m_offset, m_base, n_base_logical, m_limit)
         return None
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
         if const_expr(state is not None):
-            fp8_tensor, scales_tensor, tDcD, m_offset, m_base, n_base = state
+            fp8_tensor, scales_tensor, tDcD, m_offset, m_base, n_base, m_limit = state
             # Extract this subtile's identity coordinates
             tDcD_sub = cute.group_modes(tDcD, 3, cute.rank(tDcD))[None, None, None, epi_coord]
-            return (fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base)
+            return (fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base, m_limit)
         return None
 
 
@@ -801,7 +812,7 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
 
         if const_expr(fp8_preact_info is not None):
             # ── FP8 PreAct path: use identity tensor for correct coordinates ──
-            fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base = fp8_preact_info
+            fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base, m_limit = fp8_preact_info
 
             # tDcD_sub[i] gives (row_in_tile, col_in_tile) for each D register element
             # col is C's physical N (f32 = bf16x2). Each f32 maps to 2 fp8 bytes.
@@ -818,9 +829,14 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
                 row = coord[0]
                 col = coord[1]
                 m_abs = m_offset + m_base + row
+                # Clamp to last valid row: under cluster_m=2 a phantom upper tile
+                # gives rows past this expert's segment (and total_M for the last
+                # expert). These manual LDGs have no TMA predication, so clamp the
+                # address; the value is dropped by D's predication downstream.
+                m_safe = m_abs if m_abs < m_limit else (m_limit - Int32(1))
                 n0 = n_base + col * 2
-                tRS_rFP8[2 * i] = fp8_tensor[m_abs, n0]
-                tRS_rFP8[2 * i + 1] = fp8_tensor[m_abs, n0 + Int32(1)]
+                tRS_rFP8[2 * i] = fp8_tensor[m_safe, n0]
+                tRS_rFP8[2 * i + 1] = fp8_tensor[m_safe, n0 + Int32(1)]
 
             # Vectorized fp8->f32 (DSL auto-packs vec4 -> nvgpu.cvt_fpext)
             tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, Float32)
@@ -832,11 +848,12 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
                 row = coord[0]
                 col = coord[1]
                 m_abs = m_offset + m_base + row
+                m_safe = m_abs if m_abs < m_limit else (m_limit - Int32(1))
                 n0 = n_base + col * 2
                 group_0 = n0 >> Int32(5)
                 group_1 = (n0 + Int32(1)) >> Int32(5)
-                scale_0 = _i32_as_f32(Int32(scales_tensor[m_abs, group_0]) << Int32(23))
-                scale_1 = _i32_as_f32(Int32(scales_tensor[m_abs, group_1]) << Int32(23))
+                scale_0 = _i32_as_f32(Int32(scales_tensor[m_safe, group_0]) << Int32(23))
+                scale_1 = _i32_as_f32(Int32(scales_tensor[m_safe, group_1]) << Int32(23))
                 tRS_rXY_f32x2[2 * i] = tRS_rXY_f32x2[2 * i] * scale_0
                 tRS_rXY_f32x2[2 * i + 1] = tRS_rXY_f32x2[2 * i + 1] * scale_1
         else:
@@ -1059,17 +1076,21 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
             fp8_preact_info = epi_loop_tensors["mFP8PreAct"]
             if const_expr(fp8_preact_info is not None):
                 # Scales loaded via EpiOp (small data, LDG is fine)
-                fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base = fp8_preact_info
+                fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base, m_limit = fp8_preact_info
                 num_d = cute.size(tDcD_sub)
                 for i in cutlass.range(num_d, unroll_full=True):
                     coord = tDcD_sub[i]
                     row, col = coord[0], coord[1]
                     m_abs = m_offset + m_base + row
+                    # See FP8PreActLoad guard: clamp to last valid row so the
+                    # cluster_m=2 phantom-tile rows can't read past the scales
+                    # buffer (the value is dropped by D predication anyway).
+                    m_safe = m_abs if m_abs < m_limit else (m_limit - Int32(1))
                     n0 = n_base + col * 2
                     group_0 = n0 >> Int32(5)
                     group_1 = (n0 + Int32(1)) >> Int32(5)
-                    scale_0 = _i32_as_f32(Int32(scales_tensor[m_abs, group_0]) << Int32(23))
-                    scale_1 = _i32_as_f32(Int32(scales_tensor[m_abs, group_1]) << Int32(23))
+                    scale_0 = _i32_as_f32(Int32(scales_tensor[m_safe, group_0]) << Int32(23))
+                    scale_1 = _i32_as_f32(Int32(scales_tensor[m_safe, group_1]) << Int32(23))
                     tRS_rXY_f32x2[2 * i] = tRS_rXY_f32x2[2 * i] * scale_0
                     tRS_rXY_f32x2[2 * i + 1] = tRS_rXY_f32x2[2 * i + 1] * scale_1
         else:
