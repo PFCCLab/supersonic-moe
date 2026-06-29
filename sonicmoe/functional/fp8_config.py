@@ -100,6 +100,21 @@ def _use_fused_blockscaled_gated() -> bool:
     return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "1").lower() in {"1", "true", "yes", "on"}
 
 
+def _use_fuse_y1_quant() -> bool:
+    """Fuse y1 (=SwiGLU(z)) FP8 quant into the up-proj GEMM epilogue (default OFF).
+
+    When enabled, the GemmGatedSm100ZeroMatPostActQuant kernel writes y1 directly
+    as FP8 + ISA-packed UE8M0 scales, eliminating the standalone
+    quantize_and_pack_activation(y1) kernel and the bf16 y1 HBM materialization.
+    Mutually exclusive with z epilogue quant (save_z_fp8); z stays bf16.
+    Default OFF — opt-in via SONIC_MOE_FUSE_Y1_QUANT=1 or cfg.fuse_y1_quant.
+    """
+    cfg = get_active_config()
+    if cfg is not None and getattr(cfg, "fuse_y1_quant", None) is not None:
+        return cfg.fuse_y1_quant
+    return os.getenv("SONIC_MOE_FUSE_Y1_QUANT", "0").lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # FP8 runtime config — resolved once per forward, passed via ctx
 # ---------------------------------------------------------------------------
@@ -112,7 +127,7 @@ class _FP8Config:
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
-        "iso32_weight", "swiglu_clamp_value",
+        "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant",
     )
 
     def __init__(self) -> None:
@@ -126,6 +141,7 @@ class _FP8Config:
         self.fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
         self.alignment_assumed: bool = False
         self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
+        self.fuse_y1_quant: bool = _use_fuse_y1_quant()
         _active = get_active_config()
         self.swiglu_clamp_value: float = (
             _active.resolve_swiglu_clamp_value() if _active is not None else 0.0
@@ -156,6 +172,7 @@ class _FP8Config:
         cfg.alignment_assumed = False
         cfg.iso32_weight = False
         cfg.swiglu_clamp_value = 0.0
+        cfg.fuse_y1_quant = False
         return cfg
 
 

@@ -43,6 +43,8 @@ from ._gated_epilogues import (
 from .gemm_sm100_fp8_zeromat import (
     GemmGatedSm100ZeroMat,
     GemmGatedSm100ZeroMatBlockscaledQuant,
+    GemmGatedSm100ZeroMatPostActQuant,
+    GemmGatedSm100ZeroMatQuantPostActQuant,
     GemmSm100ZeroMatBlockscaledQuant,
 )
 
@@ -97,6 +99,7 @@ def gemm_gated(
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     z_scale_out: Optional[Tensor] = None,  # (total_m, N//32) uint8 — epilogue quant scale output
+    postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
     swiglu_clamp_value: float = 0.0,
 ) -> None:
     if activation != "swiglu":
@@ -154,11 +157,26 @@ def gemm_gated(
     # Use zero-materialization kernel when gather_A + blockscaled (FP8 with A_idx)
     blockscaled_runtime = a_scales is not None and b_scales is not None
     epilogue_quant = z_scale_out is not None
+    postact_quant = postact_scale_out is not None
+    # z-quant and y1-quant CAN coexist (combined epilogue): the two EpiOps operate
+    # on disjoint register fragments (tRS_rD vs tRS_rPostAct) and disjoint scale
+    # buffers (mZScale vs mPostActScaleIsa).  Running both lets fuse_y1=1 coexist
+    # with save_z_fp8=1 so the backward takes the healthy fp8-preact dgated path.
+    combined_quant = epilogue_quant and postact_quant
     if epilogue_quant:
         assert device_capacity[0] > 9, "Epilogue quant only supported on SM100+"
+    if postact_quant:
+        assert device_capacity[0] > 9, "Postact quant only supported on SM100+"
+        assert gather_A and blockscaled_runtime, (
+            "Postact (y1) quant only supported on the gather_A+blockscaled zeromat path"
+        )
     if device_capacity[0] > 9 and gather_A and blockscaled_runtime:
-        if epilogue_quant:
+        if combined_quant:
+            GemmCls = GemmGatedSm100ZeroMatQuantPostActQuant
+        elif epilogue_quant:
             GemmCls = GemmGatedSm100ZeroMatBlockscaledQuant
+        elif postact_quant:
+            GemmCls = GemmGatedSm100ZeroMatPostActQuant
         else:
             GemmCls = GemmGatedSm100ZeroMat
     elif device_capacity[0] > 9:
@@ -188,6 +206,8 @@ def gemm_gated(
     epi_kwargs = {}
     if epilogue_quant:
         epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)
+    if postact_quant:
+        epi_kwargs["mPostActScaleIsa"] = _make_cute_tensor_dynamic(postact_scale_out, leading_dim=2)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
@@ -249,6 +269,7 @@ def gemm_gated(
         A_idx is not None,
         blockscaled,
         epilogue_quant,
+        postact_quant,
         float(swiglu_clamp_value),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )

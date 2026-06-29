@@ -43,6 +43,8 @@ from .blockscaled_fp8_gemm import _tile_atom_to_shape_SF_rank_aware
 from ._gated_epilogues import (
     GemmGatedMixin,
     GemmGatedBlockscaledQuantMixin,
+    GemmGatedPostActIsaQuantMixin,
+    GemmGatedBlockscaledQuantPostActMixin,
     BlockscaledQuantOnlyMixin,
     GemmDGatedMixin,
     GemmDGatedFP8CLoadMixin,
@@ -143,8 +145,9 @@ class _GemmSm100ZeroMatMixin:
             # ============================================================
             if const_expr(self.gather_A):
                 # mA is (T, K) but GEMM logically has TK output rows.
-                # Use (TK, K) = (mD.shape[0], mA.shape[1]) for SFA layout.
-                sfa_logical_shape = (mD.shape[0], mA.shape[1])
+                # Use D when present, otherwise mPostAct; both carry total_M.
+                total_m = mD.shape[0] if const_expr(mD is not None) else epilogue_args.mPostAct.shape[0]
+                sfa_logical_shape = (total_m, mA.shape[1])
                 sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
                     sfa_logical_shape, self.sf_vec_size
                 )
@@ -374,6 +377,31 @@ class GemmGatedSm100ZeroMat(GemmGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
 
 class GemmGatedSm100ZeroMatBlockscaledQuant(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
     """SM100 GemmGated + epilogue blockscaled FP8 quant + zero-materialization SFA fix."""
+    pass
+
+
+class GemmGatedSm100ZeroMatPostActQuant(GemmGatedPostActIsaQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """SM100 GemmGated + epilogue blockscaled FP8 quant of the postact (y1) + zero-mat SFA fix.
+
+    Fuses the standalone quantize_and_pack_activation(y1) into the up-proj
+    epilogue: emits y1 directly as FP8 (mPostAct fp8) + ISA-packed UE8M0
+    scales (mPostActScaleIsa), eliminating the bf16 y1 materialization and the
+    standalone y1 quant kernel.  z (mD) stays bf16.  Requires epi_tile_n(z)=64
+    (default override) for 1:1 subtile->postact-group mapping.
+    """
+    pass
+
+
+class GemmGatedSm100ZeroMatQuantPostActQuant(
+    GemmGatedBlockscaledQuantPostActMixin, _GemmSm100ZeroMatMixin, GemmSm100
+):
+    """SM100 GemmGated + epilogue blockscaled FP8 quant of BOTH z AND postact (y1) + zero-mat SFA fix.
+
+    Single up-proj pass that emits z as fp8 (mD fp8 + mZScale) AND y1 as fp8
+    (mPostAct fp8 + mPostActScaleIsa).  Lets fuse_y1=1 coexist with save_z_fp8=1
+    so the backward takes the healthy fp8-preact dgated path.  Requires
+    epi_tile_n(z)=64 for the 1:1 subtile->postact-group mapping.
+    """
     pass
 
 

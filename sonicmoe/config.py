@@ -85,6 +85,7 @@ class SonicMoEConfig:
     fused_swiglu_quant: Optional[bool] = None
     epilogue_quant: Optional[bool] = None
     fused_zy1_quant: Optional[bool] = None
+    fuse_y1_quant: Optional[bool] = None
     assume_aligned: Optional[bool] = None
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
