@@ -146,6 +146,7 @@ def gemm_gated_tuned(
     z_scale_out: Optional[Tensor] = None,  # epilogue quant scale output
     postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
     swiglu_clamp_value: float = 0.0,
+    postact_bf16_trunc: bool = False,
 ) -> None:
     if config is None:
         config = quack_default_config(A.device)
@@ -194,6 +195,7 @@ def gemm_gated_tuned(
         z_scale_out=z_scale_out,
         postact_scale_out=postact_scale_out,
         swiglu_clamp_value=swiglu_clamp_value,
+        postact_bf16_trunc=postact_bf16_trunc,
     )
 
 
@@ -320,6 +322,7 @@ def gemm_gated(
     z_scale_out: Optional[Tensor] = None,
     postact_scale_out: Optional[Tensor] = None,
     swiglu_clamp_value: float = 0.0,
+    postact_bf16_trunc: bool = False,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -343,7 +346,8 @@ def gemm_gated(
         fn = partial(gemm_gated_tuned.fn, config=None)
         fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx,
            dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out,
-           postact_scale_out=postact_scale_out, swiglu_clamp_value=swiglu_clamp_value)
+           postact_scale_out=postact_scale_out, swiglu_clamp_value=swiglu_clamp_value,
+           postact_bf16_trunc=postact_bf16_trunc)
     else:
         gemm_gated_out(
             A, B, preact_out, postact_out, C, bias, activation,

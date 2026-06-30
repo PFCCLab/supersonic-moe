@@ -224,7 +224,6 @@ def _fused_blockscaled_gated_forward(
     x_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
     w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
     store_z: bool = True,
-    fuse_y1_quant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
@@ -286,7 +285,7 @@ def _fused_blockscaled_gated_forward(
     # dgated path, while y1 is fused (no standalone quant kernel, no bf16 y1 HBM
     # round-trip).  fuse_y1 with z bf16 (save_z_fp8 off) is the legacy y1-only
     # path; both are supported.
-    fuse_y1 = fuse_y1_quant
+    fuse_y1 = cfg.fuse_y1_quant
     if fuse_y1:
         I_dim = w1.shape[0] // 2  # w1 is (2I, H, E) -> N=2I, postact y1 has I cols
         assert TK % 128 == 0 and I_dim % 128 == 0, (
@@ -325,6 +324,7 @@ def _fused_blockscaled_gated_forward(
         z_scale_out=z_scale_out,
         postact_scale_out=postact_scale_out,
         swiglu_clamp_value=cfg.swiglu_clamp_value,
+        postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
     )
     del x_fp8, x_scales_tk_e8m0
 
@@ -1063,11 +1063,9 @@ class _UpProjection(torch.autograd.Function):
 
                 if aligned and cfg.fused_gated:
                     w1_fp8 = _get_fp8_weight_attr(w1, "fp8")
-                    fuse_y1 = _use_fuse_y1_quant()
                     z, y1, y1_fp8_fused, y1_scales_fused = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx,
                         x_fp8_pre=prequant_activation_payload, w1_fp8_pre=w1_fp8,
-                        fuse_y1_quant=fuse_y1,
                     )
                     if cfg.save_z_fp8 and cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);

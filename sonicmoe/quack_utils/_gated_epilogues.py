@@ -291,6 +291,8 @@ class GemmGatedMixin(GemmActMixin):
         d = self._epi_ops_to_params_dict(args)
         d["act_fn"] = args.act_fn
         d["swiglu_clamp_value"] = args.swiglu_clamp_value
+        if hasattr(args, "postact_bf16_trunc"):
+            d["postact_bf16_trunc"] = args.postact_bf16_trunc
         return self.EpilogueParams(**d)
 
     @cute.jit
@@ -348,7 +350,7 @@ def _bf16_trunc_rne(x: Float32, *, loc=None, ip=None) -> Float32:
     writes y1 as bf16 to HBM (RNE truncation of the 16 low mantissa bits) before
     the triton quantize reads it back.  This helper performs that exact RNE
     truncation in-register so the FUSED epilogue can be made byte-identical to
-    the standalone path on demand (env SONIC_MOE_FUSE_Y1_BF16_TRUNC=1).
+    the standalone path when requested by Python FP8 config.
 
     NOT stochastic — deterministic RNE, identical to torch ``.to(bfloat16)`` and
     the numpy ``bf16_trunc`` model verified bit-exact (0 mismatch / 100k draws).
@@ -367,24 +369,6 @@ def _bf16_trunc_rne(x: Float32, *, loc=None, ip=None) -> Float32:
     roundup = (lower + kept_lsb + Int32(0x7FFF)) >> Int32(16)
     out_bits = ((bits >> Int32(16)) + roundup) << Int32(16)
     return _i32_as_f32(out_bits)
-
-
-def _fuse_y1_bf16_trunc_enabled() -> bool:
-    """Whether the fused y1 quant emulates the standalone bf16 HBM round-trip.
-
-    DEFAULT ON (when fuse_y1 is active): the standalone carbide path writes y1 to
-    HBM as bf16 before the triton quantize, so by default the fused path matches
-    it byte-for-byte (RNE-truncate the fp32 postact to bf16 first).  This keeps
-    fuse_y1 numerically aligned with the legacy/standalone quant path that the
-    bf16 baseline was trained against — the e2e loss diff vs the standalone path
-    drops when this is on (verified vs the 950-step peer baseline).
-
-    Set ``SONIC_MOE_FUSE_Y1_BF16_TRUNC=0`` to DISABLE it and quantize the true
-    fp32 postact directly (one fewer rounding; numerically closer to the fp32
-    reference per the knwoledge/epilogue_quant forensics, but diverges from the
-    standalone-trained baseline).  Only consulted when fuse_y1 is active.
-    """
-    return os.getenv("SONIC_MOE_FUSE_Y1_BF16_TRUNC", "1").lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +727,10 @@ class GemmGatedPostActIsaQuantMixin(GemmGatedMixin):
         *GemmGatedMixin._epi_ops,
         BlockscaledIsaPostActScaleStore("mPostActScaleIsa"),
     )
+    _extra_param_fields = (
+        *GemmGatedMixin._extra_param_fields,
+        ("postact_bf16_trunc", cutlass.Constexpr, False),
+    )
 
     def _forced_epi_tile_n(self) -> int:
         """Fused postact quant requires epi_tile_n=64 (one 1x32 group per half-N
@@ -758,6 +746,7 @@ class GemmGatedPostActIsaQuantMixin(GemmGatedMixin):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
+        postact_bf16_trunc: cutlass.Constexpr[bool] = False
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -776,15 +765,10 @@ class GemmGatedPostActIsaQuantMixin(GemmGatedMixin):
         if const_expr(_pa_scale_active is not None):
             num_pa = cute.size(tRS_rPostAct)
 
-            # OPTIONAL: emulate the standalone carbide path's bf16 HBM round-trip.
-            # The standalone path writes y1 to HBM as bf16 (RNE truncation) BEFORE
-            # the triton quantize reads it back and takes amax on the bf16 value.
-            # When SONIC_MOE_FUSE_Y1_BF16_TRUNC=1 we RNE-truncate the postact to
-            # bf16 in-register FIRST, so BOTH amax and the quantized value derive
-            # from the bf16 value — making the fused output byte-identical to the
-            # standalone path (verified: stand == bf16-sim 100%).  Default OFF =
-            # quantize the true fp32 postact (numerically superior).
-            if const_expr(_fuse_y1_bf16_trunc_enabled()):
+            # Optional config-controlled emulation of the standalone bf16 HBM
+            # round-trip: when enabled, BOTH amax and quantized value derive from
+            # the RNE-truncated bf16 postact.  Default OFF keeps fp32->fp8 direct.
+            if const_expr(params.postact_bf16_trunc):
                 for i in cutlass.range(num_pa, unroll_full=True):
                     tRS_rPostAct[i] = _bf16_trunc_rne(tRS_rPostAct[i])
 
@@ -877,6 +861,10 @@ class GemmGatedBlockscaledQuantPostActMixin(GemmGatedMixin):
         BlockscaledScaleStoreDual("mZScale"),
         BlockscaledIsaPostActScaleStore("mPostActScaleIsa"),
     )
+    _extra_param_fields = (
+        *GemmGatedMixin._extra_param_fields,
+        ("postact_bf16_trunc", cutlass.Constexpr, False),
+    )
 
     def _forced_epi_tile_n(self) -> int:
         """Same as the y1-only mixin: postact quant structurally requires 64."""
@@ -888,6 +876,7 @@ class GemmGatedBlockscaledQuantPostActMixin(GemmGatedMixin):
         mPostAct: cute.Tensor
         act_fn: cutlass.Constexpr[Optional[Callable]] = None
         swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
+        postact_bf16_trunc: cutlass.Constexpr[bool] = False
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
@@ -908,10 +897,8 @@ class GemmGatedBlockscaledQuantPostActMixin(GemmGatedMixin):
         _pa_scale_active = epi_loop_tensors["mPostActScaleIsa"]
         if const_expr(_pa_scale_active is not None):
             num_pa = cute.size(tRS_rPostAct)
-            # OPTIONAL bf16 round-trip emulation (see GemmGatedPostActIsaQuantMixin):
-            # SONIC_MOE_FUSE_Y1_BF16_TRUNC=1 RNE-truncates the postact to bf16
-            # first so the fused y1 matches the standalone carbide path byte-exact.
-            if const_expr(_fuse_y1_bf16_trunc_enabled()):
+            # Optional config-controlled bf16 round-trip emulation (default OFF).
+            if const_expr(params.postact_bf16_trunc):
                 for i in cutlass.range(num_pa, unroll_full=True):
                     tRS_rPostAct[i] = _bf16_trunc_rne(tRS_rPostAct[i])
             # amax over the postact register fragment (one 1x32 group).  No 1e-4
