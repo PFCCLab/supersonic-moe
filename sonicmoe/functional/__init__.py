@@ -325,6 +325,7 @@ def _fused_blockscaled_gated_forward(
         z_scale_out=z_scale_out,
         postact_scale_out=postact_scale_out,
         swiglu_clamp_value=cfg.swiglu_clamp_value,
+        postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
     )
     del x_fp8, x_scales_tk_e8m0
 

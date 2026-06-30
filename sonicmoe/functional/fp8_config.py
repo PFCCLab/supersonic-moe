@@ -103,16 +103,25 @@ def _use_fused_blockscaled_gated() -> bool:
 def _use_fuse_y1_quant() -> bool:
     """Fuse y1 (=SwiGLU(z)) FP8 quant into the up-proj GEMM epilogue (default OFF).
 
-    When enabled, the GemmGatedSm100ZeroMatPostActQuant kernel writes y1 directly
-    as FP8 + ISA-packed UE8M0 scales, eliminating the standalone
-    quantize_and_pack_activation(y1) kernel and the bf16 y1 HBM materialization.
-    Mutually exclusive with z epilogue quant (save_z_fp8); z stays bf16.
-    Default OFF — opt-in via SONIC_MOE_FUSE_Y1_QUANT=1 or cfg.fuse_y1_quant.
+    This is intentionally Python-config only: set ``SonicMoEConfig(fuse_y1_quant=True)``
+    to enable it.  No standalone env flag is consulted here.
     """
     cfg = get_active_config()
-    if cfg is not None and getattr(cfg, "fuse_y1_quant", None) is not None:
-        return cfg.fuse_y1_quant
-    return os.getenv("SONIC_MOE_FUSE_Y1_QUANT", "0").lower() in {"1", "true", "yes", "on"}
+    if cfg is not None:
+        return cfg.resolve_fuse_y1_quant()
+    return False
+
+
+def _use_fuse_y1_bf16_trunc() -> bool:
+    """RNE-truncate fused y1 postact to bf16 before FP8 quant (default OFF).
+
+    Python-config only: set ``SonicMoEConfig(fuse_y1_bf16_trunc=True)`` for
+    byte-parity experiments against the legacy standalone bf16-HBM y1 path.
+    """
+    cfg = get_active_config()
+    if cfg is not None:
+        return cfg.resolve_fuse_y1_bf16_trunc()
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +136,7 @@ class _FP8Config:
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
-        "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant",
+        "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant", "fuse_y1_bf16_trunc",
     )
 
     def __init__(self) -> None:
@@ -142,6 +151,7 @@ class _FP8Config:
         self.alignment_assumed: bool = False
         self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
         self.fuse_y1_quant: bool = _use_fuse_y1_quant()
+        self.fuse_y1_bf16_trunc: bool = _use_fuse_y1_bf16_trunc()
         _active = get_active_config()
         self.swiglu_clamp_value: float = (
             _active.resolve_swiglu_clamp_value() if _active is not None else 0.0
@@ -173,6 +183,7 @@ class _FP8Config:
         cfg.iso32_weight = False
         cfg.swiglu_clamp_value = 0.0
         cfg.fuse_y1_quant = False
+        cfg.fuse_y1_bf16_trunc = False
         return cfg
 
 

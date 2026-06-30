@@ -68,6 +68,10 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_FP8_EPILOGUE_QUANT``. Default: False.
         fused_zy1_quant: Enable fused z+y1 quantization.
             Env: ``SONIC_MOE_FP8_FUSED_ZY1_QUANT``. Default: False.
+        fuse_y1_quant: Enable y1 postact FP8 quantization in the up-proj epilogue.
+            Python-config only. Default: False.
+        fuse_y1_bf16_trunc: RNE-truncate fused y1 postact to bf16 before FP8 quant.
+            Python-config only. Default: False.
         assume_aligned: Force alignment assumption (skip D2H check).
             Env: ``SONIC_MOE_FP8_ASSUME_ALIGNED``. Default: False.
         stagewise_memory: Enable per-stage memory logging.
@@ -86,6 +90,7 @@ class SonicMoEConfig:
     epilogue_quant: Optional[bool] = None
     fused_zy1_quant: Optional[bool] = None
     fuse_y1_quant: Optional[bool] = None
+    fuse_y1_bf16_trunc: Optional[bool] = None
     assume_aligned: Optional[bool] = None
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
@@ -154,6 +159,16 @@ class SonicMoEConfig:
         if self.fused_zy1_quant is not None:
             return self.fused_zy1_quant
         return _env_bool("SONIC_MOE_FP8_FUSED_ZY1_QUANT", False) or False
+
+    def resolve_fuse_y1_quant(self) -> bool:
+        if self.fuse_y1_quant is not None:
+            return self.fuse_y1_quant
+        return False
+
+    def resolve_fuse_y1_bf16_trunc(self) -> bool:
+        if self.fuse_y1_bf16_trunc is not None:
+            return self.fuse_y1_bf16_trunc
+        return False
 
     def resolve_assume_aligned(self) -> bool:
         if self.assume_aligned is not None:

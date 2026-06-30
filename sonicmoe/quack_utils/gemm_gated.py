@@ -101,6 +101,7 @@ def gemm_gated(
     z_scale_out: Optional[Tensor] = None,  # (total_m, N//32) uint8 — epilogue quant scale output
     postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
     swiglu_clamp_value: float = 0.0,
+    postact_bf16_trunc: bool = False,
 ) -> None:
     if activation != "swiglu":
         swiglu_clamp_value = 0.0
@@ -208,6 +209,7 @@ def gemm_gated(
         epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)
     if postact_quant:
         epi_kwargs["mPostActScaleIsa"] = _make_cute_tensor_dynamic(postact_scale_out, leading_dim=2)
+        epi_kwargs["postact_bf16_trunc"] = bool(postact_bf16_trunc)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
@@ -271,6 +273,7 @@ def gemm_gated(
         epilogue_quant,
         postact_quant,
         float(swiglu_clamp_value),
+        bool(postact_bf16_trunc),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_gated.compile_cache
