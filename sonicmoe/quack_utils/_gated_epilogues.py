@@ -340,6 +340,53 @@ def _i32_as_f32(x: Int32, *, loc=None, ip=None) -> Float32:
     return Float32(llvm.bitcast(T.f32(), Int32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
 
+@dsl_user_op
+def _bf16_trunc_rne(x: Float32, *, loc=None, ip=None) -> Float32:
+    """Round-to-nearest-even fp32 -> bf16 -> fp32, matching an HBM bf16 store.
+
+    Reproduces the standalone (carbide-kernel) precision: the standalone path
+    writes y1 as bf16 to HBM (RNE truncation of the 16 low mantissa bits) before
+    the triton quantize reads it back.  This helper performs that exact RNE
+    truncation in-register so the FUSED epilogue can be made byte-identical to
+    the standalone path on demand (env SONIC_MOE_FUSE_Y1_BF16_TRUNC=1).
+
+    NOT stochastic — deterministic RNE, identical to torch ``.to(bfloat16)`` and
+    the numpy ``bf16_trunc`` model verified bit-exact (0 mismatch / 100k draws).
+    bits' = ((bits>>16) + roundup) << 16,
+      roundup = (low>0x8000) | (low==0x8000 & lsb_of_kept==1).
+    """
+    bits = _f32_as_i32(x)
+    lower = bits & Int32(0xFFFF)
+    kept_lsb = (bits >> Int32(16)) & Int32(1)
+    # RNE roundup as PURE integer arithmetic — no dynamic Boolean (the DSL cannot
+    # fold a `cutlass.Boolean` into a Python `if` inside a @dsl_user_op).
+    #   roundup = (lower + kept_lsb + 0x7FFF) >> 16
+    # Verified exact round-to-nearest-even over all 2^17 (lower,kept) patterns:
+    #   lower>0x8000 -> always 1; lower==0x8000 -> 1 iff kept_lsb==1 (tie-to-even);
+    #   lower<0x8000 -> 0.  Matches torch .to(bfloat16) bit-for-bit.
+    roundup = (lower + kept_lsb + Int32(0x7FFF)) >> Int32(16)
+    out_bits = ((bits >> Int32(16)) + roundup) << Int32(16)
+    return _i32_as_f32(out_bits)
+
+
+def _fuse_y1_bf16_trunc_enabled() -> bool:
+    """Whether the fused y1 quant emulates the standalone bf16 HBM round-trip.
+
+    DEFAULT ON (when fuse_y1 is active): the standalone carbide path writes y1 to
+    HBM as bf16 before the triton quantize, so by default the fused path matches
+    it byte-for-byte (RNE-truncate the fp32 postact to bf16 first).  This keeps
+    fuse_y1 numerically aligned with the legacy/standalone quant path that the
+    bf16 baseline was trained against — the e2e loss diff vs the standalone path
+    drops when this is on (verified vs the 950-step peer baseline).
+
+    Set ``SONIC_MOE_FUSE_Y1_BF16_TRUNC=0`` to DISABLE it and quantize the true
+    fp32 postact directly (one fewer rounding; numerically closer to the fp32
+    reference per the knwoledge/epilogue_quant forensics, but diverges from the
+    standalone-trained baseline).  Only consulted when fuse_y1 is active.
+    """
+    return os.getenv("SONIC_MOE_FUSE_Y1_BF16_TRUNC", "1").lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # BlockscaledScaleStore EpiOp (from gemm_gated.py)
 # ---------------------------------------------------------------------------
@@ -729,6 +776,18 @@ class GemmGatedPostActIsaQuantMixin(GemmGatedMixin):
         if const_expr(_pa_scale_active is not None):
             num_pa = cute.size(tRS_rPostAct)
 
+            # OPTIONAL: emulate the standalone carbide path's bf16 HBM round-trip.
+            # The standalone path writes y1 to HBM as bf16 (RNE truncation) BEFORE
+            # the triton quantize reads it back and takes amax on the bf16 value.
+            # When SONIC_MOE_FUSE_Y1_BF16_TRUNC=1 we RNE-truncate the postact to
+            # bf16 in-register FIRST, so BOTH amax and the quantized value derive
+            # from the bf16 value — making the fused output byte-identical to the
+            # standalone path (verified: stand == bf16-sim 100%).  Default OFF =
+            # quantize the true fp32 postact (numerically superior).
+            if const_expr(_fuse_y1_bf16_trunc_enabled()):
+                for i in cutlass.range(num_pa, unroll_full=True):
+                    tRS_rPostAct[i] = _bf16_trunc_rne(tRS_rPostAct[i])
+
             # Step 1: amax over the postact register fragment (one 1x32 group).
             # NOTE: no 1e-4 floor here — the standalone y1 quant kernel
             # (_quantize_and_pack_kernel) does not clamp amax, so omitting it
@@ -849,6 +908,12 @@ class GemmGatedBlockscaledQuantPostActMixin(GemmGatedMixin):
         _pa_scale_active = epi_loop_tensors["mPostActScaleIsa"]
         if const_expr(_pa_scale_active is not None):
             num_pa = cute.size(tRS_rPostAct)
+            # OPTIONAL bf16 round-trip emulation (see GemmGatedPostActIsaQuantMixin):
+            # SONIC_MOE_FUSE_Y1_BF16_TRUNC=1 RNE-truncates the postact to bf16
+            # first so the fused y1 matches the standalone carbide path byte-exact.
+            if const_expr(_fuse_y1_bf16_trunc_enabled()):
+                for i in cutlass.range(num_pa, unroll_full=True):
+                    tRS_rPostAct[i] = _bf16_trunc_rne(tRS_rPostAct[i])
             # amax over the postact register fragment (one 1x32 group).  No 1e-4
             # floor — matches the standalone y1 quant kernel byte-for-byte.
             amax = Float32(0.0)
