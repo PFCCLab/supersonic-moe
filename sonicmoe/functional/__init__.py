@@ -1266,8 +1266,8 @@ class _UpProjection(torch.autograd.Function):
         # resize_(0) the bf16 param storage without breaking backward.
         _fp8_aligned = (use_quack_gemm and cfg.enabled and cfg.alignment_assumed)
         ctx._w1_decoupled = _fp8_aligned
-        if _fp8_aligned and ctx._prequant_activation_payload and not cfg.fp8_wgrad:
-            raise RuntimeError("prequant activation payload requires FP8 wgrad because BF16 x is not retained")
+        # if _fp8_aligned and ctx._prequant_activation_payload and not cfg.fp8_wgrad:
+        #     raise RuntimeError("prequant activation payload requires FP8 wgrad because BF16 x is not retained")
         if _fp8_aligned:
             # Store metadata needed for dw1 allocation
             ctx._w1_shape = w1.shape  # (2I, H, E)
@@ -1474,6 +1474,12 @@ class _UpProjection(torch.autograd.Function):
                         dw1 = dw1_base.permute(1, 2, 0)
                     del dz_col_fp8, dz_col_scales, x_col_fp8, x_col_scales
                 else:
+                    bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
+                    if ctx._prequant_activation_payload:
+                        assert x_fp8_pre is not None and x_scales_pre is not None, "Pre-quantized input is None."
+                        x_bf16 = dequantize_blockscaled_fp8(x_fp8_pre, _raw_1x32_scale_bytes(x_scales_pre))
+                    else:
+                        x_bf16 = x
                     _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
                     if _wgrad_accum is not None:
                         # BF16 wgrad + fp32 accumulate.
@@ -1483,7 +1489,7 @@ class _UpProjection(torch.autograd.Function):
                         accum_view = _wgrad_accum.permute(0, 2, 1)  # [E, H, 2I]
                         if _use_wgrad_beta_accum():
                             bf16_wgrad_gemm_varlen_k_accumulate(
-                                x.T,
+                                x_bf16.T,
                                 dz_bf16,
                                 expert_frequency_offset,
                                 x_gather_idx,
@@ -1496,7 +1502,7 @@ class _UpProjection(torch.autograd.Function):
                             )
                         else:
                             bf16_wgrad_gemm_varlen_k_tma_add(
-                                x.T,
+                                x_bf16.T,
                                 dz_bf16,
                                 expert_frequency_offset,
                                 x_gather_idx,
@@ -1513,7 +1519,7 @@ class _UpProjection(torch.autograd.Function):
                         dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
                         dw1 = dw1_base.permute(1, 2, 0)
                         bf16_wgrad_gemm_varlen_k(
-                            x.T,
+                            x_bf16.T,
                             dz_bf16,
                             expert_frequency_offset,
                             x_gather_idx,
@@ -2193,7 +2199,6 @@ class _DownProjection(torch.autograd.Function):
                     # Weight-grad: dw2 = dout.T @ y1s (per expert).
                     TK_wgrad = x_gather_idx.shape[0]
                     if ctx._fp8_cfg.fp8_wgrad:
-
                         # Memory-optimized wgrad pipeline (all main stream):
                         # Step 1: colwise(y1s) then del y1s to free 192 MiB
                         y1s_col_fp8, y1s_col_sc = colwise_quantize_and_pack(

@@ -136,7 +136,7 @@ class _FP8Config:
     """
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
-        "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
+        "epilogue_quant", "_fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
         "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant", "fuse_y1_bf16_trunc",
     )
 
@@ -148,7 +148,7 @@ class _FP8Config:
         self.fused_swiglu_quant: bool = _use_fused_swiglu_quant()
         self.epilogue_quant: bool = _use_epilogue_quant()
         self._fp8_wgrad_setting = _use_fp8_wgrad()  # True/False/None
-        self.fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
+        self._fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
         self.alignment_assumed: bool = False
         self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
         self.fuse_y1_quant: bool = _use_fuse_y1_quant()
@@ -158,15 +158,24 @@ class _FP8Config:
             _active.resolve_swiglu_clamp_value() if _active is not None else 0.0
         )
 
+    @property
+    def fp8_wgrad(self) -> bool:
+        return self._fp8_wgrad
+
+    @fp8_wgrad.setter
+    def fp8_wgrad(self, value: bool) -> None:
+        self._fp8_wgrad = value
+        self._fp8_wgrad_setting = value
+
     # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
     _WGRAD_FP8_I_THRESHOLD = 0
 
     def resolve_wgrad(self, I: int) -> None:
         """Resolve FP8 wgrad based on explicit setting or shape-based heuristic."""
         if self._fp8_wgrad_setting is not None:
-            self.fp8_wgrad = self._fp8_wgrad_setting
+            self._fp8_wgrad = self._fp8_wgrad_setting
         else:
-            self.fp8_wgrad = I >= self._WGRAD_FP8_I_THRESHOLD
+            self._fp8_wgrad = I >= self._WGRAD_FP8_I_THRESHOLD
 
     @staticmethod
     def disabled() -> "_FP8Config":
