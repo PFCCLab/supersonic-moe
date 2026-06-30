@@ -90,6 +90,10 @@ from ..quack_utils import (
 from ..quack_utils.fused_quant_kernels import (
     fused_dual_colwise_quantize,
 )
+from ..quack_utils.gemm_sm100_fp8_zeromat import (
+    blockscaled_fp8_gemm_zeromat_bf16,
+    blockscaled_fp8_gemm_zeromat_quant,
+)
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
@@ -225,7 +229,8 @@ def _fused_blockscaled_gated_forward(
     x_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
     w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
     store_z: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    fp8_config: _FP8Config | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
     Zero-materialization path (SonicMoE design principle):
@@ -270,7 +275,7 @@ def _fused_blockscaled_gated_forward(
     # The epilogue multiplies z by quant_scale in registers -> hardware fp8 saturating
     # cast writes z_fp8 to D. This eliminates the standalone z quant kernel
     # and halves D bandwidth (192MB fp8 vs 384MB bf16).
-    cfg = _get_fp8_config()
+    cfg = fp8_config if fp8_config is not None else _get_fp8_config()
     epilogue_quant = cfg.epilogue_quant and cfg.save_z_fp8
     if epilogue_quant:
         N = w1.shape[0]  # (2I, H, E) -> w1.shape[0] = 2I
@@ -319,7 +324,7 @@ def _fused_blockscaled_gated_forward(
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
         b_scales=w1_scales,
-        store_preact=store_z,
+        store_preact=True,
         dynamic_scheduler=False,
         tuned=False,
         z_scale_out=z_scale_out,
@@ -367,44 +372,90 @@ def _recompute_z_fp8(
     w1: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
+    x_fp8_pre: torch.Tensor | None = None,
+    x_scales_pre: torch.Tensor | None = None,
+    w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Re-run the up-proj GEMM to materialize z_fp8 + scales (Option B).
+    """Re-run up-proj to materialize only z_fp8 + scales for backward."""
+    if w1_fp8_pre is None:
+        raise RuntimeError("Sonic FP8 recompute requires explicit w1_fused payload")
+    w1_fp8, w1_scales = w1_fp8_pre
 
-    Used by ``_DownProjection.backward`` when ``cfg.recompute_z`` was active
-    in forward (z_fp8 was deliberately not stored).
+    if x_fp8_pre is not None or x_scales_pre is not None:
+        if x_fp8_pre is None or x_scales_pre is None:
+            raise ValueError("x_fp8_pre and x_scales_pre must be provided together")
+        x_fp8 = x_fp8_pre
+        x_scales_t = x_scales_pre
+        _PREQUANT_HIT_COUNT["activation_recompute"] += 1
+    else:
+        if x is None:
+            raise ValueError("BF16 x is required when no prequant activation payload is provided")
+        x_fp8, x_scales_t = quantize_and_pack_activation(x)
+    TK = x_gather_idx.shape[0]
+    K = x_fp8.shape[1]
+    x_scales_tk_e8m0 = _gather_1x32_scales_to_isa(
+        x_scales_t, x_gather_idx, int(x_fp8.shape[0]), K
+    )
+    del x_scales_t
 
-    Default (Option A): rerun the gated forward kernel and discard y1.
-    Correct on all routing distributions (uniform & skewed).  Slight overhead:
-    one extra TK x I bf16 alloc + swiglu in registers per recompute call.
+    z_fp8, z_raw_scales = blockscaled_fp8_gemm_zeromat_quant(
+        x_fp8,
+        w1_fp8.mT,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        a_scales=x_scales_tk_e8m0,
+        b_scales=w1_scales,
+    )
+    return z_fp8, z_raw_scales.view(_E8M0_DTYPE)
 
-    Opt-in (Option B, set ``SONIC_MOE_FP8_RECOMPUTE_OPT_B=1``): dispatches to
-    ``blockscaled_fp8_gemm_zeromat_quant`` — a dedicated non-gated CUTLASS DSL
-    kernel that emits ONLY z_fp8 + scales (no y1 alloc, no swiglu, no PostAct
-    smem/TMA/R2S/S2G).  KNOWN-BROKEN on non-uniform routing: produces an
-    illegal-instruction CUDA fault when expert load is skewed (verified by
-    standalone repro).  Layer-1 round-robin uniform test passes bit-exactly.
-    The DSL mixin lives in ``sonicmoe/quack_utils/gemm_gated.py``
-    (``BlockscaledQuantOnlyMixin``) and is preserved for future debugging.
-    Do NOT enable in production.
 
-    Returns (z_fp8, z_raw_scales) ready to plug into the fp8 backward path.
+def _recompute_z_bf16(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
+    x_gather_idx: torch.Tensor,
+    x_fp8_pre: torch.Tensor | None = None,
+    x_scales_pre: torch.Tensor | None = None,
+    w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Re-run up-proj to materialize z in BF16 for backward (no z quant).
+
+    Precision-preserving counterpart of ``_recompute_z_fp8``: identical FP8 GEMM
+    accumulation (``blockscaled_fp8_gemm_zeromat_bf16``) but a BF16 D output, so z
+    is never quantized.  Used as the default recompute path when ``save_z_fp8`` is
+    disabled (precision first).
     """
-    # Option A: rerun gated forward, discard y1, pop z_fp8 from epilogue cache.
-    cfg = _get_fp8_config()
-    saved_epi_q = cfg.epilogue_quant
-    saved_recompute = cfg.recompute_z
-    cfg.epilogue_quant = True
-    cfg.recompute_z = False
-    try:
-        _PREQUANTIZED_SCALES.pop("z_fp8", None)
-        _z_ph, _y1, _y1_fp8, _y1_sc = _fused_blockscaled_gated_forward(
-            x, w1, expert_frequency_offset, x_gather_idx,
-        )
-        z_fp8, z_raw_scales = _PREQUANTIZED_SCALES.pop("z_fp8")
-    finally:
-        cfg.epilogue_quant = saved_epi_q
-        cfg.recompute_z = saved_recompute
-    return z_fp8, z_raw_scales
+
+    if w1_fp8_pre is None:
+        raise RuntimeError("Sonic FP8 recompute requires explicit w1_fused payload")
+    w1_fp8, w1_scales = w1_fp8_pre
+
+    if x_fp8_pre is not None or x_scales_pre is not None:
+        if x_fp8_pre is None or x_scales_pre is None:
+            raise ValueError("x_fp8_pre and x_scales_pre must be provided together")
+        x_fp8 = x_fp8_pre
+        x_scales_t = x_scales_pre
+        _PREQUANT_HIT_COUNT["activation_recompute"] += 1
+    else:
+        if x is None:
+            raise ValueError("BF16 x is required when no prequant activation payload is provided")
+        x_fp8, x_scales_t = quantize_and_pack_activation(x)
+    TK = x_gather_idx.shape[0]
+    K = x_fp8.shape[1]
+    x_scales_tk_e8m0 = _gather_1x32_scales_to_isa(
+        x_scales_t, x_gather_idx, int(x_fp8.shape[0]), K
+    )
+    del x_scales_t
+
+    z = blockscaled_fp8_gemm_zeromat_bf16(
+        x_fp8,
+        w1_fp8.mT,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        a_scales=x_scales_tk_e8m0,
+        b_scales=w1_scales,
+    )
+    return z
 
 
 def _get_fp8_weight_attr(
@@ -1040,6 +1091,7 @@ class _UpProjection(torch.autograd.Function):
         is_inference_mode_enabled: bool,
         use_low_precision_postact_buffer: bool = False,
         prequant_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
+        fp8_config: _FP8Config | None = None,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -1053,7 +1105,7 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             # assert not torch.compiler.is_compiling()  # Paddle compat
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
-            cfg = _get_fp8_config()
+            cfg = fp8_config if fp8_config is not None else _get_fp8_config()
             if cfg.enabled:
                 cfg.resolve_wgrad(w1.shape[0] // 2)  # w1 is (2I, H, E), I = shape[0]/2
                 global _ALIGNMENT_ASSUMED
@@ -1064,19 +1116,30 @@ class _UpProjection(torch.autograd.Function):
 
                 if aligned and cfg.fused_gated:
                     w1_fp8 = _get_fp8_weight_attr(w1, "fp8")
-                    z, y1, y1_fp8_fused, y1_scales_fused = _fused_blockscaled_gated_forward(
+                    z, y1 = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx,
-                        x_fp8_pre=prequant_activation_payload, w1_fp8_pre=w1_fp8,
+                        x_fp8_pre=prequant_activation_payload,
+                        w1_fp8_pre=w1_fp8, store_z=not cfg.recompute_z,
+                        fp8_config=cfg,
                     )
-                    if cfg.save_z_fp8 and cfg.recompute_z:
+                    if cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);
                         # we will recompute it just-in-time in DownProj.backward.
                         # Stash the args needed for that recompute so DownProj.forward
                         # can move them onto its ctx (avoids ctx-attr copy from
                         # UpProj.ctx — UpProj is a different autograd Function).
                         _PREQUANTIZED_SCALES.pop("z_fp8", None)
-                        _PREQUANTIZED_SCALES["z_fp8_recompute"] = (
-                            x, w1, expert_frequency_offset, x_gather_idx,
+                        if prequant_activation_payload is not None:
+                            _x_fp8_pre, _x_scales_pre = prequant_activation_payload
+                        else:
+                            _x_fp8_pre, _x_scales_pre = None, None
+                        x_recompute = None if _x_fp8_pre is not None else x
+                        recompute_key = (
+                            "z_fp8_recompute" if cfg.save_z_fp8 else "z_bf16_recompute"
+                        )
+                        _PREQUANTIZED_SCALES[recompute_key] = (
+                            x_recompute, w1, expert_frequency_offset, x_gather_idx,
+                            _x_fp8_pre, _x_scales_pre, w1_fp8,
                         )
                         if y1_fp8_fused is not None:
                             y1_fp8, y1_packed_scales = y1_fp8_fused, y1_scales_fused
@@ -1610,6 +1673,7 @@ class _DownProjection(torch.autograd.Function):
         activation_type: ActivationType,
         fp8_protocol: FP8Protocol | None,
         fp8_combine_grad_handle=None,
+        fp8_config: _FP8Config | None = None,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -1620,7 +1684,7 @@ class _DownProjection(torch.autograd.Function):
             # assert not torch.compiler.is_compiling()  # Paddle compat
 
             assert b2 is None
-            cfg = _get_fp8_config()
+            cfg = fp8_config if fp8_config is not None else _get_fp8_config()
             if cfg.enabled and cfg.alignment_assumed:
                 if cfg.fused_gated:
                     # Use pre-quantized y1 from _UpProjection if available
@@ -1766,10 +1830,16 @@ class _DownProjection(torch.autograd.Function):
         # Accept fp8 z when prequant cache already holds the fp8+scales pair
         # (e.g. epilogue quant produced them), even if z.dtype is no longer bf16.
         z_has_prequant = "z_fp8" in _PREQUANTIZED_SCALES
-        z_has_recompute = "z_fp8_recompute" in _PREQUANTIZED_SCALES
+        z_has_fp8_recompute = "z_fp8_recompute" in _PREQUANTIZED_SCALES
+        # BF16 recompute (precision-first default): forward stored only a zero-storage
+        # bf16 z placeholder; backward re-runs the up-proj GEMM with a BF16 D output so
+        # z is never quantized.  Independent of save_z_fp8 / the fp8 recompute path.
+        z_bf16_recompute_args = _PREQUANTIZED_SCALES.pop("z_bf16_recompute", None)
+        ctx._needs_z_bf16_recompute = z_bf16_recompute_args is not None
+        ctx._z_bf16_recompute_args = z_bf16_recompute_args
         z_is_fp8 = (cfg.enabled and use_quack_gemm and cfg.save_z_fp8
                     and cfg.alignment_assumed
-                    and (z.dtype == torch.bfloat16 or z_has_prequant or z_has_recompute))
+                    and (z.dtype == torch.bfloat16 or z_has_prequant or z_has_fp8_recompute))
         ctx._z_is_fp8 = z_is_fp8
 
         # w2 decoupling: in FP8+aligned+fused_gated mode, backward doesn't
@@ -2643,7 +2713,7 @@ def moe_TC_softmax_topk_layer(
     ), "b1 and b2 has to be None or not None at the same time!"
     _validate_runtime_precision_switches(fp8_protocol)
     # Resolve all FP8 flags once at entry — eliminates repeated os.getenv in hot path.
-    _refresh_fp8_config()
+    fp8_config = _refresh_fp8_config()
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
@@ -2716,12 +2786,13 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
         use_low_precision_postact_buffer,
+        fp8_config=fp8_config,
     )
     _log_stage_memory("forward:up-proj")
 
     if fp8_protocol is not None and _upproj_epilogue_precision() == "fp8":
         _reset_stage_memory_probe()
-        cfg = _get_fp8_config()
+        cfg = fp8_config
         if cfg.enabled and cfg.fused_gated and cfg.alignment_assumed and is_using_quack_gemm():
             # Blockscaled FP8 path: y1 was already quantized inside _UpProjection
             # (prequant cache holds fp8+scales).  Skip the adapter's quant->dequant
@@ -2783,6 +2854,7 @@ def moe_TC_softmax_topk_layer(
         False,  # is_varlen_K
         activation_type,
         fp8_protocol,
+        fp8_config=fp8_config,
     )
     _log_stage_memory("forward:down-proj-router")
 
@@ -2815,7 +2887,7 @@ def moe_general_routing_inputs(
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
     ), "b1 and b2 has to be None or not None at the same time!"
-    _refresh_fp8_config()
+    fp8_config = _refresh_fp8_config()
 
     T = x.size(0)
     TK = router_scores.size(0)
@@ -2845,6 +2917,7 @@ def moe_general_routing_inputs(
         activation_type,
         is_inference_mode_enabled,
         False,  # use_low_precision_postact_buffer
+        fp8_config=fp8_config,
     )
 
     o = _DownProjection.apply(
@@ -2865,6 +2938,7 @@ def moe_general_routing_inputs(
         True,  # is_varlen_K
         activation_type,
         None,
+        fp8_config=fp8_config,
     )
 
     return o, expert_frequency
