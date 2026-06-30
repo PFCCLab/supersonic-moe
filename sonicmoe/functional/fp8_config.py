@@ -113,10 +113,11 @@ def _use_fuse_y1_quant() -> bool:
 
 
 def _use_fuse_y1_bf16_trunc() -> bool:
-    """RNE-truncate fused y1 postact to bf16 before FP8 quant (default OFF).
+    """RNE-truncate fused y1 postact to bf16 before FP8 quant.
 
-    Python-config only: set ``SonicMoEConfig(fuse_y1_bf16_trunc=True)`` for
-    byte-parity experiments against the legacy standalone bf16-HBM y1 path.
+    Python-config only.  Defaults to tracking ``fuse_y1_quant`` (on when the
+    fused y1 quant is on, for standalone byte-parity) but can be overridden
+    independently via ``SonicMoEConfig(fuse_y1_bf16_trunc=...)``.
     """
     cfg = get_active_config()
     if cfg is not None:
