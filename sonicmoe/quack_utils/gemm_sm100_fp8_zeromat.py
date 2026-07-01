@@ -31,6 +31,7 @@ import quack.copy_utils as copy_utils
 import cuda.bindings.driver as cuda
 from cutlass import Float32, Int32, const_expr
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.layout_utils import permute_gated_Cregs_b16
 from quack.tile_scheduler import TileSchedulerOptions
@@ -719,3 +720,128 @@ def blockscaled_fp8_gemm_zeromat_quant(
         b_scale_cute,
     )
     return z_fp8_out, z_scale_out
+
+
+# ---------------------------------------------------------------------------
+# BF16 D wrapper (no quant epi) — used as a clean reference for iso32 byte-exact
+# validation against `_dual_varlen_iso32_quantize_kernel` on the same GEMM input.
+# ---------------------------------------------------------------------------
+
+
+class GemmSm100ZeroMatBf16(_GemmSm100ZeroMatMixin, GemmDefaultSm100):
+    """Bare zeromat blockscaled FP8 GEMM with BF16 D output (no quant epi).
+
+    Reference path for iso32 epi validation: produces the same GEMM
+    accumulator as `blockscaled_fp8_gemm_zeromat_iso32_quant` but writes
+    raw BF16, allowing the production `_dual_varlen_iso32_quantize_kernel`
+    to be run on the result for byte-exact comparison.
+    """
+    pass
+
+
+_zeromat_bf16_compile_cache = {}
+
+
+def blockscaled_fp8_gemm_zeromat_bf16(
+    A: Tensor,
+    B: Tensor,
+    cu_seqlens_m: Tensor,
+    A_idx: Tensor,
+    a_scales: Tensor,
+    b_scales: Tensor,
+    z_bf16_out: Optional[Tensor] = None,
+) -> Tensor:
+    """Blockscaled FP8 GEMM with BF16 D output (no quant epi).
+
+    Identical accumulation path to `blockscaled_fp8_gemm_zeromat_iso32_quant`;
+    differs only in the final D dtype (BF16 vs FP8) and skips the iso32 epi
+    quant step.  Used as the *ground-truth source tensor* for byte-exact
+    validation of the iso32 epi against `_dual_varlen_iso32_quantize_kernel`.
+    """
+    TK = A_idx.shape[0]
+    N = B.shape[-2]
+    if z_bf16_out is None:
+        z_bf16_out = torch.empty((TK, N), dtype=torch.bfloat16, device=A.device)
+
+    L, M, _, _, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
+        A, B, z_bf16_out, None, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
+    )
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
+    major_configs = {
+        "A": ("m", "k", "l"), "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"), "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    for info in tensor_infos.values():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
+
+    device_cap = get_device_capacity(A.device)
+    assert device_cap[0] == 10
+    GemmCls = GemmSm100ZeroMatBf16
+
+    tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
+    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None and name in major_configs:
+            leading_dim = 1 if info.major == major_configs[name][1] else 0
+            info.cute_tensor = _make_cute(info.tensor, leading_dim)
+
+    epi_args = GemmCls.EpilogueArguments()
+    scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
+    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+    _stream_obj = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(
+        _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
+    )
+    a_scale_cute = _make_cute(a_scales, leading_dim=1)
+    b_scale_cute = _make_cute(b_scales, leading_dim=1)
+
+    compile_key = (
+        "zeromat_bf16",
+        A.shape[-1], A.dtype,
+        tuple(B.shape), B.dtype,
+        z_bf16_out.dtype,
+        True,
+        tile_M, tile_N, cluster_M, cluster_N,
+    )
+
+    cache = _zeromat_bf16_compile_cache
+    if compile_key not in cache:
+        gemm_obj = GemmCls(
+            cutlass.Float32,
+            _TORCH_TO_CUTLASS[A.dtype],
+            (tile_M, tile_N),
+            (cluster_M, cluster_N, 1),
+            gather_A=True,
+            sf_vec_size=32,
+        )
+        cache[compile_key] = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            current_stream,
+            a_scale_cute,
+            b_scale_cute,
+        )
+    cache[compile_key](
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        current_stream,
+        a_scale_cute,
+        b_scale_cute,
+    )
+    return z_bf16_out
+
+
