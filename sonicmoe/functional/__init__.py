@@ -1116,7 +1116,7 @@ class _UpProjection(torch.autograd.Function):
 
                 if aligned and cfg.fused_gated:
                     w1_fp8 = _get_fp8_weight_attr(w1, "fp8")
-                    z, y1 = _fused_blockscaled_gated_forward(
+                    z, y1, y1_fp8_fused, y1_scales_fused = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx,
                         x_fp8_pre=prequant_activation_payload,
                         w1_fp8_pre=w1_fp8, store_z=not cfg.recompute_z,
