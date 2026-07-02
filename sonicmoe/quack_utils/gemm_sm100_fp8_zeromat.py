@@ -50,6 +50,7 @@ from ._gated_epilogues import (
     GemmDGatedMixin,
     GemmDGatedFP8CLoadMixin,
 )
+from .sm_limit import capped_max_active_clusters, clc_persistence_default, sm_cap_enabled
 
 from cutlass.utils import LayoutEnum
 
@@ -532,7 +533,7 @@ def gemm_gated_zeromat(
 
     tile_M, tile_N = 128, 128
     cluster_M, cluster_N = 1, 1
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
@@ -560,6 +561,7 @@ def gemm_gated_zeromat(
         PostAct.dtype,
         activation,
         True,  # blockscaled
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
 
     cache = _zeromat_compile_cache
@@ -571,6 +573,7 @@ def gemm_gated_zeromat(
             (cluster_M, cluster_N, 1),
             gather_A=True,
             sf_vec_size=32,
+            use_clc_persistence=clc_persistence_default(True),
         )
         cache[compile_key] = cute.compile(
             gemm_obj,
@@ -657,7 +660,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
 
     tile_M, tile_N = 128, 128
     cluster_M, cluster_N = 1, 1
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
@@ -682,6 +685,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
         tuple(B.shape), B.dtype,
         z_fp8_out.dtype,
         True,  # blockscaled
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
 
     cache = _zeromat_compile_cache
@@ -693,6 +697,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
             (cluster_M, cluster_N, 1),
             gather_A=True,
             sf_vec_size=32,
+            use_clc_persistence=clc_persistence_default(True),
         )
         cache[compile_key] = cute.compile(
             gemm_obj,
@@ -781,7 +786,7 @@ def blockscaled_fp8_gemm_zeromat_bf16(
     GemmCls = GemmSm100ZeroMatBf16
 
     tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
@@ -805,6 +810,7 @@ def blockscaled_fp8_gemm_zeromat_bf16(
         z_bf16_out.dtype,
         True,
         tile_M, tile_N, cluster_M, cluster_N,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
 
     cache = _zeromat_bf16_compile_cache
@@ -816,6 +822,7 @@ def blockscaled_fp8_gemm_zeromat_bf16(
             (cluster_M, cluster_N, 1),
             gather_A=True,
             sf_vec_size=32,
+            use_clc_persistence=clc_persistence_default(True),
         )
         cache[compile_key] = cute.compile(
             gemm_obj,

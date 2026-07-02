@@ -79,6 +79,10 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_STAGEWISE_MEMORY``. Default: False.
         swiglu_clamp_value: Optional user-controlled SwiGLU clamp value.
             Default: 0.0 (disabled).
+        gemm_num_sms: Absolute SM-count cap for all frontier CUTLASS GEMMs
+            (single knob, à la DeepGEMM ``set_num_sms``). None = use all SMs.
+            Non-None auto-switches the scheduler off Blackwell CLC onto STATIC
+            so the cap takes effect. Env: ``SONIC_MOE_GEMM_NUM_SMS``.
     """
 
     use_fp8: Optional[bool] = None
@@ -96,6 +100,7 @@ class SonicMoEConfig:
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
     swiglu_clamp_value: Optional[float] = None
+    gemm_num_sms: Optional[int] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -193,6 +198,30 @@ class SonicMoEConfig:
         if self.swiglu_clamp_value is not None:
             return max(float(self.swiglu_clamp_value), 0.0)
         return 0.0
+
+    def resolve_gemm_num_sms(self) -> Optional[int]:
+        """Global SM-count cap for all frontier CUTLASS GEMMs.
+
+        Returns an absolute upper bound on the number of SMs a persistent
+        GEMM may occupy, or ``None`` for "use all SMs" (unchanged behavior).
+        Intended for compute/communication multi-stream overlap: cap the
+        GEMM so a DeepEP/HybridEP comm kernel on another stream can claim
+        the freed SMs.  Mirrors DeepGEMM's ``set_num_sms`` single-knob API.
+
+        When non-None, the GEMM wrappers additionally switch the persistent
+        tile scheduler off the Blackwell CLC path (which ignores the SM cap)
+        onto STATIC scheduling, where the cap actually shrinks the grid.
+        Env fallback: ``SONIC_MOE_GEMM_NUM_SMS`` (int).
+        """
+        if self.gemm_num_sms is not None:
+            return int(self.gemm_num_sms)
+        raw = os.getenv("SONIC_MOE_GEMM_NUM_SMS", "").strip()
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                return None
+        return None
 
     # --- Context manager for temporary activation ----------------------------
 

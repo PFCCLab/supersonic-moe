@@ -112,6 +112,7 @@ _WEIGHT_CACHE: dict[
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
 from ..cache_manager import InstrumentedCompileCache as _ICC
+from .sm_limit import capped_max_active_clusters, clc_persistence_default, sm_cap_enabled
 _COMPILE_CACHE = _ICC("blockscaled_grouped")
 _PAD_PLAN_CACHE: dict = {}       # content-key -> plan
 # Fast-path cache: skip validation/tensor-info/compile-key on steady-state calls.
@@ -2265,7 +2266,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None, batch_idx_permute=None,
@@ -2292,6 +2293,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
         tensor_infos["A"].major, tensor_infos["B"].major,
         tensor_infos["D"].major,
         config.pingpong, _SF_VEC_SIZE,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
     compiled = _COMPILE_CACHE_VK.get(compile_key)
     if compiled is None:
@@ -2299,6 +2301,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
             Float32, tensor_infos["A"].dtype,
             tile_shape_mn, cluster_shape_mnk,
             sf_vec_size=_SF_VEC_SIZE, gather_A=False,
+            use_clc_persistence=clc_persistence_default(True),
         )
         compiled = cute.compile(
             gemm_obj,
@@ -2433,7 +2436,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k accumulate")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None, batch_idx_permute=None,
@@ -2458,6 +2461,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
         tensor_infos["A"].major, tensor_infos["B"].major,
         tensor_infos["D"].major,
         config.pingpong, _SF_VEC_SIZE,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
     compiled = _COMPILE_CACHE_VK_ACCUM.get(compile_key)
     if compiled is None:
@@ -2465,6 +2469,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
             Float32, tensor_infos["A"].dtype,
             tile_shape_mn, cluster_shape_mnk,
             sf_vec_size=_SF_VEC_SIZE, gather_A=False,
+            use_clc_persistence=clc_persistence_default(True),
         )
         compiled = cute.compile(
             gemm_obj,
@@ -2596,7 +2601,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k tma_add")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None, batch_idx_permute=None,
@@ -2621,6 +2626,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
         tensor_infos["A"].major, tensor_infos["B"].major,
         tensor_infos["D"].major,
         config.pingpong, _SF_VEC_SIZE,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
     compiled = _COMPILE_CACHE_VK_TMA_ADD.get(compile_key)
     if compiled is None:
@@ -2628,6 +2634,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
             Float32, tensor_infos["A"].dtype,
             tile_shape_mn, cluster_shape_mnk,
             sf_vec_size=_SF_VEC_SIZE, gather_A=False,
+            use_clc_persistence=clc_persistence_default(True),
         )
         compiled = cute.compile(
             gemm_obj,
@@ -2875,7 +2882,7 @@ def blockscaled_fp8_gemm_grouped(
     ):
         raise TypeError("Skipping due to unsupported FP8 blockscaled type/major combination")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
@@ -2911,6 +2918,7 @@ def blockscaled_fp8_gemm_grouped(
         config.pingpong,
         True,
         _SF_VEC_SIZE,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
     compiled = _COMPILE_CACHE.get(compile_key)
     if compiled is None:
@@ -2921,6 +2929,7 @@ def blockscaled_fp8_gemm_grouped(
             cluster_shape_mnk,
             sf_vec_size=_SF_VEC_SIZE,
             gather_A=False,
+            use_clc_persistence=clc_persistence_default(True),
         )
         compiled = cute.compile(
             gemm_obj,
@@ -4591,7 +4600,7 @@ def _run_cutlass_blockscaled_gemm(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
 
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
@@ -4631,6 +4640,7 @@ def _run_cutlass_blockscaled_gemm(
         config.pingpong,
         True,
         _SF_VEC_SIZE,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
     compiled = _COMPILE_CACHE.get(compile_key)
     if compiled is None:
@@ -4641,6 +4651,7 @@ def _run_cutlass_blockscaled_gemm(
             cluster_shape_mnk,
             sf_vec_size=_SF_VEC_SIZE,
             gather_A=False,
+            use_clc_persistence=clc_persistence_default(True),
         )
         compiled = cute.compile(
             gemm_obj,
@@ -4842,7 +4853,7 @@ def blockscaled_fp8_weight_grad_gemm(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for weight-grad GEMM")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
@@ -4873,6 +4884,7 @@ def blockscaled_fp8_weight_grad_gemm(
         config.pingpong,
         True,
         _SF_VEC_SIZE,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
     compiled = _COMPILE_CACHE.get(compile_key)
     if compiled is None:
@@ -4883,6 +4895,7 @@ def blockscaled_fp8_weight_grad_gemm(
             cluster_shape_mnk,
             sf_vec_size=_SF_VEC_SIZE,
             gather_A=False,
+            use_clc_persistence=clc_persistence_default(True),
         )
         compiled = cute.compile(
             gemm_obj,
@@ -5038,7 +5051,7 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for weight-grad GEMM")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
@@ -5067,6 +5080,7 @@ def blockscaled_fp8_weight_grad_gemm_fast(
         config.pingpong,
         True,
         _SF_VEC_SIZE,
+        sm_cap_enabled(),  # STATIC vs CLC scheduler (compile-time)
     )
     compiled = _COMPILE_CACHE.get(compile_key)
     if compiled is None:
@@ -5077,6 +5091,7 @@ def blockscaled_fp8_weight_grad_gemm_fast(
             cluster_shape_mnk,
             sf_vec_size=_SF_VEC_SIZE,
             gather_A=False,
+            use_clc_persistence=clc_persistence_default(True),
         )
         compiled = cute.compile(
             gemm_obj,

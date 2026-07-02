@@ -14,6 +14,7 @@ from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 
 from ..cache_manager import InstrumentedCompileCache as _ICC
+from .sm_limit import capped_max_active_clusters, clc_persistence_default, sm_cap_enabled
 
 
 _MAX_FAST_PATH_ENTRIES = 64
@@ -168,7 +169,7 @@ def _run_bf16_wgrad_varlen_k(
     ):
         raise TypeError("Unsupported BF16 wgrad type/major combination for varlen_k")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
@@ -198,6 +199,7 @@ def _run_bf16_wgrad_varlen_k(
         True,
         config.is_dynamic_persistent,
         config.device_capacity,
+        sm_cap_enabled(),
     )
     compiled = compile_cache.get(compile_key)
     if compiled is None:
@@ -207,7 +209,7 @@ def _run_bf16_wgrad_varlen_k(
             tile_shape_mn,
             cluster_shape_mnk,
             gather_A=True,
-            use_clc_persistence=config.is_dynamic_persistent,
+            use_clc_persistence=clc_persistence_default(config.is_dynamic_persistent),
         )
         compiled = cute.compile(
             gemm_obj,
