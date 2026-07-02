@@ -26,25 +26,28 @@ Two mechanisms, applied together at every frontier GEMM call site:
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from quack.cute_dsl_utils import get_max_active_clusters
+
+from ..config import get_active_config
 
 
 def resolve_gemm_num_sms() -> Optional[int]:
     """Active SM cap, or None (use all SMs).
 
     Priority: active ``SonicMoEConfig.gemm_num_sms`` > env
-    ``SONIC_MOE_GEMM_NUM_SMS`` > None.  The ``..config`` import is deferred to
-    call time to avoid an import-time cycle (config <-> quack_utils).
+    ``SONIC_MOE_GEMM_NUM_SMS`` > None.  ``get_active_config`` is imported at
+    module top level (mirroring ``functional/utils.py`` and
+    ``functional/fp8_config.py``); ``config`` imports nothing from
+    ``quack_utils``, so there is no cycle.  A deferred (in-function) import
+    would re-resolve the relative name at call time and, under the
+    ``paddlefleet_ops.sonicmoe`` install alias, fail to find ``sonicmoe``.
     """
-    from ..config import get_active_config
-
     cfg = get_active_config()
     if cfg is not None:
         return cfg.resolve_gemm_num_sms()
-
-    import os
 
     raw = os.getenv("SONIC_MOE_GEMM_NUM_SMS", "").strip()
     if raw:
