@@ -17,6 +17,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, mlir_namedtuple
+
+from .sm_limit import capped_max_active_clusters
 from quack.epi_ops import TileStore, EpiOp, assume_stride_divisibility
 from quack.gemm_act import GemmActMixin
 from quack.gemm_default_epi import GemmDefaultEpiMixin
@@ -198,7 +200,7 @@ def gemm_gated(
     ):
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N, persistent=persistent)
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
             leading_dim = 1 if info.major == major_configs[name][1] else 0

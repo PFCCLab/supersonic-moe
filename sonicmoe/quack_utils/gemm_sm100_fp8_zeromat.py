@@ -454,6 +454,8 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 
+from .sm_limit import capped_max_active_clusters
+
 _TORCH_TO_CUTLASS = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     _E8M0_DTYPE: cutlass.Float8E8M0FNU,
@@ -532,7 +534,7 @@ def gemm_gated_zeromat(
 
     tile_M, tile_N = 128, 128
     cluster_M, cluster_N = 1, 1
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
@@ -657,7 +659,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
 
     tile_M, tile_N = 128, 128
     cluster_M, cluster_N = 1, 1
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
@@ -781,7 +783,7 @@ def blockscaled_fp8_gemm_zeromat_bf16(
     GemmCls = GemmSm100ZeroMatBf16
 
     tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
