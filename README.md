@@ -22,7 +22,7 @@ DeepEP topk metadata
   -> FP8 down-proj
   -> FP8-C-load GemmDGated backward
   -> iso32 dz dual quant
-  -> TMA reduce-add wgrad into ERNIE/Paddle main_grad
+  -> TMA reduce-add wgrad into framework main_grad
 ```
 
 Latest reference-shape benchmark (`T=8192,H=3072,I=1536,E=8,K=8`, Target GPU, nsys GPU-projection):
@@ -228,7 +228,7 @@ for step in range(num_steps):
         out = node(x, tokens_per_expert, dispatched_indices, dispatched_probs)
         out.backward(grad)
     node.step()           # MUST run BEFORE optimizer.step():
-                          # converts native CUTLASS [E,2I,H] → ERNIE split-half
+                          # converts native CUTLASS [E,2I,H] → framework split-half
                           # [E,H,2I] in-place into expert.weight.main_grad,
                           # which the optimizer then reads.
     optimizer.step()
@@ -318,7 +318,7 @@ steady-state on iteration ≥ 2.
 |----------|-----------|:--------:|
 | **dx** (d/d hidden_states) | Paddle autograd through `_SonicMoEDeepEPFunc.backward` | cos=0.9975 |
 | **ds** (d/d dispatched_probs) | `_GatherRouterScores` PyLayer with custom Triton scatter (no CUB cascade) | cos=0.9971–0.9973 |
-| **dw1, dw2** | CUTLASS wgrad accumulates directly into the per-instance fused `[E, 2I, H]` / `[E, H, I]` native buffer (lazy-allocated on first backward); `node.step()` performs the in-place native→ERNIE split-half layout conversion into `expert.weight.main_grad` before `optimizer.step()` reads it. | cos=0.9975 / 0.9971 |
+| **dw1, dw2** | CUTLASS wgrad accumulates directly into the per-instance fused `[E, 2I, H]` / `[E, H, I]` native buffer (lazy-allocated on first backward); `node.step()` performs the in-place native→framework split-half layout conversion into `expert.weight.main_grad` before `optimizer.step()` reads it. | cos=0.9975 / 0.9971 |
 
 ### Precision (Session 65, FP8 vs BF16 gold, TMA Reduce-Add epilogue)
 

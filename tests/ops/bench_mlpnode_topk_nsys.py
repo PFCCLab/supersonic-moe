@@ -203,7 +203,7 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
     torch.cuda.nvtx.range_pop()
 
     # node.step() OUTSIDE bench loop — this is the per-optimizer-step cost
-    # (native→ERNIE wgrad layout conversion + cache invalidation)
+    # (native→ernie wgrad layout conversion + cache invalidation)
     torch.cuda.nvtx.range_push("STEP")
     step_start = torch.cuda.Event(enable_timing=True)
     step_end = torch.cuda.Event(enable_timing=True)
