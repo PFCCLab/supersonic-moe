@@ -16,8 +16,7 @@ This test:
      fused_gated) — otherwise the determinism claim is vacuous.
 
 Run:
-    source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-    cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+    source .runenv.sh
     CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 \
       python -m pytest tests/fp8_frontier_determinism_test.py -v -s --tb=short
 """

@@ -22,3 +22,7 @@ Use the repository indexes first, then open narrow targets.
 
 - `reports/fp8_upgrade/HANDOFF.md` is stale historical reference only; do not use it as the current handoff.
 - `agent.md` exists only as a compatibility alias; edit `AGENTS.md` and keep `agent.md` thin.
+
+## File path conventions
+
+- **NEVER** commit absolute paths to the repository or local system in any source file, script, or configuration. Use relative paths or environment variables instead. (e.g., `/root/paddlejob/...` is a local path and should not be committed.)

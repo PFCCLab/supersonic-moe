@@ -16,10 +16,13 @@ import csv
 import time
 import json
 
-_REPO = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe"
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
-_NSYS = "/opt/nsys/opt/nvidia/nsight-systems-cli/2026.2.1/bin/nsys"
-_PYTHON = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/python"
+_REPO = os.environ.get(
+    "SONIC_MOE_REPO",
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+)
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
+_NSYS = os.environ.get("SONIC_MOE_NSYS", "nsys")
+_PYTHON = os.environ.get("SONIC_MOE_PADDLE_PYTHON", sys.executable)
 
 TOPK = 8
 N_WARMUP = 12

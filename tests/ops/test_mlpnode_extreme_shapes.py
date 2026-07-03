@@ -24,7 +24,7 @@ import os
 import sys
 import math
 
-venv = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv"
+venv = os.environ.get("SONIC_MOE_PADDLE_VENV", sys.prefix)
 python_bin = os.path.join(venv, "bin", "python")
 if os.path.realpath(sys.prefix) != os.path.realpath(venv):
     print("Switch venv:", venv)
@@ -35,10 +35,10 @@ os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
 os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
 
-_REPO = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe"
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_REPO = os.environ.get("SONIC_MOE_REPO", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 import pytest

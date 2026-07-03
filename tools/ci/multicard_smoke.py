@@ -23,10 +23,9 @@ print(f"[pre-import] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES'
       f"PADDLE_LOCAL_RANK={os.environ.get('PADDLE_LOCAL_RANK')!r} "
       f"FLAGS_selected_gpus={os.environ.get('FLAGS_selected_gpus')!r}", flush=True)
 
-# Some Python interpreters (e.g. /usr/local/bin/python in this image) do not
-# have quack on the import path; sonicmoe imports it eagerly. Inject the same
-# location every other tests/ops/* benchmark uses.
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+# Some Python interpreters do not have quack on the import path; allow callers
+# to point at an external checkout.
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 if os.path.isdir(_QUACK) and _QUACK not in sys.path:
     sys.path.insert(0, _QUACK)
 

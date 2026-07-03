@@ -24,12 +24,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-REPO = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe")
-QUACK = REPO / "third_party/quack"
-NSYS = "/usr/local/bin/nsys"
-PYTHON = "/usr/local/bin/python"
+REPO = Path(os.environ.get("SONIC_MOE_REPO", Path(__file__).resolve().parents[1])).resolve()
+QUACK = Path(os.environ.get("SONIC_MOE_QUACK_PATH", REPO / "third_party/quack"))
+NSYS = os.environ.get("SONIC_MOE_NSYS", "nsys")
+PYTHON = os.environ.get("SONIC_MOE_PADDLE_PYTHON", sys.executable)
 BENCH = REPO / "tests/ops/bench_mlpnode_topk_nsys.py"
-OUT_ROOT = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+OUT_ROOT = Path(os.environ.get("SONIC_MOE_NSYS_OUTPUT_DIR", REPO / "reports" / "nsys"))
 
 
 @dataclass

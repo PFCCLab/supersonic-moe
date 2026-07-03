@@ -52,12 +52,9 @@ def _run_subprocess(body: str, cache_dir: Path, *, env_extra=None) -> tuple[int,
     env = os.environ.copy()
     env["SONIC_MOE_CACHE_DIR"] = str(cache_dir)
     env.setdefault("CUDA_VISIBLE_DEVICES", env.get("CUDA_VISIBLE_DEVICES", "0"))
-    # quack lives outside the importing interpreter's site-packages on this
-    # host; tests/ops/* benches inject it via sys.path.insert. Mirror that
-    # for every JIT-bench subprocess so /usr/local/bin/python (no quack
-    # installed) can still import sonicmoe.
-    _QUACK = ("/root/paddlejob/share-storage/gpfs/system-public/"
-              "zhangyichen/sonicmoe_for_ernie/quack")
+    # Allow an external quack checkout when the importing interpreter does not
+    # already provide it.
+    _QUACK = env.get("SONIC_MOE_QUACK_PATH", "")
     if os.path.isdir(_QUACK):
         prev = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = (

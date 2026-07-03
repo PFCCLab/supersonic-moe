@@ -25,7 +25,7 @@
 | `bench_frontier_perf.py` | Session 62 FP8 frontier comprehensive benchmark. | — |
 | `bench_gemm_dynamic_ab.py` | A/B experiment: compare per-call GEMM latency with/without mark_layout_dynamic. | — |
 | `bench_iso32_quant_nsys.py` | Perf microbench: iso32 vs 1×32 weight blockscaled-FP8 quant kernel. | — |
-| `bench_mlpnode_mem.py` | SonicMoEMlpNode 单次前反向显存基准 用法: CUDA_VISIBLE_DEVICES=0 python tests/ops/bench_mlpnode_mem.py 配置（默认值对应 ERNIE 真实业务规格）: H=3072 I=1536 K=8 E_LOCAL=8 EP_SIZE=32 SEQ_LEN=16384 精度策略： - 前向/…. | — |
+| `bench_mlpnode_mem.py` | SonicMoEMlpNode 单次前反向显存基准 用法: CUDA_VISIBLE_DEVICES=0 python tests/ops/bench_mlpnode_mem.py 配置: H=3072 I=1536 K=8 E_LOCAL=8 EP_SIZE=32 SEQ_LEN=16384 精度策略： - 前向/…. | — |
 | `bench_mlpnode_topk_nsys.py` | nsys GPU-projection benchmark for SonicMoEMlpNode topk path. | — |
 | `bench_static_vs_dynamic_gemm.py` | A/B experiment: dynamic vs static compile_key for CuTe GEMM. | — |
 | `bench_user_shape_fwd_nsys.py` | Session 69 — reproduce user shape & profile sonic-meta routing region. | — |

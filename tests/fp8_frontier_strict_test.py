@@ -4,8 +4,7 @@ Uses E=8, K=8 shapes so tokens_per_expert = T (guaranteed 128-aligned).
 This ensures the full fused-gated + zero-mat CUTLASS path is exercised.
 
 Run:
-    source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-    cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+    source .runenv.sh
     CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
       python -m pytest tests/fp8_frontier_strict_test.py -v -s --tb=short
 """

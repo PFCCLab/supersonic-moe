@@ -42,7 +42,7 @@ import os
 import sys
 import time
 
-_REPO = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe"
+_REPO = os.environ.get("SONIC_MOE_REPO", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 

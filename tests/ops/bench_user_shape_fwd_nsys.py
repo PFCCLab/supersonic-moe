@@ -2,7 +2,7 @@
 """Session 69 — reproduce user shape & profile sonic-meta routing region.
 
 Shape: H=1024 I=1024 K=16 E_LOCAL=96 EP_SIZE=8 SEQ_LEN=16384
-(matches /root/paddlejob/share-storage/gpfs/system-public/liangshuhao/supersonic-moe/tests/ops/bench_mlpnode_mem.py)
+(matches tests/ops/bench_mlpnode_mem.py)
 
 Generates routing identical in distribution to user's `make_inputs` but built
 on-GPU in O(NK) instead of a Python loop.
@@ -20,9 +20,9 @@ os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
 os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 

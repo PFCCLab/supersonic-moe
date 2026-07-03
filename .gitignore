@@ -246,3 +246,4 @@ core
 # Local docs
 docs/
 reports/
+.claude/settings.local.json

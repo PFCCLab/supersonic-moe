@@ -85,7 +85,9 @@ DEFAULT_PRECISION_SEEDS = [42, 123, 456, 789, 1024]
 DEFAULT_BENCH_REPEATS = 3
 DEFAULT_NSYS_WARMUP = 5
 DEFAULT_NSYS_ITERS = 20
-PERSISTENT_TMP_ROOT = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu")
+PERSISTENT_TMP_ROOT = Path(
+    os.environ.get("SONIC_MOE_PERSISTENT_TMP_ROOT", str(ROOT / "reports" / "tmp"))
+)
 
 # ── Grid benchmark: 3T × 3E × 3I = 27 shapes ──────────────────────────────
 GRID_T = [8192, 16384, 32768]
@@ -97,9 +99,7 @@ GRID_K = 8     # fixed topK
 # Python binary resolution: prefer the virtualenv that has quack/sonicmoe,
 # fall back to sys.executable.  The old hardcoded xfer path is kept as the
 # first candidate but is no longer a hard requirement.
-_XFER_PYTHON = Path(
-    "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python"
-)
+_XFER_PYTHON = Path(os.environ.get("SONIC_MOE_XFER_PYTHON", sys.executable))
 
 
 def _resolve_python_bin() -> str:
@@ -1799,7 +1799,9 @@ def run_nsys_profile(
         shapes = [SHAPE]
 
     # Persistent output directory for nsys-rep files (user-inspectable)
-    nsys_output_dir = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+    nsys_output_dir = Path(
+        os.environ.get("SONIC_MOE_NSYS_OUTPUT_DIR", str(ROOT / "reports" / "nsys"))
+    )
     nsys_output_dir.mkdir(parents=True, exist_ok=True)
 
     results: dict[str, Any] = {"shapes": {}}
@@ -3502,13 +3504,11 @@ def run(
     # ── report mode: comprehensive per-kernel + memory + precision + autograd ──
     if mode == "report":
         shapes = nsys_shapes or [SHAPE]
-        official_python = str(Path(
-            "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/official_bf16/bin/python"
-        ))
-        official_root = str(Path(
-            "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/official/sonic-moe"
-        ))
-        nsys_output_dir = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+        official_python = os.environ.get("SONIC_MOE_OFFICIAL_BF16_PYTHON", sys.executable)
+        official_root = os.environ.get("SONIC_MOE_OFFICIAL_REPO", str(ROOT))
+        nsys_output_dir = Path(
+            os.environ.get("SONIC_MOE_NSYS_OUTPUT_DIR", str(ROOT / "reports" / "nsys"))
+        )
         nsys_output_dir.mkdir(parents=True, exist_ok=True)
 
         all_reports = {"metadata": metadata, "shapes": {}}
@@ -4238,7 +4238,9 @@ print("NSYS_DONE")
 ''').format(root=str(ROOT), gpu=str(gpu), warmup=nsys_warmup, iters=nsys_iters, **shape)
 
     python_bin = _resolve_python_bin()
-    nsys_output_dir = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+    nsys_output_dir = Path(
+        os.environ.get("SONIC_MOE_NSYS_OUTPUT_DIR", str(ROOT / "reports" / "nsys"))
+    )
     nsys_output_dir.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%H%M%S")
     rep_name = f"fp8pad_{shape_key}_{ts}"

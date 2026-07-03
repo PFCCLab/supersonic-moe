@@ -26,9 +26,9 @@ os.environ.setdefault("USE_QUACK_GEMM", "1")
 os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 E, H, I = 8, 3072, 1536
@@ -325,9 +325,9 @@ def main():
     nsys_us = None
     if args.nsys:
         _print(f"\n[Phase 5] nsys GPU-projection (N=8192, 12 iters)...")
-        nsys_dir = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys"
+        nsys_dir = os.environ.get("SONIC_MOE_NSYS_OUTPUT_DIR", os.path.join(_REPO, "reports", "nsys"))
         os.makedirs(nsys_dir, exist_ok=True)
-        nsys_out = f"{nsys_dir}/s62_coldstart_verified"
+        nsys_out = os.path.join(nsys_dir, "s62_coldstart_verified")
         env = os.environ.copy()
         cmd = (f"nsys profile --trace=cuda,nvtx --sample=none --backtrace=none "
                f"--resolve-symbols=false --export=sqlite "

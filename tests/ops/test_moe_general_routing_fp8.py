@@ -45,10 +45,10 @@ os.environ.setdefault("USE_QUACK_GEMM", "1")
 # This is safe when padding always guarantees 128-alignment (which prepare_sonic_inputs does).
 os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
 
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
-_REPO  = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe"
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
+_REPO = os.environ.get("SONIC_MOE_REPO", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 import paddle

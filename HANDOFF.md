@@ -164,7 +164,7 @@ Read these before changing the frontier:
 | 9 | `sonicmoe/quack_utils/gemm_gated.py` | fused gated GEMM + epilogue blockscaled quant |
 | 10 | `sonicmoe/quack_utils/gemm_dgated.py` | FP8 C-load dGated backward |
 | 11 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | quant kernels, iso32, TMA reduce-add, FP8 GEMM wrappers |
-| 12 | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` | machine, proxy, ncu lock reset, profiling methodology |
+| 12 | private env-notes file (`SONIC_MOE_ENV_NOTES`) | machine, proxy, ncu lock reset, profiling methodology |
 
 Historical but non-authoritative:
 

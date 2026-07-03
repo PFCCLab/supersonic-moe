@@ -53,16 +53,10 @@ import numpy as np
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
-ERNIE_ROOT = (
-    "/root/paddlejob/share-storage/gpfs/system-public/liangshuhao/"
-    "erniebot_test_speed/third_party/ernie-core/src"
-)
+ERNIE_ROOT = os.environ.get("ERNIE_CORE_PATH", "")
 
-SYSTEM_PYTHON = "/bin/python3"  # Python 3.10 with paddle
-XFER_PYTHON = (
-    "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/"
-    "envs/xfer/bin/python"
-)
+SYSTEM_PYTHON = os.environ.get("SONIC_MOE_SYSTEM_PYTHON", sys.executable)
+XFER_PYTHON = os.environ.get("SONIC_MOE_XFER_PYTHON", sys.executable)
 
 NSYS_BIN = shutil.which("nsys") or "/usr/local/bin/nsys"
 
@@ -88,9 +82,9 @@ NSYS_REPEATS = 3        # repeat nsys profiling, report median
 SEEDS = [42, 123, 777]  # repeated measurements for precision
 
 # Target GPU hardware constants (for theoretical analysis)
-Target GPU_FP8_TFLOPS = 4500       # E4M3 tensor-core peak (TFLOPS)
-Target GPU_BF16_TFLOPS = 2250      # BF16 tensor-core peak (TFLOPS)
-Target GPU_HBM_BW_GBPS = 8000      # HBM3e bandwidth (GB/s)
+TARGET_GPU_FP8_TFLOPS = 4500       # E4M3 tensor-core peak (TFLOPS)
+TARGET_GPU_BF16_TFLOPS = 2250      # BF16 tensor-core peak (TFLOPS)
+TARGET_GPU_HBM_BW_GBPS = 8000      # HBM3e bandwidth (GB/s)
 
 # ── Path registry ─────────────────────────────────────────────────────────────
 PATH_NAMES = ["paddle_bf16", "paddle_fp8", "sonic_bf16", "sonic_fp8"]
@@ -255,10 +249,10 @@ def compute_theory(shape: dict) -> dict:
     total_bytes_fp8 = act_bytes_bf16 // 2 + weight_bytes_bf16 // 2  # rough
 
     # Roofline bounds
-    bf16_compute_us = flops_total / (Target GPU_BF16_TFLOPS * 1e6)
-    fp8_compute_us = flops_total / (Target GPU_FP8_TFLOPS * 1e6)
-    bf16_mem_us = total_bytes_bf16 / (Target GPU_HBM_BW_GBPS * 1e3)
-    fp8_mem_us = total_bytes_fp8 / (Target GPU_HBM_BW_GBPS * 1e3)
+    bf16_compute_us = flops_total / (TARGET_GPU_BF16_TFLOPS * 1e6)
+    fp8_compute_us = flops_total / (TARGET_GPU_FP8_TFLOPS * 1e6)
+    bf16_mem_us = total_bytes_bf16 / (TARGET_GPU_HBM_BW_GBPS * 1e3)
+    fp8_mem_us = total_bytes_fp8 / (TARGET_GPU_HBM_BW_GBPS * 1e3)
 
     return {
         "TK": TK,
@@ -925,9 +919,9 @@ def generate_report(results: dict, report_path: str) -> None:
     # ── 5. Theoretical Analysis ──
     L.append("## 5. Theoretical Analysis\n")
     L.append("### Roofline Model (Target GPU)\n")
-    L.append(f"- BF16 tensor-core peak: {Target GPU_BF16_TFLOPS} TFLOPS")
-    L.append(f"- FP8 tensor-core peak: {Target GPU_FP8_TFLOPS} TFLOPS")
-    L.append(f"- HBM3e bandwidth: {Target GPU_HBM_BW_GBPS} GB/s\n")
+    L.append(f"- BF16 tensor-core peak: {TARGET_GPU_BF16_TFLOPS} TFLOPS")
+    L.append(f"- FP8 tensor-core peak: {TARGET_GPU_FP8_TFLOPS} TFLOPS")
+    L.append(f"- HBM3e bandwidth: {TARGET_GPU_HBM_BW_GBPS} GB/s\n")
     L.append("| Shape | FLOPs (G) | AI (BF16) | AI (FP8) | Compute Bound BF16 (us) | Compute Bound FP8 (us) | Mem Bound BF16 (us) |")
     L.append("|-------|--------:|------:|-----:|----------:|----------:|----------:|")
     for sl in results:
