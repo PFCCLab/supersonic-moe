@@ -15,7 +15,7 @@
 | --- | --- | --- |
 | `cli/` | Directory for cli. | — |
 | `count_cumsum/` | CUDA extension for count / cumsum helpers used by routing code. | — |
-| `ernie_compat/` | Directory for ernie compat. | — |
+| `ernie_compat/` | Paddle compatibility entrypoints and DeepEP metadata conversion helpers. | — |
 | `functional/` | Core forward and backward orchestration, routing helpers, and FP8 protocol flow. | — |
 | `include/` | C/C++ headers shared by compiled extensions. | — |
 | `quack_utils/` | QuACK / CUTLASS / Triton utilities for BF16 and FP8 GEMM paths. | — |

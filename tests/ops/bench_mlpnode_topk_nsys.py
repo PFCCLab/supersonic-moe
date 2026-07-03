@@ -21,7 +21,7 @@ Usage:
         /tmp/mlpnode_topk.nsys-rep
     python tests/ops/bench_mlpnode_topk_nsys.py --extract /tmp/mlpnode_topk.sqlite --iters 12
 
-README baseline (Session 53, PyTorch native, Ernie shape T=8192 E=8 I=1536):
+README baseline (Session 53, PyTorch native, reference shape T=8192 E=8 I=1536):
     BF16: 3644 µs/iter    FP8: 2715 µs/iter    Speedup: 1.34×
 """
 
@@ -55,9 +55,9 @@ else:
     os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 
@@ -231,11 +231,11 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--T", type=int, default=8192,
-                        help="N_recv tokens (Ernie shape: 8192)")
+                        help="N_recv tokens (reference shape: 8192)")
     parser.add_argument("--E", type=int, default=8)
     parser.add_argument("--I", type=int, default=1536)
     parser.add_argument("--H", type=int, default=3072,
-                        help="Hidden size (Ernie shape: 3072)")
+                        help="Hidden size (reference shape: 3072)")
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--iters", type=int, default=12)

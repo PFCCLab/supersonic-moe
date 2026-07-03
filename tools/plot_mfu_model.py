@@ -78,7 +78,7 @@ def plot_mfu_vs_tk(data, ax):
     TK_line = np.logspace(3.9, 6.9, 300)
 
     configs = [
-        (8, 3072, 1536, '#1f77b4', 'o', 'E=8 H=3072 I=1536 (Ernie)'),
+        (8, 3072, 1536, '#1f77b4', 'o', 'E=8 H=3072 I=1536 (reference)'),
         (8, 4096, 2048, '#2ca02c', 's', 'E=8 H=4096 I=2048 (Qwen3)'),
         (8, 4096, 4096, '#ff7f0e', '^', 'E=8 H=4096 I=4096 (peak)'),
         (8, 6144, 3072, '#d62728', 'D', 'E=8 H=6144 I=3072 (70B)'),
@@ -105,7 +105,7 @@ def plot_mfu_vs_tk(data, ax):
 
     # Annotations
     ax.axvspan(40000, 200000, alpha=0.06, color='#2ecc71', zorder=1)
-    ax.text(85000, 2, 'Ernie optimal', fontsize=8, color='#27ae60', ha='center', style='italic')
+    ax.text(85000, 2, 'reference optimal', fontsize=8, color='#27ae60', ha='center', style='italic')
     ax.text(5e6, 48, 'L2 thrashing →', fontsize=8, color='gray', style='italic')
 
     ax.set_xlabel('TK (token-expert pairs)', fontsize=11)
@@ -170,12 +170,12 @@ def main():
     print(f"Loaded {len(data)} data points")
 
     # Verify model
-    proj_ernie = gpu_proj_us(65536, 3072, 1536, 8)
-    mfu_ernie = mfu_pct(65536, 3072, 1536, 8)
-    print(f"Model check (Ernie): proj={proj_ernie:.0f}µs, MFU={mfu_ernie:.1f}% (measured: 2715µs, 45.6%)")
+    proj_reference = gpu_proj_us(65536, 3072, 1536, 8)
+    mfu_reference = mfu_pct(65536, 3072, 1536, 8)
+    print(f"Model check (reference): proj={proj_reference:.0f}µs, MFU={mfu_reference:.1f}% (measured: 2715µs, 45.6%)")
 
     # ═══ Figure: 3×2 grid ═══
-    # Top row: Ernie shape (H=3072, I=1536) — curve + contour
+    # Top row: reference shape (H=3072, I=1536) — curve + contour
     # Middle/Bottom rows: other HI configs
     fig, axes = plt.subplots(3, 2, figsize=(16, 18))
 
@@ -310,7 +310,7 @@ def main():
     plt.savefig(path1, dpi=150, bbox_inches='tight')
     print(f"Saved: {path1}")
 
-    # Also save standalone contour (Ernie only)
+    # Also save standalone contour (reference only)
     fig2, ax2 = plt.subplots(1, 1, figsize=(12, 7))
     E_fine = np.linspace(8, 128, 60)
     TK_fine = np.logspace(4, 6.85, 60)
@@ -336,7 +336,7 @@ def main():
                edgecolors='white', lw=1, zorder=7, vmin=5, vmax=47)
     ax2.set_xlabel('log₁₀(TK)', fontsize=12)
     ax2.set_ylabel('E (experts)', fontsize=12)
-    ax2.set_title('MFU Contour + TK* (Ernie: H=3072, I=1536)', fontsize=13)
+    ax2.set_title('MFU Contour + TK* (Reference: H=3072, I=1536)', fontsize=13)
     ax2.set_yticks([8, 16, 32, 64, 128])
     ax2.legend(loc='upper left', fontsize=11)
     plt.tight_layout()

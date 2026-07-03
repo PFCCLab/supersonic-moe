@@ -1,7 +1,9 @@
 #!/bin/bash
 set -e
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/.runenv.sh
-cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+source "$PROJECT_ROOT/.runenv.sh"
+cd "$PROJECT_ROOT"
 
 echo "=== SonicMoE Full CI Regression Suite ==="
 echo "Date: $(date)"

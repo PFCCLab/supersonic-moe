@@ -12,7 +12,7 @@ Usage:
 import argparse, collections, json, os, sqlite3, subprocess, sys, tempfile, time, textwrap
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Workload template (runs inside nsys subprocess)

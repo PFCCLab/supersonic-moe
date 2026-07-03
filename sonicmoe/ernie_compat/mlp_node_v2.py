@@ -421,7 +421,7 @@ class SonicMoEMlpNode:
       * ``dx`` flows back through Paddle autograd (no detach).
       * ``dw1`` / ``dw2`` accumulate into per-expert ``main_grad`` via a
         native-layout view of a per-instance fp32 buffer; layout is
-        converted in-place to ERNIE format on ``step()``.
+        converted in-place to ERNIE layout on ``step()``.
       * ``ds`` flows back through Paddle autograd.
 
     Performance properties:

@@ -4,9 +4,9 @@ Tests the full MoE forward/backward pipeline:
   permute -> up-gate projection -> SwiGLU -> down projection -> unpermute
 
 Validates SonicMoE BF16 and FP8 paths against a pure-torch float32 gold reference
-that uses ERNIE-core's split-half SwiGLU convention.
+that uses the ERNIE split-half SwiGLU convention.
 
-Weight conversion between split-half (ERNIE) and interleaved (SonicMoE) is verified
+Weight conversion between split-half and interleaved (SonicMoE) is verified
 explicitly.
 """
 import paddle
@@ -69,7 +69,7 @@ FP8_DW_RRMSE = 0.15
 def split_to_interleaved(w_split: torch.Tensor) -> torch.Tensor:
     """Convert split-half (2I, H) -> interleaved (2I, H).
 
-    Split-half (ERNIE):      [gate_0..gate_{I-1}, up_0..up_{I-1}]
+    Split-half:              [gate_0..gate_{I-1}, up_0..up_{I-1}]
     Interleaved (SonicMoE):  [gate_0, up_0, gate_1, up_1, ...]
     """
     two_I = w_split.shape[0]
@@ -167,7 +167,7 @@ def _torch_moe_gold(
     topk_indices: torch.Tensor,  # (T, K) int32
     topk_scores: torch.Tensor,  # (T, K) float32
 ) -> torch.Tensor:
-    """Full MoE forward in float32 using split-half SwiGLU (ERNIE convention).
+    """Full MoE forward in float32 using split-half SwiGLU (split-half convention).
 
     Pipeline:
       1. Compute routing metadata (cu_seqlens, x_gather_idx, s_reverse_scatter_idx)
@@ -581,7 +581,7 @@ def _make_test_data(T, H, I, E, K, seed, device="cuda"):
 
     Returns:
         x: (T, H) bf16
-        w1_split: (E, 2I, H) float32 — split-half (ERNIE convention)
+        w1_split: (E, 2I, H) float32 — split-half (split-half convention)
         w2: (E, H, I) float32
         topk_indices: (T, K) int32
         topk_scores: (T, K) float32
@@ -859,12 +859,12 @@ def test_sonicmoe_bf16_vs_fp8(T, H, I, E, K, seed):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Test 5: ERNIE split-half SwiGLU vs Gold (validates weight conversion)
+# Test 5: split-half SwiGLU vs Gold (validates weight conversion)
 # ═══════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.parametrize("T, H, I, E, K", MOE_SHAPES)
 @pytest.mark.parametrize("seed", SEEDS, ids=[f"seed{s}" for s in SEEDS])
-def test_ernie_split_half_vs_gold(T, H, I, E, K, seed):
+def test_split_half_vs_gold(T, H, I, E, K, seed):
     """Verify split-half SwiGLU torch implementation matches gold exactly.
 
     Also validates round-trip weight conversion:

@@ -132,11 +132,11 @@ def main():
     print(f"")
     print(f"  MFU asymptote (TK→∞, fixed H,I,E):")
     print(f"  lim MFU = 1 / (1/{eta_max:.4f} + peak*a_quant*max(H,2I)/(18*H*I) + peak*a_expert*E/(18*H*I))")
-    # Calculate for Ernie shape
+    # Calculate for reference shape
     H_e, I_e, E_e = 3072, 1536, 8
     mfu_lim = 1.0 / (1.0/eta_max + PEAK_FP8*1e6*a_quant*1e-9*max(H_e,2*I_e)/(18*H_e*I_e)
                       + PEAK_FP8*1e6*a_expert*1e-6*E_e/(18*H_e*I_e))
-    print(f"  Ernie (H=3072,I=1536,E=8): MFU_∞ = {mfu_lim*100:.1f}%")
+    print(f"  Reference (H=3072,I=1536,E=8): MFU_∞ = {mfu_lim*100:.1f}%")
     H_w, I_w, E_w = 6144, 2048, 8
     mfu_lim_w = 1.0 / (1.0/eta_max + PEAK_FP8*1e6*a_quant*1e-9*max(H_w,2*I_w)/(18*H_w*I_w)
                         + PEAK_FP8*1e6*a_expert*1e-6*E_w/(18*H_w*I_w))

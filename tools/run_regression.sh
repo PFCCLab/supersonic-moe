@@ -1,7 +1,11 @@
 #!/bin/bash
 set -e
-cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+cd "$PROJECT_ROOT"
+if [[ -n "${SONIC_MOE_XFER_VENV:-}" ]]; then
+  source "$SONIC_MOE_XFER_VENV/bin/activate"
+fi
 export USE_QUACK_GEMM=1
 export SONIC_MOE_FP8_MODE=perf
 

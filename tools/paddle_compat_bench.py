@@ -33,14 +33,8 @@ ROOT = Path(__file__).resolve().parent.parent
 REPORT_DIR = ROOT / "reports" / "paddle_compat_bench"
 
 # ── Environment ───────────────────────────────────────────────────────────────
-EB_VENV_PYTHON = (
-    "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/"
-    "erniebot/eb_venv/bin/python"
-)
-QUACK_PATH = (
-    "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/"
-    "sonicmoe_for_ernie/quack"
-)
+EB_VENV_PYTHON = os.environ.get("SONIC_MOE_PADDLE_PYTHON", sys.executable)
+QUACK_PATH = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 NSYS_BIN = shutil.which("nsys") or "/usr/local/bin/nsys"
 
 SHAPES = {

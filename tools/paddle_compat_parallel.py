@@ -19,8 +19,8 @@ import json, os, shutil, sqlite3, subprocess, sys, tempfile, textwrap, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EB_PY = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/python"
-QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+PADDLE_PY = os.environ.get("SONIC_MOE_PADDLE_PYTHON", sys.executable)
+QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 NSYS = shutil.which("nsys") or "/usr/local/bin/nsys"
 REPORT_DIR = ROOT / "reports" / "paddle_compat"
 BASELINE_PATH = ROOT / "reports" / "grid_session53" / "session53_grid_full.json"
@@ -124,7 +124,9 @@ def _env(gpu):
     e = os.environ.copy()
     e["CUDA_VISIBLE_DEVICES"] = str(gpu)
     e["USE_QUACK_GEMM"] = "1"
-    e["PYTHONPATH"] = f"{QUACK}:{ROOT}"
+    e["PYTHONPATH"] = os.pathsep.join(
+        str(p) for p in (QUACK, ROOT, e.get("PYTHONPATH", "")) if p
+    )
     return e
 
 def run_prec(gpu, shape, fp8):
@@ -134,7 +136,7 @@ def run_prec(gpu, shape, fp8):
     script = WORKER.format(fp8_env=fp8_env, root=str(ROOT), mode="precision",
                            use_fp8=fp8, warmup=2, iters=0, **shape)
     t0 = time.time()
-    r = subprocess.run([EB_PY, "-c", script], capture_output=True, text=True,
+    r = subprocess.run([PADDLE_PY, "-c", script], capture_output=True, text=True,
                        env=_env(gpu), timeout=600)
     elapsed = time.time() - t0
     if r.returncode != 0:
@@ -159,7 +161,7 @@ def run_nsys_one(gpu, shape, fp8, rep):
     t0 = time.time()
     try:
         cmd = [NSYS, "profile", "--capture-range=cudaProfilerApi", "--capture-range-end=stop",
-               f"--output={prefix}", "--export=sqlite", "--force-overwrite=true", EB_PY, sf.name]
+               f"--output={prefix}", "--export=sqlite", "--force-overwrite=true", PADDLE_PY, sf.name]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=_env(gpu))
         elapsed = time.time() - t0
         os.unlink(sf.name)

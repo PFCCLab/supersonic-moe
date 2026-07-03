@@ -1,6 +1,6 @@
 """Inline audit: monkey-patch backward to print tensor inventory at dgated completion."""
 import sys, os, gc, torch
-sys.path.insert(0, "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe")
+sys.path.insert(0, os.environ.get("SONIC_MOE_REPO", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 os.environ["USE_QUACK_GEMM"] = "1"
 os.environ["SONIC_MOE_FP8_MODE"] = "perf"
 torch.manual_seed(42)

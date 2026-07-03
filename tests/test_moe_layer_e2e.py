@@ -358,7 +358,7 @@ class MoELayer(paddle.nn.Layer):
         # Paddle expects None (for stop_gradient=True metadata tensors),
         # causing: "backward should return None at position N because forward
         # Tensor's stopgradient is true" → ValueError / core dump.
-        # This matches ERNIE/DeepSeek design: router grad flows via aux_loss,
+        # This matches the router-grad design: router grad flows via aux_loss,
         # not through expert output.
         with paddle.no_grad():
             (

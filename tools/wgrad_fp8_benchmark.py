@@ -254,7 +254,7 @@ def benchmark_wgrad(T, H, I, E, K, repeats=20):
 def main():
     shapes = [
         # (T, H, I, E, K)
-        (8192, 3072, 1536, 8, 8),   # Ernie shape
+        (8192, 3072, 1536, 8, 8),   # reference shape
         (8192, 3072, 2048, 8, 8),   # I=2048 shape
         (4096, 3072, 1536, 8, 8),   # Smaller T
         (8192, 4096, 2048, 8, 8),   # Larger H+I

@@ -22,3 +22,8 @@ Use the repository indexes first, then open narrow targets.
 
 - `reports/fp8_upgrade/HANDOFF.md` is stale historical reference only; do not use it as the current handoff.
 - `agent.md` exists only as a compatibility alias; edit `AGENTS.md` and keep `agent.md` thin.
+
+## Confidentiality conventions
+
+- **NEVER** commit absolute paths to the repository or local system in any source file, script, or configuration. Use relative paths or environment variables instead. (e.g., `/root/paddlejob/...` is a local path and should not be committed.)
+- **NEVER** commit ERNIE-related business descriptions, production labels, private workload names, or private deployment context. Search keywords such as `ERNIE`, `ernie`, `ernie-core`, and `erniebot` as review signals, but this is not a blanket keyword ban: existing technical identifiers and compatibility-layer descriptions may keep saying ERNIE when that is the accurate technical contract. Use neutral terms such as reference shape or production-like workload for private workload descriptions.

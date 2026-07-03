@@ -4,7 +4,7 @@
 用法:
     CUDA_VISIBLE_DEVICES=0 python tests/ops/bench_mlpnode_mem.py
 
-配置（默认值对应 ERNIE 真实业务规格）:
+配置（默认值对应生产样例规格）:
     H=3072  I=1536  K=8  E_LOCAL=8  EP_SIZE=32  SEQ_LEN=16384
 
 精度策略：
@@ -16,7 +16,7 @@ import os
 import sys
 
 # ── 自动切换到 eb_venv ───────────────────────────────────────────────────────
-_VENV = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv"
+_VENV = os.environ.get("SONIC_MOE_PADDLE_VENV", sys.prefix)
 if os.path.realpath(sys.prefix) != os.path.realpath(_VENV):
     print(f"\033[33mSwitch venv: {_VENV}\033[0m")
     os.execv(f"{_VENV}/bin/python", [f"{_VENV}/bin/python", *sys.argv])
@@ -26,11 +26,10 @@ os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
 os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
 
-# _REPO = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe"
-_REPO = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe"
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 import math
@@ -109,7 +108,7 @@ def make_inputs(n_experts, hidden_size, topk, ep_size, seq_len):
     return x, dispatched_indices, dispatched_probs, tokens_per_expert
 
 
-# ── MockExpert（最小专家模块，对齐 ERNIE per-expert 参数结构）────────────────
+# ── MockExpert（最小专家模块，对齐 split-half per-expert 参数结构）────────────────
 class MockExpert:
     """提供 up_gate_proj.weight [H, 2I] 和 down_proj.weight [I, H]。"""
     def __init__(self, h: int, i: int, seed: int):
@@ -283,4 +282,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

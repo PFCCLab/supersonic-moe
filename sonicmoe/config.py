@@ -139,7 +139,7 @@ class SonicMoEConfig:
         re-runs the up-proj GEMM (gather-A + epilogue blockscaled fp8
         quant) just-in-time and discards the recomputed y1 (SwiGLU /
         PostAct write are wasted, ~5-15% of an up-proj fwd cost).
-        Saves ~213 MiB peak (fp8 z) per active layer at ERNIE shape.
+        Saves ~213 MiB peak (fp8 z) per active layer at reference shape.
         Implies save_z_fp8=True semantically.
         """
         if self.recompute_z is not None:

@@ -27,7 +27,7 @@ Hardware/method: Target GPU SM100 (`SM100`, 148 SMs, HBM3e), nsys GPU-projection
 | `T=1024,H=3072,I=1536,E=8,K=8` | 566.0 µs | 27.32% | 1229 | `reports/fresh_benchmark_ws1/` |
 | `T=2048,H=3072,I=1536,E=8,K=8` | 870.1 µs | 35.54% | 1599 | same |
 | `T=4096,H=3072,I=1536,E=8,K=8` | 1459.1 µs | 42.39% | 1907 | same |
-| **`T=8192,H=3072,I=1536,E=8,K=8`** | **2659.8 µs** | **46.51%** | **2093** | same; canonical Ernie shape |
+| **`T=8192,H=3072,I=1536,E=8,K=8`** | **2659.8 µs** | **46.51%** | **2093** | same; canonical reference shape |
 | `T=16384,H=3072,I=1536,E=8,K=8` | 5224.9 µs | 47.35% | 2131 | same |
 | `T=8192,H=3072,I=1536,E=16,K=8` | 2800.7 µs | 44.17% | 1987 | same |
 | `T=8192,H=3072,I=1536,E=32,K=8` | 3187.5 µs | 38.81% | 1746 | same |
@@ -35,12 +35,12 @@ Hardware/method: Target GPU SM100 (`SM100`, 148 SMs, HBM3e), nsys GPU-projection
 
 Baseline caveat:
 
-- **FP8 vs true BF16** (nsys GPU-projection, same codebase): Ernie shape `2660 µs` (FP8) vs `4346 µs` (BF16, CuTe DSL GemmGatedSm100/GemmDGatedSm100, zero FP8 kernels) = **1.63x speedup**.
+- **FP8 vs true BF16** (nsys GPU-projection, same codebase): reference shape `2660 µs` (FP8) vs `4346 µs` (BF16, CuTe DSL GemmGatedSm100/GemmDGatedSm100, zero FP8 kernels) = **1.63x speedup**.
 - **BF16 vs S53 official PyTorch**: Current BF16 is `4346 µs` vs S53's `3644 µs` (ratio 1.19x). The 19% gap comes from Paddle proxy dispatch overhead (~10%) plus FP8-infrastructure-loaded branch cost (~9%, documented in S53 engineering log Lesson 50). This is expected and NOT a regression.
 - **True BF16 mode**: Set `SONIC_MOE_FP8_MODE=""` before import. `SonicMoEMlpNode` now respects this setting and dispatches to CuTe DSL BF16 GEMMs (GemmGatedSm100 + GemmDGatedSm100). No quantization kernels, no FP8 C-load.
 - **Small batches**: FP8 crossover is around `T=3000-4000`.
 
-### 2.2 Kernel breakdown at Ernie shape
+### 2.2 Kernel breakdown at reference shape
 
 Latest nsys GPU-projection per iter:
 
@@ -57,7 +57,7 @@ Latest nsys GPU-projection per iter:
 ~2639-2660 µs total
 ```
 
-NCU headline for the 6 GEMMs (`reports/ernie_shape_ncu_s78b/`):
+NCU headline for the 6 GEMMs (reference-shape report):
 
 | Role | Tensor pipe | DRAM | L2 hit | regs/thread | Readout |
 |---|---:|---:|---:|---:|---|
@@ -75,10 +75,10 @@ The current FP8 perf path is speed-oriented and keeps FP8 weight caches hot.
 | Item | Current understanding |
 |---|---|
 | FP8 weight caches | Multiple physical layouts are cached for fwd/down/dgated/actgrad/wgrad. Cache keys include `data_ptr + inplace_version + shape/stride`; optimizer in-place updates naturally invalidate. |
-| `z` activation | Saved as `z_fp8 + UE8M0 scales`, avoiding a persistent `z_bf16(TK,2I)` activation. Ernie `z_bf16` would be ~384 MiB; FP8 data is ~192 MiB plus scales. |
+| `z` activation | Saved as `z_fp8 + UE8M0 scales`, avoiding a persistent `z_bf16(TK,2I)` activation. The reference-shape `z_bf16` would be ~384 MiB; FP8 data is ~192 MiB plus scales. |
 | `y1` | `y1_fp8 + scales` is passed across `_UpProjection` → `_DownProjection` via `_PREQUANTIZED_SCALES["fwd"]`; the BF16 logical object exists for autograd/flow but hot path consumes FP8. |
-| backward peak | Dominated by `dz`, `y1s`, colwise/rowwise quant products, `dx_expanded`, and wgrad accumulators. Previous report gives ~1.3 GiB/layer activation peak at Ernie shape; exact peak depends on cache retention and stagewise-memory mode. |
-| `SONIC_MOE_STAGEWISE_MEMORY=1` | Memory-saving mode; expect ~1.0-1.5 GiB peak savings at Ernie-like shape with ~3-5% cost. |
+| backward peak | Dominated by `dz`, `y1s`, colwise/rowwise quant products, `dx_expanded`, and wgrad accumulators. Previous report gives ~1.3 GiB/layer activation peak at reference shape; exact peak depends on cache retention and stagewise-memory mode. |
+| `SONIC_MOE_STAGEWISE_MEMORY=1` | Memory-saving mode; expect ~1.0-1.5 GiB peak savings at reference-like shape with ~3-5% cost. |
 | `SONIC_MOE_FP8_RECOMPUTE_Z=1` | Saves roughly one active `z_fp8` lifetime but costs extra up-proj recompute. Default remains off for perf. |
 
 Memory claims older than Session 65 are often apples-to-oranges: some measured no FP8 wgrad, some included per-iter `node.step()` flush, some used old QuACK overhead. Treat them as historical unless reproduced with `bench_mlpnode_topk_nsys.py` / current benches.
@@ -103,7 +103,7 @@ Determinism:
 
 Numerical caveats:
 
-- iso32 dz dual quant is validated on real Ernie-like `dz` captures with downstream GEMM RRMSE ratio `1.000x`, but it is **not** a mathematical identity. Monitor `log2(block_amax / row_amax)` and zero ratio if using new distributions; fallback to 1x32 dual quant for high-risk distributions.
+- iso32 dz dual quant is validated on real reference-like `dz` captures with downstream GEMM RRMSE ratio `1.000x`, but it is **not** a mathematical identity. Monitor `log2(block_amax / row_amax)` and zero ratio if using new distributions; fallback to 1x32 dual quant for high-risk distributions.
 - TMA reduce-add is not a precision improvement. It keeps fp32 `main_grad` but changes the accumulation implementation from epilogue C-load to TMA store-side ADD. It does not do Kahan/pairwise accumulation.
 - FP8 small values near zero can show large relative error; judge by cosine/RRMSE/absolute error and training loss, not max relative error alone.
 
@@ -155,7 +155,7 @@ Read these before changing the frontier:
 |---:|---|---|
 | 1 | `reports/sonic_moe_fp8_frontier_newcomer_guide.md` | Standalone training guide: basics, dataflow, symbols, roofline, precision, expert Q&A |
 | 2 | `reports/fresh_benchmark_ws1/README.md` + `sweep.json` + `mfu_model.json` | Latest 22-point performance sweep and fitted MFU model |
-| 3 | `reports/ernie_shape_ncu_s78b/README.md` | NCU full report and bottleneck reasoning for 6 GEMMs |
+| 3 | reference-shape NCU report | NCU full report and bottleneck reasoning for 6 GEMMs |
 | 4 | `docs/gemm_dgated_fp8cload.md` | GemmDGatedFP8CLoad deep-dive: Int16 trick, dSwiGLU 9-SASS decomposition, FP8 blockscaled dequant, zero-materialization gather |
 | 5 | `docs/expert_interleave_weight_layout.md` | Expert Interleave 权重布局设计动机 — 5 层全栈收益分析 + 独创性论证 |
 | 6 | `reports/sonic_moe_comprehensive_analysis.md` | Broad analysis report and newcomer summary |
@@ -164,7 +164,7 @@ Read these before changing the frontier:
 | 9 | `sonicmoe/quack_utils/gemm_gated.py` | fused gated GEMM + epilogue blockscaled quant |
 | 10 | `sonicmoe/quack_utils/gemm_dgated.py` | FP8 C-load dGated backward |
 | 11 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | quant kernels, iso32, TMA reduce-add, FP8 GEMM wrappers |
-| 12 | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` | machine, proxy, ncu lock reset, profiling methodology |
+| 12 | private env-notes file (`SONIC_MOE_ENV_NOTES`) | machine, proxy, ncu lock reset, profiling methodology |
 
 Historical but non-authoritative:
 
@@ -226,7 +226,7 @@ Full MFU gap (100% → 46.5%):
 F = 18 * TK * H * I
 MFU = F / (busy_seconds * peak_FLOPs_per_second)
 
-Ernie:
+Reference:
   TK = 8192 * 8 = 65536
   F = 18 * 65536 * 3072 * 1536 = 5.566e12 FLOPs
   ideal @4500 TFLOPS = 1237 µs
@@ -303,7 +303,7 @@ Current application: `GemmDGatedFP8CLoadSm100ZeroMat` is a fission candidate bec
 10. **Use whitelisted env for paddlejob launch.** Denylist cleanup is unsafe; cluster env vars can silently force multi-node rendezvous.
 11. **Never use `.numel()` or `.element_size()` in hot-path Paddle proxy code.** These trigger implicit cudaMemcpy D2H (GPU stream sync). Use `.size` (int property) and `.itemsize` instead. Gated by `tests/test_no_memcpy_sync.py`. See PR#22.
 12. **SonicMoEMlpNode 现在支持真 BF16 模式。** 设置 `SONIC_MOE_FP8_MODE=""` 即可。BF16 路径使用 GemmGatedSm100 + GemmDGatedSm100（CuTe DSL BF16 GEMM），wgrad 通过 gemm_add() 累加到 main_grad，与 FP8 路径共享 zero-materialization 和 varlen 基础设施。
-13. **MXFP8 128 行对齐浪费是硅片硬约束，kernel 层面无解。** 详细分析见 `/panzhaowu/bkup/mxfp8_alignment_waste_analysis.pdf`。TC:CUDA core 吞吐比 = 58.5:1，CUDA core 并发 tail 不可行（tail 必须 < 0.67% 才能隐藏）。系统级解法：token rounding（已实现未上线）或跨 microbatch buffer（可行，改善 = grad_acc_steps 倍）。
+13. **MXFP8 128 行对齐浪费是硅片硬约束，kernel 层面无解。** 详细分析见私有 alignment-waste 笔记。TC:CUDA core 吞吐比 = 58.5:1，CUDA core 并发 tail 不可行（tail 必须 < 0.67% 才能隐藏）。系统级解法：token rounding（已实现未上线）或跨 microbatch buffer（可行，改善 = grad_acc_steps 倍）。
 14. **Token Rounding 已实现但未进入生产。** 代码在 `forward_token_choice_rounding(Mtile=128)`，但因路由扰动对训练收敛的影响未验证，生产环境仍用 route-level padding。
 
 ---

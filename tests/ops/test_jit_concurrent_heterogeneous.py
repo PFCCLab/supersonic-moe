@@ -31,6 +31,7 @@ import pytest
 
 _SHAPE_A = dict(E=8, H=3072, I=1536, total_K=4096)
 _SHAPE_B = dict(E=8, H=3072, I=1536, total_K=8192)
+_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 _CHILD = textwrap.dedent("""
@@ -41,8 +42,11 @@ _CHILD = textwrap.dedent("""
     os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
     os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
     os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda-13.0/bin/ptxas")
-    sys.path.insert(0, "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack")
-    sys.path.insert(0, "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe")
+    quack = os.environ.get("SONIC_MOE_QUACK_PATH", "")
+    repo = os.environ["SONIC_MOE_REPO"]
+    for path in (quack, repo):
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
     import paddle
     paddle.enable_compat()
     import torch  # noqa
@@ -56,13 +60,17 @@ _CHILD = textwrap.dedent("""
 
 
 def _spawn(cache_dir: str, shape: dict, log_file: str) -> subprocess.Popen:
-    py = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/python"
+    py = os.environ.get("SONIC_MOE_PADDLE_PYTHON", sys.executable)
     log = open(log_file, "w")
     return subprocess.Popen(
         [py, "-c", _CHILD, cache_dir,
          str(shape["E"]), str(shape["H"]), str(shape["I"]), str(shape["total_K"])],
         stdout=log, stderr=subprocess.STDOUT,
-        env={**os.environ, "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0")},
+        env={
+            **os.environ,
+            "CUDA_VISIBLE_DEVICES": os.environ.get("CUDA_VISIBLE_DEVICES", "0"),
+            "SONIC_MOE_REPO": os.environ.get("SONIC_MOE_REPO", _REPO),
+        },
     )
 
 

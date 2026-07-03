@@ -24,12 +24,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-REPO = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe")
-QUACK = REPO / "third_party/quack"
-NSYS = "/usr/local/bin/nsys"
-PYTHON = "/usr/local/bin/python"
+REPO = Path(os.environ.get("SONIC_MOE_REPO", Path(__file__).resolve().parents[1])).resolve()
+QUACK = Path(os.environ.get("SONIC_MOE_QUACK_PATH", REPO / "third_party/quack"))
+NSYS = os.environ.get("SONIC_MOE_NSYS", "nsys")
+PYTHON = os.environ.get("SONIC_MOE_PADDLE_PYTHON", sys.executable)
 BENCH = REPO / "tests/ops/bench_mlpnode_topk_nsys.py"
-OUT_ROOT = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+OUT_ROOT = Path(os.environ.get("SONIC_MOE_NSYS_OUTPUT_DIR", REPO / "reports" / "nsys"))
 
 
 @dataclass
@@ -49,8 +49,8 @@ class Shape:
 SHAPES: list[Shape] = [
     # Anchor: matches reports/session53_breakdown.md head-line numbers.
     Shape("baseline_T8K_E8",     8192,  8, 1536, 8, "none",    s53_bf16=3644, s53_fp8=2715, notes="S53 anchor"),
-    # ERNIE production EP=32 shape (HANDOFF Session 65).
-    Shape("ernie_T8K_E32",       8192, 32, 1536, 8, "none",                                  notes="ERNIE EP=32"),
+    # production-like reference EP=32 shape (HANDOFF Session 65).
+    Shape("reference_T8K_E32",   8192, 32, 1536, 8, "none",                                  notes="reference EP=32"),
     # Large-N: stress Target GPU / activates many wgrad blocks (was the bug-class regime).
     Shape("large_T16K_E8",      16384,  8, 1536, 8, "none",    s53_bf16=7953, s53_fp8=5227, notes="2× tokens"),
     Shape("large_T16K_E32",     16384, 32, 1536, 8, "none",                                  notes="2× tokens, EP=32"),

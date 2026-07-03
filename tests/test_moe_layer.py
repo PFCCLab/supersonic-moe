@@ -145,7 +145,7 @@ class Gate(paddle.nn.Layer):
 # Lightweight expert stubs for SonicMoEMlpNode (Path B)
 # ---------------------------------------------------------------------------
 class _FakeLinear:
-    """Minimal weight holder matching ERNIE per-expert interface."""
+    """Minimal weight holder matching split-half per-expert interface."""
     def __init__(self, weight):
         self.weight = weight
 

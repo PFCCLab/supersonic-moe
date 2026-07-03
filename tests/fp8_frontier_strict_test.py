@@ -4,8 +4,7 @@ Uses E=8, K=8 shapes so tokens_per_expert = T (guaranteed 128-aligned).
 This ensures the full fused-gated + zero-mat CUTLASS path is exercised.
 
 Run:
-    source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-    cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+    source .runenv.sh
     CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
       python -m pytest tests/fp8_frontier_strict_test.py -v -s --tb=short
 """
@@ -270,9 +269,9 @@ class FP8FrontierStrictTest(unittest.TestCase):
 
     # ── Main FP8 frontier tests (E=8, K=8 → natural 128-alignment) ──────
 
-    def test_ernie_production(self) -> None:
-        """Production Ernie shape: T=8192, H=3072, I=1536, E=8, K=8"""
-        self._run_fwd_bwd(8192, 3072, 1536, 8, 8, "ernie-prod")
+    def test_reference_shape(self) -> None:
+        """Production reference shape: T=8192, H=3072, I=1536, E=8, K=8"""
+        self._run_fwd_bwd(8192, 3072, 1536, 8, 8, "reference-prod")
 
     def test_small_aligned(self) -> None:
         """Small aligned: T=1024, H=3072, I=1536, E=8, K=8"""

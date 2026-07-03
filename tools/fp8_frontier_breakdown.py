@@ -34,7 +34,7 @@ from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional.utils import enable_quack_gemm
 
-# Ernie shape
+# reference shape
 T, H, I, E, K = 8192, 3072, 1536, 8, 8
 moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
            intermediate_size=I, activation_function=ActivationType.SWIGLU,

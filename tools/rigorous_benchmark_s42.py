@@ -176,7 +176,8 @@ def main():
     args = p.parse_args()
 
     all_results = []
-    with tempfile.TemporaryDirectory(dir="/root/paddlejob/share-storage/gpfs/system-public/panzhaowu") as tmpdir:
+    tmp_root = os.environ.get("SONIC_MOE_PERSISTENT_TMP_ROOT")
+    with tempfile.TemporaryDirectory(dir=tmp_root) as tmpdir:
         for repeat in range(N_REPEATS):
             print(f"\n{'='*70}")
             print(f"Repeat {repeat+1}/{N_REPEATS}")

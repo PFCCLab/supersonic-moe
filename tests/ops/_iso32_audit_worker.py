@@ -22,8 +22,12 @@ else:
     os.environ["SONIC_MOE_FP8_MODE"] = "perf"
     os.environ["SONIC_MOE_FP8_ISO32_WEIGHT"] = "1"
 
-sys.path.insert(0, "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe")
-os.chdir("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe")
+_REPO = os.environ.get(
+    "SONIC_MOE_REPO",
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+)
+sys.path.insert(0, _REPO)
+os.chdir(_REPO)
 
 torch.cuda.init()
 _ = torch.empty(1, device="cuda")

@@ -60,7 +60,7 @@ def audit_one(dz: torch.Tensor) -> dict:
     """All inputs/outputs on CUDA."""
     TK, twoI = dz.shape
     I = twoI // 2
-    H = 3072  # Ernie hidden — used only for proxy GEMM downstream
+    H = 3072  # reference hidden — used only for proxy GEMM downstream
 
     # 1) Direct quant fidelity
     dz_dq_1x32 = _quant_dequant_blockscaled(dz, row_tile=1)
@@ -143,7 +143,7 @@ def main() -> None:
 
     md = ["# iso32 dz precision audit (Phase 0.2)\n"]
     md.append("Pure-PyTorch quant→dequant comparison on **real** dz tensors "
-              "captured from the bwd dGated path during Ernie-shape inference.\n")
+              "captured from the bwd dGated path during reference-shape inference.\n")
     md.append("**Pass thresholds**: direct cos ≥ 0.9995; direct RRMSE iso32/1×32 ≤ 3×; "
               "downstream dx & dw1 RRMSE iso32/1×32 ≤ 2×.  Dyn-range bits-lost "
               "is reported as advisory only — for e4m3 the 3-bit mantissa noise "

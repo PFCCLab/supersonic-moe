@@ -242,7 +242,7 @@ class MoE(nn.Module):
     def prefetch_all_fp8_weights(self) -> None:
         """Pre-quantize all expert weights to blockscaled FP8 for fused gated path.
 
-        Stores FP8 weights as attributes on the parameter objects (ernie-core pattern).
+        Stores FP8 weights as attributes on the parameter objects (ERNIE pattern).
         Call once after model init or after optimizer step. The fused forward path
         will check for these cached attributes before quantizing on-the-fly.
 
@@ -281,7 +281,7 @@ class MoE(nn.Module):
         This is the "bf16 master + fp8 shadow" pattern: bf16 Parameters are master weights
         for the optimizer; FP8 shadows are consumed by the fused GEMM kernels.
 
-        Ernie shape (E=8, H=3072, I=1536): quantize cost ~80µs one-shot (vs ~174µs/iter).
+        reference shape (E=8, H=3072, I=1536): quantize cost ~80µs one-shot (vs ~174µs/iter).
         Shadow size: ~223 MiB (4 layouts), automatically freed when _version changes.
         """
         w1 = self.c_fc.weight   # (E, 2I, H) bf16 Parameter — Experts convention
@@ -327,7 +327,7 @@ class MoE(nn.Module):
         The FP8 shadow caches must be populated — forward/backward will
         use them exclusively via the decoupled-weight path.
 
-        Saves ~216 MiB at Ernie shape (w1=144 MiB + w2=72 MiB).
+        Saves ~216 MiB at reference shape (w1=144 MiB + w2=72 MiB).
 
         Typical training loop::
 

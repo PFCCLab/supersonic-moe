@@ -14,9 +14,9 @@ os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 import paddle
@@ -31,7 +31,7 @@ from sonicmoe.ernie_compat.mlp_node_v2 import (
 import sonicmoe.ernie_compat.mlp_node_v2 as _m
 
 # ── Config ───────────────────────────────────────────────────────────────
-T, H, I, E, K = 8192, 3072, 1536, 8, 8   # Ernie shape
+T, H, I, E, K = 8192, 3072, 1536, 8, 8   # reference shape
 WARMUP = 5
 ITERS = 12
 

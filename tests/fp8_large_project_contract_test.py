@@ -723,7 +723,7 @@ print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
             quantize_and_pack_weight_iso32,
         )
 
-        # Test with Ernie-like weight shapes
+        # Test with reference-like weight shapes
         for E, N, K in [(8, 3072, 3072), (8, 1536, 3072), (8, 3072, 1536)]:
             w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16) * 0.02
             w_fp8, w_scales = _quantize_weight_3d_triton(w)
@@ -952,7 +952,7 @@ print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
             # to avoid comparing padding scale bytes that differ due to OOB writes
             # in the separate kernel's 2D grid.
             ("contract", 8192, 3072, 1536),
-            ("prod_ernie", 65536, 3072, 1536),
+            ("prod_reference", 65536, 3072, 1536),
             ("large_T", 32768, 3072, 1536),
         ]
         for label, TK, two_I, I in shapes:
@@ -1038,7 +1038,7 @@ print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
         shapes = [
             # (T, H, I, E, K)
             (1024, 3072, 1536, 8, 8),      # contract shape
-            (8192, 3072, 1536, 8, 8),       # production Ernie shape
+            (8192, 3072, 1536, 8, 8),       # production reference shape
         ]
         for T, H, I, E, K in shapes:
             with self.subTest(T=T, H=H, I=I):

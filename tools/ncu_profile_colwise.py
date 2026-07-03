@@ -5,7 +5,7 @@ import torch
 
 torch.manual_seed(42)
 
-# Ernie shape
+# reference shape
 TK = 65536
 I_dim = 1536
 H_dim = 3072

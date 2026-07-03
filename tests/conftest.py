@@ -23,16 +23,10 @@ from __future__ import annotations
 import os
 import sys
 
-# Ensure the locally-built quack is importable for any test that triggers a
-# sonicmoe import. Some Python interpreters on this host (e.g.
-# /usr/local/bin/python) have no quack site-package — every individual
-# tests/ops/* bench manually does ``sys.path.insert(0, _QUACK)``; do it once
-# here so newly-added tests don't have to remember.
-_QUACK = (
-    "/root/paddlejob/share-storage/gpfs/system-public/"
-    "zhangyichen/sonicmoe_for_ernie/quack"
-)
-if os.path.isdir(_QUACK) and _QUACK not in sys.path:
+# Ensure an external quack checkout is importable when the active interpreter
+# does not already provide it.
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
+if _QUACK and os.path.isdir(_QUACK) and _QUACK not in sys.path:
     sys.path.insert(0, _QUACK)
 
 # Production-mode FP8 defaults — set BEFORE any sonicmoe import so module-level

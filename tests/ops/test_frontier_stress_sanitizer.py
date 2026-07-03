@@ -13,7 +13,7 @@ import sys
 import time
 import subprocess
 
-venv = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv"
+venv = os.environ.get("SONIC_MOE_PADDLE_VENV", sys.prefix)
 python_bin = os.path.join(venv, "bin", "python")
 if os.path.realpath(sys.prefix) != os.path.realpath(venv):
     os.execv(python_bin, [python_bin, *sys.argv])
@@ -23,10 +23,13 @@ os.environ.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
 os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 os.environ.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda-13.0/bin/ptxas")
 
-_REPO = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe"
-_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+_REPO = os.environ.get(
+    "SONIC_MOE_REPO",
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+)
+_QUACK = os.environ.get("SONIC_MOE_QUACK_PATH", "")
 for _p in (_QUACK, _REPO):
-    if _p not in sys.path:
+    if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
 import paddle
@@ -317,7 +320,7 @@ def main():
     print("=" * 72)
 
     sani_cases = [
-        (8192, 8, 8, 1536),    # Ernie production
+        (8192, 8, 8, 1536),    # production-like reference
         (16384, 8, 8, 1536),   # Large T
         (4096, 8, 32, 1536),   # Large E
         (8192, 8, 8, 4096),    # Large I (peak MFU shape)
@@ -333,7 +336,7 @@ def main():
     print("=" * 72)
 
     prec_cases = [
-        (8192, 8, 8, 1536),    # Ernie standard
+        (8192, 8, 8, 1536),    # reference standard
         (16384, 8, 8, 1536),   # 2x tokens
         (8192, 8, 8, 4096),    # Peak MFU shape
         (4096, 8, 32, 1536),   # E=32

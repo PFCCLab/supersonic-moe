@@ -7,7 +7,7 @@ the same Target GPU GPU.
 
 Four paths:
   1. Paddle BF16  — BF16 matmul per expert (no FP8, ERNIE-core convention)
-  2. Paddle FP8   — Fp8FusedMlpFunc.apply per expert (real ERNIE handwritten bwd)
+  2. Paddle FP8   — Fp8FusedMlpFunc.apply per expert (ERNIE-style handwritten bwd)
   3. SonicMoE BF16 — _UpProjection + _DownProjection (QuACK BF16 path)
   4. SonicMoE FP8  — same + enable_fp8(True) (blockscaled CUTLASS)
 
@@ -53,24 +53,19 @@ import numpy as np
 
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
-ERNIE_ROOT = (
-    "/root/paddlejob/share-storage/gpfs/system-public/liangshuhao/"
-    "erniebot_test_speed/third_party/ernie-core/src"
-)
+REFERENCE_CORE_ROOT = os.environ.get("SONIC_MOE_REFERENCE_CORE_ROOT", "")
+REFERENCE_EXPERT_NODE = os.environ.get("SONIC_MOE_REFERENCE_EXPERT_NODE", "")
 
-SYSTEM_PYTHON = "/bin/python3"  # Python 3.10 with paddle
-XFER_PYTHON = (
-    "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/"
-    "envs/xfer/bin/python"
-)
+SYSTEM_PYTHON = os.environ.get("SONIC_MOE_SYSTEM_PYTHON", sys.executable)
+XFER_PYTHON = os.environ.get("SONIC_MOE_XFER_PYTHON", sys.executable)
 
 NSYS_BIN = shutil.which("nsys") or "/usr/local/bin/nsys"
 
 # ── Shape grid (from introspect.py) ───────────────────────────────────────────
-# Default Ernie shape + selected grid shapes from introspect.py:
+# Default reference shape + selected grid shapes from introspect.py:
 #   GRID_T = [8192, 16384, 32768], GRID_E = [8, 32, 128],
 #   GRID_I = [1536, 2048, 3072], GRID_H = 3072, GRID_K = 8
-# Avoid very large shapes to prevent ERNIE OOM (single GPU, no model parallel)
+# Avoid very large shapes to prevent reference OOM (single GPU, no model parallel)
 SHAPES = {
     "T8192_H3072_I1536_E8_K8":    {"S": 8192,  "H": 3072, "I": 1536, "E": 8,   "K": 8},
     "T16384_H3072_I1536_E8_K8":   {"S": 16384, "H": 3072, "I": 1536, "E": 8,   "K": 8},
@@ -88,9 +83,9 @@ NSYS_REPEATS = 3        # repeat nsys profiling, report median
 SEEDS = [42, 123, 777]  # repeated measurements for precision
 
 # Target GPU hardware constants (for theoretical analysis)
-Target GPU_FP8_TFLOPS = 4500       # E4M3 tensor-core peak (TFLOPS)
-Target GPU_BF16_TFLOPS = 2250      # BF16 tensor-core peak (TFLOPS)
-Target GPU_HBM_BW_GBPS = 8000      # HBM3e bandwidth (GB/s)
+TARGET_GPU_FP8_TFLOPS = 4500       # E4M3 tensor-core peak (TFLOPS)
+TARGET_GPU_BF16_TFLOPS = 2250      # BF16 tensor-core peak (TFLOPS)
+TARGET_GPU_HBM_BW_GBPS = 8000      # HBM3e bandwidth (GB/s)
 
 # ── Path registry ─────────────────────────────────────────────────────────────
 PATH_NAMES = ["paddle_bf16", "paddle_fp8", "sonic_bf16", "sonic_fp8"]
@@ -133,8 +128,8 @@ def generate_data(shape: dict, data_dir: str, seed: int = 42) -> None:
     topk_scores = (exp_g / exp_g.sum(axis=1, keepdims=True)).astype(np.float32)
     np.save(os.path.join(data_dir, "topk_scores.npy"), topk_scores)
 
-    gold_ernie, gold_sonic = _compute_gold_fp64(x, data_dir, S, H, I, E, K, topk_indices, topk_scores)
-    np.save(os.path.join(data_dir, "gold_ernie.npy"), gold_ernie)
+    gold_reference, gold_sonic = _compute_gold_fp64(x, data_dir, S, H, I, E, K, topk_indices, topk_scores)
+    np.save(os.path.join(data_dir, "gold_reference.npy"), gold_reference)
     np.save(os.path.join(data_dir, "gold_sonic.npy"), gold_sonic)
 
     # Grad output for backward (shared across all paths)
@@ -146,7 +141,7 @@ def _compute_gold_fp64(x, data_dir, S, H, I, E, K, topk_indices, topk_scores):
     """Gold MoE fwd in float64.
 
     Produces TWO gold references:
-      - gold_ernie: probs applied BEFORE down-proj (ERNIE convention)
+      - gold_reference: probs applied BEFORE down-proj (split-half convention)
       - gold_sonic: probs applied AFTER down-proj during scatter (SonicMoE convention)
     """
     x64 = x.astype(np.float64)
@@ -174,31 +169,31 @@ def _compute_gold_fp64(x, data_dir, S, H, I, E, K, topk_indices, topk_scores):
         sig = 1.0 / (1.0 + np.exp(-gate))
         y1[s:end] = gate * sig * up
 
-    # Compute probs in sorted order for ERNIE convention
+    # Compute probs in sorted order for split-half convention
     sc64 = topk_scores.astype(np.float64)
     probs_sorted = np.zeros(TK, dtype=np.float64)
     for i, so in enumerate(sorted_order):
         t, k = divmod(so, K)
         probs_sorted[i] = sc64[t, k]
 
-    # ── ERNIE gold: probs BEFORE down-proj ──
-    y1_ernie = y1.copy()
+    # ── reference gold: probs BEFORE down-proj ──
+    y1_reference = y1.copy()
     for e in range(E):
         s, end = cu[e], cu[e + 1]
-        y1_ernie[s:end] *= probs_sorted[s:end, None]
+        y1_reference[s:end] *= probs_sorted[s:end, None]
 
-    y2_ernie = np.zeros((TK, H), dtype=np.float64)
+    y2_reference = np.zeros((TK, H), dtype=np.float64)
     for e in range(E):
         s, end = cu[e], cu[e + 1]
         if s >= end:
             continue
         w2 = np.load(os.path.join(data_dir, f"w2_e{e}.npy")).astype(np.float64)
-        y2_ernie[s:end] = y1_ernie[s:end] @ w2
+        y2_reference[s:end] = y1_reference[s:end] @ w2
 
-    out_ernie = np.zeros((S, H), dtype=np.float64)
+    out_reference = np.zeros((S, H), dtype=np.float64)
     for t in range(S):
         for k in range(K):
-            out_ernie[t] += y2_ernie[s_rev[t * K + k]]  # no probs here — already applied
+            out_reference[t] += y2_reference[s_rev[t * K + k]]  # no probs here — already applied
 
     # ── SonicMoE gold: probs AFTER down-proj (at scatter) ──
     y2_sonic = np.zeros((TK, H), dtype=np.float64)
@@ -214,7 +209,7 @@ def _compute_gold_fp64(x, data_dir, S, H, I, E, K, topk_indices, topk_scores):
         for k in range(K):
             out_sonic[t] += y2_sonic[s_rev[t * K + k]] * sc64[t, k]
 
-    return out_ernie, out_sonic
+    return out_reference, out_sonic
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -255,10 +250,10 @@ def compute_theory(shape: dict) -> dict:
     total_bytes_fp8 = act_bytes_bf16 // 2 + weight_bytes_bf16 // 2  # rough
 
     # Roofline bounds
-    bf16_compute_us = flops_total / (Target GPU_BF16_TFLOPS * 1e6)
-    fp8_compute_us = flops_total / (Target GPU_FP8_TFLOPS * 1e6)
-    bf16_mem_us = total_bytes_bf16 / (Target GPU_HBM_BW_GBPS * 1e3)
-    fp8_mem_us = total_bytes_fp8 / (Target GPU_HBM_BW_GBPS * 1e3)
+    bf16_compute_us = flops_total / (TARGET_GPU_BF16_TFLOPS * 1e6)
+    fp8_compute_us = flops_total / (TARGET_GPU_FP8_TFLOPS * 1e6)
+    bf16_mem_us = total_bytes_bf16 / (TARGET_GPU_HBM_BW_GBPS * 1e3)
+    fp8_mem_us = total_bytes_fp8 / (TARGET_GPU_HBM_BW_GBPS * 1e3)
 
     return {
         "TK": TK,
@@ -281,17 +276,20 @@ def compute_theory(shape: dict) -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ─── Paddle paths: unified template using ExpertsGroupGemmContiguousNode ──────
-# Both BF16 and FP8 use the REAL ERNIE-core ExpertsGroupGemmContiguousNode which
-# provides production-grade forward AND backward:
+# Both BF16 and FP8 use the configured reference expert node, which provides
+# production-grade forward AND backward:
 #   BF16: fp8=None → BF16 matmul per expert (fwd) + BF16 weight grad (bwd)
 #   FP8:  fp8="e4m3" → FP8 GEMM (fwd) + FP8 wgrad + FP8 dact GEMM (bwd)
 # Unzip/Zip: F.moe_permute / F.moe_unpermute (production fused kernels)
 _PADDLE_SCRIPT_TEMPLATE = textwrap.dedent(r'''
 import gc, json, os, sys
 import numpy as np
-ERNIE_ROOT = "{ernie_root}"
-if ERNIE_ROOT not in sys.path:
-    sys.path.insert(0, ERNIE_ROOT)
+REFERENCE_CORE_ROOT = "{reference_core_root}"
+if REFERENCE_CORE_ROOT and REFERENCE_CORE_ROOT not in sys.path:
+    sys.path.insert(0, REFERENCE_CORE_ROOT)
+REFERENCE_EXPERT_NODE = "{reference_expert_node}"
+if not REFERENCE_EXPERT_NODE:
+    raise RuntimeError("Set SONIC_MOE_REFERENCE_EXPERT_NODE=module.path:ClassName")
 os.environ["FLAGS_cudnn_deterministic"] = "True"
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
 
@@ -304,7 +302,9 @@ warmup, iters = {warmup}, {iters}
 USE_FP8 = {use_fp8}  # True for FP8 path, False for BF16 path
 OUTPUT_PREFIX = "{output_prefix}"
 
-from ernie_core.models.moe.token_dispatcher.fp8_utils import ExpertsGroupGemmContiguousNode
+_mod_name, _cls_name = REFERENCE_EXPERT_NODE.split(":", 1)
+_mod = __import__(_mod_name, fromlist=[_cls_name])
+ExpertsGroupGemmContiguousNode = getattr(_mod, _cls_name)
 
 # ── Mock custom_map for ExpertsGroupGemmContiguousNode ──
 class _W:
@@ -314,7 +314,7 @@ class _Expert:
         self.up_gate_proj = _W(w1); self.down_proj = _W(w2)
 class _Cfg:
     fp8_fused_ops_configs = {{"spaq": True, "stack_quant": True, "swiglu_probs_bwd": True, "transpose_split_quant": True}}
-    # BF16 path: moe_grouped_gemm=False (ERNIE BF16 doesn't support grouped GEMM)
+    # BF16 path: moe_grouped_gemm=False for the ERNIE BF16 implementation.
     # FP8 path: moe_grouped_gemm controlled by flag (default True = production training)
     moe_grouped_gemm = {use_grouped_gemm} if USE_FP8 else False
 class _Map:
@@ -368,7 +368,7 @@ def run_fwd():
     return o3, output, up
 
 def run_bwd(o3, grad_expert_out, up):
-    """Backward: ExpertsGroupGemmContiguousNode.backward (production ERNIE bwd)."""
+    """Backward: ExpertsGroupGemmContiguousNode.backward (production reference bwd)."""
     for w in w1_list + w2_list:
         w.main_grad = None
     dx, probs_grad = node.backward(grad_expert_out, up)
@@ -841,7 +841,7 @@ def generate_report(results: dict, report_path: str) -> None:
     L.append("**Tensor**: final MoE output after down-proj + `F.moe_unpermute` (Paddle) / router scatter (SonicMoE).")
     L.append("")
     L.append("**Two gold references** (prob-scaling location differs):")
-    L.append("- **Gold-ERNIE**: `output = (swiglu(x@w1) * prob) @ w2`, accumulate at scatter (prob BEFORE down-proj)")
+    L.append("- **Gold-reference**: `output = (swiglu(x@w1) * prob) @ w2`, accumulate at scatter (prob BEFORE down-proj)")
     L.append("- **Gold-SonicMoE**: `output = swiglu(x@w1) @ w2 * prob` (prob AFTER down-proj at scatter)")
     L.append("")
     L.append("Note: intermediate tensors (preact, postact, expert_out) are NOT comparable cross-framework due to")
@@ -925,9 +925,9 @@ def generate_report(results: dict, report_path: str) -> None:
     # ── 5. Theoretical Analysis ──
     L.append("## 5. Theoretical Analysis\n")
     L.append("### Roofline Model (Target GPU)\n")
-    L.append(f"- BF16 tensor-core peak: {Target GPU_BF16_TFLOPS} TFLOPS")
-    L.append(f"- FP8 tensor-core peak: {Target GPU_FP8_TFLOPS} TFLOPS")
-    L.append(f"- HBM3e bandwidth: {Target GPU_HBM_BW_GBPS} GB/s\n")
+    L.append(f"- BF16 tensor-core peak: {TARGET_GPU_BF16_TFLOPS} TFLOPS")
+    L.append(f"- FP8 tensor-core peak: {TARGET_GPU_FP8_TFLOPS} TFLOPS")
+    L.append(f"- HBM3e bandwidth: {TARGET_GPU_HBM_BW_GBPS} GB/s\n")
     L.append("| Shape | FLOPs (G) | AI (BF16) | AI (FP8) | Compute Bound BF16 (us) | Compute Bound FP8 (us) | Mem Bound BF16 (us) |")
     L.append("|-------|--------:|------:|-----:|----------:|----------:|----------:|")
     for sl in results:
@@ -954,7 +954,7 @@ def generate_report(results: dict, report_path: str) -> None:
     L.append("E4M3 FP8: 3 mantissa bits → per-element relative error ε ≈ 2^{-4} ≈ 6.25%.")
     L.append("MoE pipeline has 2 quantized matmuls (up-proj, down-proj) plus SwiGLU.")
     L.append("Expected RRMSE ≈ √(ε_up² + ε_act² + ε_down²) ≈ 0.05–0.08.")
-    L.append("Both ERNIE and SonicMoE use blockscaled E4M3 with E8M0 power-of-2 scales,")
+    L.append("Both reference and SonicMoE use blockscaled E4M3 with E8M0 power-of-2 scales,")
     L.append("so their FP8 errors should be comparable (differences from block size and fusion).\n")
 
     # ── 6. Conclusions ──
@@ -1011,7 +1011,8 @@ def run_benchmark(shape_labels: list[str], gpu: int, skip_nsys: bool,
                 ("sonic_fp8",   XFER_PYTHON,   SONIC_FP8_SCRIPT),
             ]:
                 fmt = dict(
-                    data_dir=data_dir, ernie_root=ERNIE_ROOT, project_root=PROJECT_ROOT,
+                    data_dir=data_dir, reference_core_root=REFERENCE_CORE_ROOT,
+                    reference_expert_node=REFERENCE_EXPERT_NODE, project_root=PROJECT_ROOT,
                     S=S, H=H, I=I, E=E, K=K, mode="precision",
                     warmup=NSYS_WARMUP, iters=NSYS_ITERS,
                 )
@@ -1048,7 +1049,7 @@ def run_benchmark(shape_labels: list[str], gpu: int, skip_nsys: bool,
 
         for seed in SEEDS:
             data_dir = os.path.join(base_tmp, sl, f"seed{seed}")
-            gold_ernie = np.load(os.path.join(data_dir, "gold_ernie.npy"))
+            gold_reference = np.load(os.path.join(data_dir, "gold_reference.npy"))
             gold_sonic = np.load(os.path.join(data_dir, "gold_sonic.npy"))
             outputs = {}
 
@@ -1071,7 +1072,7 @@ def run_benchmark(shape_labels: list[str], gpu: int, skip_nsys: bool,
 
             # Compare each path against its correct gold (forward output)
             for pname, arr in outputs.items():
-                gold = gold_ernie if "paddle" in pname else gold_sonic
+                gold = gold_reference if "paddle" in pname else gold_sonic
                 m = precision_metrics(arr, gold)
                 seed_metrics[pname].append(m)
 
@@ -1124,11 +1125,11 @@ def run_benchmark(shape_labels: list[str], gpu: int, skip_nsys: bool,
                     ("SonicMoE FP8 vs SonicMoE BF16", "sonic_fp8", "sonic_bf16"),
                     ("Paddle FP8 vs SonicMoE FP8", "paddle_fp8", "sonic_fp8"),
                     ("Paddle BF16 vs SonicMoE BF16", "paddle_bf16", "sonic_bf16"),
-                    ("Gold ERNIE vs Gold SonicMoE", None, None),  # special
+                    ("Gold reference vs Gold SonicMoE", None, None),  # special
                 ]
                 for label, a, b in pairs:
-                    if label == "Gold ERNIE vs Gold SonicMoE":
-                        pairwise_metrics[label] = precision_metrics(gold_ernie, gold_sonic)
+                    if label == "Gold reference vs Gold SonicMoE":
+                        pairwise_metrics[label] = precision_metrics(gold_reference, gold_sonic)
                     elif a in outputs and b in outputs:
                         pairwise_metrics[label] = precision_metrics(outputs[a], outputs[b])
 
@@ -1162,7 +1163,8 @@ def run_benchmark(shape_labels: list[str], gpu: int, skip_nsys: bool,
             os.makedirs(nsys_base, exist_ok=True)
             data_dir_nsys = os.path.join(base_tmp, sl, f"seed{SEEDS[0]}")
             fmt_nsys = dict(
-                data_dir=data_dir_nsys, ernie_root=ERNIE_ROOT, project_root=PROJECT_ROOT,
+                data_dir=data_dir_nsys, reference_core_root=REFERENCE_CORE_ROOT,
+                reference_expert_node=REFERENCE_EXPERT_NODE, project_root=PROJECT_ROOT,
                 S=shape["S"], H=shape["H"], I=shape["I"], E=shape["E"], K=shape["K"],
                 mode="nsys", warmup=NSYS_WARMUP, iters=NSYS_ITERS,
             )

@@ -87,13 +87,13 @@ def parse_shape(s: str) -> ShapeSpec:
     return ShapeSpec(**{k: int(v) for k, v in m.groupdict().items()})
 
 
-# Default shape sweep — Ernie + larger model dimensions.
+# Default shape sweep — reference + larger model dimensions.
 DEFAULT_SHAPES = [
-    # Ernie-shape: vary token count (sequence/microbatch scaling)
+    # reference-shape: vary token count (sequence/microbatch scaling)
     "T1024-H3072-I1536-E8-K8",
     "T2048-H3072-I1536-E8-K8",
     "T4096-H3072-I1536-E8-K8",
-    "T8192-H3072-I1536-E8-K8",   # canonical Ernie production
+    "T8192-H3072-I1536-E8-K8",   # canonical reference production
     "T16384-H3072-I1536-E8-K8",
     # Vary expert count at fixed T (router-overhead scaling)
     "T8192-H3072-I1536-E16-K8",
@@ -247,29 +247,29 @@ def render_plots(rows: list[dict], outdir: Path) -> None:
 
     sns.set_theme(style="whitegrid", context="talk", palette="deep")
 
-    # 1. MFU vs T at Ernie shape, varying E
-    ernie = df[(df.H == 3072) & (df.I == 1536)].sort_values(["E", "T"])
-    if not ernie.empty:
+    # 1. MFU vs T at reference shape, varying E
+    reference = df[(df.H == 3072) & (df.I == 1536)].sort_values(["E", "T"])
+    if not reference.empty:
         fig, ax = plt.subplots(figsize=(10, 6))
-        sns.lineplot(data=ernie, x="T", y="MFU_%", hue="E", marker="o",
+        sns.lineplot(data=reference, x="T", y="MFU_%", hue="E", marker="o",
                      palette="viridis", ax=ax, linewidth=2.2, markersize=10)
         ax.set_xscale("log", base=2)
         ax.set_xlabel("Tokens per layer per microbatch (T)")
         ax.set_ylabel("MFU (%)")
         ax.set_title(
-            "FP8 Frontier MFU vs Token Count — Ernie shape (H=3072, I=1536, K=8)\n"
+            "FP8 Frontier MFU vs Token Count — reference shape (H=3072, I=1536, K=8)\n"
             "Target GPU dense FP8 peak 4500 TFLOPS · busy-time projection (async-overlap, no-bubble)"
         )
-        ax.set_ylim(0, max(50, ernie["MFU_%"].max() * 1.15))
-        for _, row in ernie.iterrows():
+        ax.set_ylim(0, max(50, reference["MFU_%"].max() * 1.15))
+        for _, row in reference.iterrows():
             ax.annotate(f"{row['MFU_%']:.1f}%",
                         xy=(row['T'], row["MFU_%"]),
                         xytext=(0, 8), textcoords="offset points",
                         ha="center", fontsize=9)
         fig.tight_layout()
-        fig.savefig(outdir / "mfu_vs_T_ernie.png", dpi=150)
+        fig.savefig(outdir / "mfu_vs_T_reference.png", dpi=150)
         plt.close(fig)
-        print(f"  wrote {outdir/'mfu_vs_T_ernie.png'}")
+        print(f"  wrote {outdir/'mfu_vs_T_reference.png'}")
 
     # 2. MFU vs model width (H,I) at T=8192
     big = df[df.T == 8192].copy().sort_values(["H", "I"])
@@ -387,7 +387,7 @@ def write_readme(rows: list[dict], outdir: Path) -> None:
                   f"worst MFU = {ok['MFU_%'].min():.2f}% "
                   f"({ok.loc[ok['MFU_%'].idxmin(),'shape']}).\n")
     md.append("\n## Figures\n")
-    md.append("- `mfu_vs_T_ernie.png` — MFU scaling vs token count, Ernie shape, hue=E.\n")
+    md.append("- `mfu_vs_T_reference.png` — MFU scaling vs token count, reference shape, hue=E.\n")
     md.append("- `mfu_vs_width_T8192.png` — MFU vs model width at T=8192.\n")
     md.append("- `roofline.png` — log-log busy-time vs matmul FLOPs against the FP8 ideal line.\n")
     md.append("- `mfu_vs_smutil.png` — MFU vs single-iter SM utilisation (per-shape headroom for async overlap).\n")
