@@ -242,3 +242,7 @@ docs/KNOWLEDGE_BASE.md
 .jit_cache_ci/
 log/
 core
+
+# Local docs
+docs/
+reports/
