@@ -67,14 +67,14 @@ from sonicmoe.ernie_compat.deepep_metadata import _HAS_CUDA_KERNEL
 # ── Shape config (matches introspect.py grid) ──────────────────────────────
 H = 3072
 K = 8
-# Default shape: the ERNIE production shape
+# Default shape: the production-like reference shape
 DEFAULT_T, DEFAULT_E, DEFAULT_I = 8192, 8, 1536
 
 N_WARMUP = 8   # enough to warm FP8 cache + alignment streak
 N_BENCH  = 12  # profiled iterations
 
 
-# ── Mock expert (simulates ERNIE expert module) ────────────────────────────
+# ── Mock expert (simulates reference expert module) ────────────────────────────
 
 class MockExpert:
     """up_gate_proj.weight [H, 2I], down_proj.weight [I, H]."""

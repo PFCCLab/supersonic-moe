@@ -7,7 +7,7 @@ correctness bug (atomic-order races, async-TMA scheduling leakage, state
 pollution across iterations, etc.), not flakiness.
 
 This test:
-  1. Builds a MoE on the production Ernie shape (E=8, K=8 — frontier).
+  1. Builds a MoE on the production reference shape (E=8, K=8 — frontier).
   2. Runs N fwd+bwd iterations with `_reset_fp8_state()` + reseed between
      each, after a warmup that latches `_ALIGNMENT_ASSUMED=True`.
   3. Asserts `torch.equal()` for outputs and every parameter gradient
@@ -170,9 +170,9 @@ class FP8FrontierDeterminismTest(unittest.TestCase):
 
         print(f"  [{label}] {iterations} iterations bit-identical ✓")
 
-    def test_ernie_production_deterministic(self) -> None:
-        """Ernie-shape frontier (T=8192, H=3072, I=1536, E=8, K=8) is deterministic."""
-        self._run_determinism(8192, 3072, 1536, 8, 8, "ernie-prod", iterations=3)
+    def test_reference_shape_deterministic(self) -> None:
+        """reference-shape frontier (T=8192, H=3072, I=1536, E=8, K=8) is deterministic."""
+        self._run_determinism(8192, 3072, 1536, 8, 8, "reference-prod", iterations=3)
 
     def test_small_aligned_deterministic(self) -> None:
         """Small aligned (T=1024, H=3072, I=1536, E=8, K=8) is deterministic."""

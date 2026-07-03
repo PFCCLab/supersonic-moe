@@ -4,7 +4,7 @@
 用法:
     CUDA_VISIBLE_DEVICES=0 python tests/ops/bench_mlpnode_mem.py
 
-配置（默认值对应 ERNIE 真实业务规格）:
+配置（默认值对应生产样例规格）:
     H=3072  I=1536  K=8  E_LOCAL=8  EP_SIZE=32  SEQ_LEN=16384
 
 精度策略：
@@ -108,7 +108,7 @@ def make_inputs(n_experts, hidden_size, topk, ep_size, seq_len):
     return x, dispatched_indices, dispatched_probs, tokens_per_expert
 
 
-# ── MockExpert（最小专家模块，对齐 ERNIE per-expert 参数结构）────────────────
+# ── MockExpert（最小专家模块，对齐 split-half per-expert 参数结构）────────────────
 class MockExpert:
     """提供 up_gate_proj.weight [H, 2I] 和 down_proj.weight [I, H]。"""
     def __init__(self, h: int, i: int, seed: int):

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_NVIDIA_SMI = "/home/opt/cuda_tools/nvidia-smi"
+DEFAULT_NVIDIA_SMI = os.environ.get("NVIDIA_SMI", "nvidia-smi")
 
 
 @dataclass

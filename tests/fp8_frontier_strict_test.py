@@ -269,9 +269,9 @@ class FP8FrontierStrictTest(unittest.TestCase):
 
     # ── Main FP8 frontier tests (E=8, K=8 → natural 128-alignment) ──────
 
-    def test_ernie_production(self) -> None:
-        """Production Ernie shape: T=8192, H=3072, I=1536, E=8, K=8"""
-        self._run_fwd_bwd(8192, 3072, 1536, 8, 8, "ernie-prod")
+    def test_reference_shape(self) -> None:
+        """Production reference shape: T=8192, H=3072, I=1536, E=8, K=8"""
+        self._run_fwd_bwd(8192, 3072, 1536, 8, 8, "reference-prod")
 
     def test_small_aligned(self) -> None:
         """Small aligned: T=1024, H=3072, I=1536, E=8, K=8"""

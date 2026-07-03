@@ -268,10 +268,10 @@ def main():
     all_pass = True
 
     # ════════════════════════════════════════════════════════════════════
-    # CASE 1: Standard Ernie shape (sanity baseline)
+    # CASE 1: Standard reference shape (sanity baseline)
     # ════════════════════════════════════════════════════════════════════
     print("\n" + "─" * 72)
-    print("  CASE 1: Ernie production baseline (E=8, N=8192, topk=8)")
+    print("  CASE 1: production-like reference baseline (E=8, N=8192, topk=8)")
     E, I, topk, N_recv = 8, 1536, 8, 8192
     experts = [MockExpert(H, I, e) for e in range(E)]
     torch.manual_seed(42)
@@ -285,7 +285,7 @@ def main():
     paddle.seed(0)
     x = torch.from_dlpack(paddle.randn([N_recv, H], dtype="bfloat16").detach()).to(device=device) * 0.02
     grad = torch.from_dlpack(paddle.randn([N_recv, H], dtype="bfloat16").detach()).to(device=device) * 0.01
-    all_pass &= run_case("ernie_baseline", experts, x, di, dp, tpe, grad, E, I)
+    all_pass &= run_case("reference_baseline", experts, x, di, dp, tpe, grad, E, I)
 
     # ════════════════════════════════════════════════════════════════════
     # CASE 2: Near-zero inputs (vanishing activation regime)

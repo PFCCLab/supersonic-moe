@@ -31,7 +31,7 @@ from sonicmoe.ernie_compat.mlp_node_v2 import (
 import sonicmoe.ernie_compat.mlp_node_v2 as _m
 
 # ── Config ───────────────────────────────────────────────────────────────
-T, H, I, E, K = 8192, 3072, 1536, 8, 8   # Ernie shape
+T, H, I, E, K = 8192, 3072, 1536, 8, 8   # reference shape
 WARMUP = 5
 ITERS = 12
 

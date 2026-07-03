@@ -1,7 +1,7 @@
 """Perf microbench: iso32 vs 1×32 weight blockscaled-FP8 quant kernel.
 
 Measures pure kernel time of `_quantize_weight_3d_triton` in both modes, for the
-two ERNIE expert-weight shapes that hit it in production (precompute_weight_fp8_*).
+two reference expert-weight shapes that hit it in production (precompute_weight_fp8_*).
 Output: NVTX-bracketed iters that nsys can resolve to per-iter GPU-projection.
 """
 

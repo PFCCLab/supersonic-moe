@@ -444,7 +444,7 @@ def render() -> None:
     delta = pk_f - pk_b
     fig.suptitle(
         f"SonicMoE Unified Buffer Lifecycle × Scoreboard\n"
-        f"Ernie-shape (T=8192, H=3072, I=1536, E=K=8)  ·  "
+        f"reference-shape (T=8192, H=3072, I=1536, E=K=8)  ·  "
         f"BF16 peak {pk_b:.0f} → FP8 peak {pk_f:.0f} MiB "
         f"({delta:+.0f} MiB, {delta/pk_b*100:+.1f}%)",
         fontsize=F["sup"], fontweight="bold", y=0.98,

@@ -78,7 +78,7 @@ KERNEL_BREAKDOWN_ROOT_PATH = ROOT / "kernel_breakdown.json"
 KERNEL_BREAKDOWN_COMPAT_PATH = ROOT / "reports" / "nsys_final" / "kernel_breakdown.json"
 NSYS_BREAKDOWN_PATH = ROOT / "reports" / "nsys_final" / "nsys_gpu_projection.json"
 
-# Default Ernie shape
+# Default reference shape
 SHAPE = {"T": 8192, "H": 3072, "I": 1536, "E": 8, "K": 8}
 DEFAULT_SHAPE = dict(SHAPE)
 DEFAULT_PRECISION_SEEDS = [42, 123, 456, 789, 1024]
@@ -1962,7 +1962,7 @@ def run_kernel_profile(gpu: int = 0) -> dict[str, Any]:
 def run_rigorous_benchmark(gpu: int, seeds: list[int], repeats: int) -> dict[str, Any] | None:
     """Run the repeated benchmark suite used by README/session figures."""
     if not _is_default_shape():
-        print("  [skip] rigorous benchmark only supports the default Ernie shape", flush=True)
+        print("  [skip] rigorous benchmark only supports the default reference shape", flush=True)
         return None
 
     bench_path = ROOT / "tools" / "rigorous_benchmark_s42.py"
@@ -2065,7 +2065,7 @@ def _summarize_benchmark_report(report: dict[str, Any] | None) -> dict[str, Any]
 def run_rigorous_profiler(gpu: int, repeats: int = 1) -> list[dict[str, Any]] | None:
     """Run the subprocess-isolated profiler used for kernel/memory JSON assets."""
     if not _is_default_shape():
-        print("  [skip] rigorous profiler only supports the default Ernie shape", flush=True)
+        print("  [skip] rigorous profiler only supports the default reference shape", flush=True)
         return None
 
     profiler_path = ROOT / "tools" / "rigorous_profiler.py"
@@ -4705,7 +4705,7 @@ def run_compile_session53() -> dict:
 
 # Default 6-shape benchmark list
 BENCHMARK_SHAPES_DEFAULT = [
-    {"T": 8192,  "H": 3072, "I": 1536, "E": 8,   "K": 8},   # Ernie production baseline
+    {"T": 8192,  "H": 3072, "I": 1536, "E": 8,   "K": 8},   # production-like reference baseline
     {"T": 8192,  "H": 3072, "I": 3072, "E": 8,   "K": 8},   # I scaling
     {"T": 32768, "H": 3072, "I": 1536, "E": 8,   "K": 8},   # T scaling
     {"T": 8192,  "H": 3072, "I": 1536, "E": 32,  "K": 8},   # E>8, route-level padding

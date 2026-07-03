@@ -124,7 +124,7 @@ def main() -> None:
     tpe = [int((di == e).sum().item()) for e in range(E)]
 
     paddle.seed(0)
-    # Use realistic-scale activations and gradients (matches Ernie-shape unit
+    # Use realistic-scale activations and gradients (matches reference-shape unit
     # variance after layernorm; unscaled randn so dz exercises a meaningful
     # exponent range rather than collapsing to ~3e-4).
     x = paddle.randn([T, H], dtype="bfloat16")

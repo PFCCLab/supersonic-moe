@@ -191,7 +191,7 @@ def make_weights(I: int, H: int, E_local: int, seed: int = 0, with_main_grad: bo
     ----------
     with_main_grad : bool
         If True, attach a float32 ``main_grad`` attribute to each weight tensor,
-        mimicking the ERNIE training convention where weight gradients are
+        mimicking the reference training convention where weight gradients are
         accumulated in float32 precision (not the bf16 .grad from autograd).
     """
     paddle.seed(seed)
@@ -208,9 +208,9 @@ def make_weights(I: int, H: int, E_local: int, seed: int = 0, with_main_grad: bo
 def accumulate_main_grad(*weights):
     """Accumulate bf16 autograd .grad into float32 .main_grad, then release .grad.
 
-    This mirrors the ERNIE training loop pattern where weight gradients are kept
+    This mirrors the reference training loop pattern where weight gradients are kept
     in float32 for optimizer precision.  See bf16_weight_grad() in
-    ernie-core/src/ernie_core/models/moe/token_dispatcher/fp8_utils.py for reference.
+    the reference Paddle implementation for comparison.
     """
     for w in weights:
         if w.grad is not None and hasattr(w, 'main_grad') and w.main_grad is not None:

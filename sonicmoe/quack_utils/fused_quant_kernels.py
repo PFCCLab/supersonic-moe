@@ -20,7 +20,7 @@ S80 — ISO32 fast-path (env: SONIC_MOE_DZ_ISO32=1):
   consumers; dz_row_scales and dz_col_scales contain the same byte values
   in their respective ISA layouts. Phase 0 audit
   (reports/iso32_dz_audit/audit.md) showed iso32 produces identical
-  downstream-GEMM RRMSE to 1×32 (ratio = 1.000×) on real Ernie-shape dz.
+  downstream-GEMM RRMSE to 1×32 (ratio = 1.000×) on real reference-shape dz.
 """
 
 import os
@@ -42,7 +42,7 @@ def _iso32_enabled() -> bool:
     """iso32 dz quant default = ON.
 
     Phase 0 audit (S80a) proved iso32 produces identical downstream-GEMM
-    RRMSE to 1×32 on real Ernie-shape dz (ratio 1.000× across 6 captures).
+    RRMSE to 1×32 on real reference-shape dz (ratio 1.000× across 6 captures).
     Phase 1B microbench: −60 µs/iter (−20.7%) in dz quant stage; multi-layer
     nsys (reports/mfu_s80b/): 2754→2693 µs/iter, 44.91%→45.92% MFU.
     Determinism CI passes. Set SONIC_MOE_DZ_ISO32=0 to fall back to 1×32.

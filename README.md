@@ -22,7 +22,7 @@ DeepEP topk metadata
   -> FP8 down-proj
   -> FP8-C-load GemmDGated backward
   -> iso32 dz dual quant
-  -> TMA reduce-add wgrad into framework main_grad
+  -> TMA reduce-add wgrad into ERNIE/Paddle main_grad
 ```
 
 Latest reference-shape benchmark (`T=8192,H=3072,I=1536,E=8,K=8`, Target GPU, nsys GPU-projection):
@@ -110,7 +110,7 @@ Read first:
 | 4 | [`docs/expert_interleave_weight_layout.md`](./docs/expert_interleave_weight_layout.md) | Expert Interleave weight layout: 5-layer benefit analysis + originality |
 | 5 | [`reports/sonic_moe_comprehensive_analysis.md`](./reports/sonic_moe_comprehensive_analysis.md) | broad technical analysis and roofline/precision/perf tables |
 | 6 | [`reports/fresh_benchmark_ws1/README.md`](./reports/fresh_benchmark_ws1/README.md) | latest sweep data and MFU fit |
-| 7 | [`reports/reference_shape_ncu/README.md`](./reports/ernie_shape_ncu_s78b/README.md) | NCU resource breakdown for the 6 GEMMs (reference shape) |
+| 7 | reference-shape NCU report | NCU resource breakdown for the 6 GEMMs (reference shape) |
 
 Important current insights:
 
@@ -228,7 +228,7 @@ for step in range(num_steps):
         out = node(x, tokens_per_expert, dispatched_indices, dispatched_probs)
         out.backward(grad)
     node.step()           # MUST run BEFORE optimizer.step():
-                          # converts native CUTLASS [E,2I,H] → framework split-half
+                          # converts native CUTLASS [E,2I,H] → ERNIE split-half
                           # [E,H,2I] in-place into expert.weight.main_grad,
                           # which the optimizer then reads.
     optimizer.step()
@@ -318,7 +318,7 @@ steady-state on iteration ≥ 2.
 |----------|-----------|:--------:|
 | **dx** (d/d hidden_states) | Paddle autograd through `_SonicMoEDeepEPFunc.backward` | cos=0.9975 |
 | **ds** (d/d dispatched_probs) | `_GatherRouterScores` PyLayer with custom Triton scatter (no CUB cascade) | cos=0.9971–0.9973 |
-| **dw1, dw2** | CUTLASS wgrad accumulates directly into the per-instance fused `[E, 2I, H]` / `[E, H, I]` native buffer (lazy-allocated on first backward); `node.step()` performs the in-place native→framework split-half layout conversion into `expert.weight.main_grad` before `optimizer.step()` reads it. | cos=0.9975 / 0.9971 |
+| **dw1, dw2** | CUTLASS wgrad accumulates directly into the per-instance fused `[E, 2I, H]` / `[E, H, I]` native buffer (lazy-allocated on first backward); `node.step()` performs the in-place native→ERNIE split-half layout conversion into `expert.weight.main_grad` before `optimizer.step()` reads it. | cos=0.9975 / 0.9971 |
 
 ### Precision (Session 65, FP8 vs BF16 gold, TMA Reduce-Add epilogue)
 
@@ -397,7 +397,7 @@ See `HANDOFF.md` for full kernel breakdown, memory notes, and next-step prioriti
 | 7 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log only; current-state correction block at top |
 | 8 | **Environment** | private env-notes file (`SONIC_MOE_ENV_NOTES`) — machine setup, Paddle compat pitfalls, perf methodology |
 
-> **Project state (clean handoff, 2026-05-09)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest reference-shape FP8 busy time is **2659.8 µs/iter** (**46.51% MFU**, **1.63x vs true BF16**). BF16 baseline (4346 µs) now verified clean via nsys (zero FP8 kernels). Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization (live-range shortening / fission), NOT direct dz-quant epilogue fusion. MXFP8 128-row alignment waste analysis completed — see `/panzhaowu/bkup/mxfp8_alignment_waste_analysis.pdf`.
+> **Project state (clean handoff, 2026-05-09)**: branch `race-fix-paddle`. FP8 frontier remains green: precision (out/dx/dw1/dw2/ds) cos≥0.997, determinism hard-gated, route-level padding active, TMA reduce-add wgrad default, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated. Latest reference-shape FP8 busy time is **2659.8 µs/iter** (**46.51% MFU**, **1.63x vs true BF16**). BF16 baseline (4346 µs) now verified clean via nsys (zero FP8 kernels). Read `HANDOFF.md` before any kernel work; the current P0 is structural dgrad1 optimization (live-range shortening / fission), NOT direct dz-quant epilogue fusion. MXFP8 128-row alignment waste analysis is complete.
 
 **Quick-validate the frontier before resuming work**:
 ```bash

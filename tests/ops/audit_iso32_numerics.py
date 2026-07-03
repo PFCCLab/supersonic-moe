@@ -2,7 +2,7 @@
 
 Pure PyTorch implementation of both quant flavors so we don't have to deal with
 the ISA-tile-packed scale layout. Compares quant→dequant fidelity vs the BF16
-ground truth on realistic ERNIE expert-weight shapes.
+ground truth on realistic reference expert-weight shapes.
 
 Metrics per-shape:
 - cosine similarity   (closer to 1 better)

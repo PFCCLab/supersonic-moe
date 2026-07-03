@@ -43,7 +43,7 @@
   "perf": {
     "shape": "T8192-H3072-I1536-E8-K8",
     "gpu_projection_us_per_iter": {
-      "_what": "nsys GPU-projection µs/iter, FP8 fwd+bwd, canonical Ernie shape. S78 actual ~2740 µs on B200 SM 10.3.",
+      "_what": "nsys GPU-projection µs/iter, FP8 fwd+bwd, canonical reference shape. S78 actual ~2740 µs on B200 SM 10.3.",
       "_actual_s78b_us": 2740,
       "budget": 2800,
       "warn": 2750

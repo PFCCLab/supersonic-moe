@@ -872,7 +872,7 @@ def main():
             (300, 8, 384),       # non-128-aligned T
             (1024, 8, 1536),     # medium
             (4096, 8, 1536),     # larger
-            (8192, 8, 1536),     # production-like ERNIE
+            (8192, 8, 1536),     # production-like reference
             (8192, 128, 1536),   # 128 experts
             (32768, 8, 1536),    # 32K tokens
         ]:

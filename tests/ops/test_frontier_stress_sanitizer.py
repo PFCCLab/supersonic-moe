@@ -320,7 +320,7 @@ def main():
     print("=" * 72)
 
     sani_cases = [
-        (8192, 8, 8, 1536),    # Ernie production
+        (8192, 8, 8, 1536),    # production-like reference
         (16384, 8, 8, 1536),   # Large T
         (4096, 8, 32, 1536),   # Large E
         (8192, 8, 8, 4096),    # Large I (peak MFU shape)
@@ -336,7 +336,7 @@ def main():
     print("=" * 72)
 
     prec_cases = [
-        (8192, 8, 8, 1536),    # Ernie standard
+        (8192, 8, 8, 1536),    # reference standard
         (16384, 8, 8, 1536),   # 2x tokens
         (8192, 8, 8, 4096),    # Peak MFU shape
         (4096, 8, 32, 1536),   # E=32

@@ -113,7 +113,7 @@ def _run_fwd_bwd(node, x, grad_out, tpe, dispatched_indices, dispatched_probs, n
 # ─── Shape configurations ───────────────────────────────────────────────
 # (T, E, K, H, I) — covers small/medium/large/wide/unaligned
 STRESS_SHAPES = [
-    # Ernie production shape
+    # production-like reference shape
     (8192, 8, 8, 3072, 1536),
     # Small (launch-overhead dominated)
     (128, 8, 8, 3072, 1536),
@@ -205,8 +205,8 @@ def test_multi_iter_stability():
     assert torch.isfinite(out_t).all(), "Output diverged after 10 iterations"
 
 
-def test_determinism_ernie_shape():
-    """Ernie production shape is bit-deterministic across runs."""
+def test_determinism_reference_shape():
+    """production-like reference shape is bit-deterministic across runs."""
     T, E, K, H, I = 8192, 8, 8, 3072, 1536
     functional._ALIGNMENT_ASSUMED = True
     functional._ALIGNMENT_STREAK = 100
@@ -246,11 +246,11 @@ def test_gradient_flow():
     flush_native_grads()
     _run_fwd_bwd(node, x, grad_out, tpe, d_idx, d_probs, n_iters=1)
 
-    # node.step() converts native grads to ernie-layout grads
+    # node.step() converts native grads to ERNIE-layout grads
     node.step()
     torch.cuda.synchronize()
 
-    # After step(), the weight .grad should be populated by the native→ernie conversion
+    # After step(), the weight .grad should be populated by the native→ERNIE conversion
     # Check that the output is finite (main correctness gate for gradient flow)
     out = node.forward(x, tpe, dispatched_indices=d_idx, dispatched_probs=d_probs)
     torch.cuda.synchronize()

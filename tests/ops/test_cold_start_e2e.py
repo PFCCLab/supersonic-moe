@@ -9,7 +9,7 @@ Phases:
   1. Import + CUDA extension build
   2. Warmup via fwd+bwd (JIT compilation)
   3. Multi-shape precision audit (expected + unexpected shapes)
-  4. nsys GPU-projection for Ernie shape (optional, --nsys flag)
+  4. nsys GPU-projection for reference shape (optional, --nsys flag)
 
 Usage:
     CUDA_VISIBLE_DEVICES=2 python tests/ops/test_cold_start_e2e.py
@@ -36,11 +36,11 @@ E, H, I = 8, 3072, 1536
 # Shapes: (N_recv, topk, description, is_warmup_shape)
 SHAPES = [
     (1024,  8, "warmup",       True),
-    (8192,  8, "ernie",        False),
-    (4096,  8, "half-ernie",   False),
+    (8192,  8, "reference",        False),
+    (4096,  8, "half-reference",   False),
     (2048,  4, "small-topk4",  False),
     (512,   8, "tiny",         False),
-    (16384, 8, "double-ernie", False),
+    (16384, 8, "double-reference", False),
 ]
 
 COS_THRESHOLD = 0.99

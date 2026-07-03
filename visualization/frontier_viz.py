@@ -440,7 +440,7 @@ def _draw_annotation(ax, xy, text, fontsize=6.5, color="#6B7280", **kw):
 def fig13_computation_dataflow(data: GridData) -> None:
     """Side-by-side BF16 vs FP8 zero-materialization data flow.
 
-    Uses T=8192, E=8, I=1536 as the representative shape (Ernie-scale).
+    Uses T=8192, E=8, I=1536 as the representative shape (reference-scale).
     Shows the key architectural difference: FP8 avoids TK-sized materialization
     via quantize_and_pack(T-sized) + ZeroMat gather-on-the-fly.
     """

@@ -5,7 +5,7 @@ Verifies:
   1. ``out / dx / ds / dw1 / dw2`` from ``recompute_z=True`` match the
      ``recompute_z=False`` baseline (FP8 path) within strict tolerances.
   2. Forward peak memory drops when ``recompute_z=True`` (z_fp8 cache no
-     longer holds ~213 MiB / layer at ERNIE shape).
+     longer holds ~213 MiB / layer at reference shape).
 
 Each test runs in a subprocess (matches the rest of the FP8 ops harness).
 

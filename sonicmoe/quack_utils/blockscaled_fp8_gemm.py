@@ -612,7 +612,7 @@ def _fused_z_save_y1_quant_kernel(
     pid_1 < z_col_blocks  -> process Z_GROUPS_PER_BLOCK groups of z (raw scales)
     pid_1 >= z_col_blocks -> process 1 k-tile of y1 (ISA-packed scales)
 
-    Ernie shape: grid=(2048, 8+12)=(2048, 20) = 40960 blocks
+    reference shape: grid=(2048, 8+12)=(2048, 20) = 40960 blocks
     vs old 1D: (2048,) = 2048 blocks -> 20× more parallelism.
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
@@ -733,7 +733,7 @@ def fused_z_save_y1_quant(
     quantization run as independent column-parallel work units.  Each block
     checks pid_1 < z_col_blocks to decide whether it processes z or y1.
 
-    Ernie shape: grid = (2048, 8+12) = 40960 blocks
+    reference shape: grid = (2048, 8+12) = 40960 blocks
     vs separate:  16384 + 24576 = 40960 blocks (same parallelism, 1 launch)
     vs old 1D:   (2048,) = 2048 blocks (20× less parallelism)
 
@@ -2000,7 +2000,7 @@ def dual_quantize_varlen(
 #
 # Insight (precision-validated by tools/audit_dz_iso32_quality.py):
 # Under e4m3, a single 32×32 amax produces identical downstream-GEMM RRMSE
-# vs the production 1×32 dual-amax scheme on real Ernie-shape dz tensors
+# vs the production 1×32 dual-amax scheme on real reference-shape dz tensors
 # (ratio = 1.000× across 6 captures × 3 routing distributions).
 #
 # Because the per-block amax is shared across the row/col axes:
