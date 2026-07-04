@@ -1302,11 +1302,6 @@ class _UpProjection(torch.autograd.Function):
         ctx._has_b1 = b1 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._prequant_activation_payload = prequant_activation_payload is not None
-        ctx._prequant_activation_payload_len = (
-            len(prequant_activation_payload)
-            if prequant_activation_payload is not None
-            else 0
-        )
         ctx._w1_original = w1_original
         ctx._wgrad_w1_accumulator = _main_grad_accumulator(w1_original)
 
@@ -1707,7 +1702,7 @@ class _UpProjection(torch.autograd.Function):
         if ctx._has_num_activated:
             grads.append(None)
         if ctx._prequant_activation_payload:
-            grads.append(tuple(None for _ in range(ctx._prequant_activation_payload_len)))
+            grads.append((None, None))
         if ctx._wgrad_w1_accumulator is not None:
             _apply_weight_backward_hook(ctx._w1_original)
         return tuple(grads)
