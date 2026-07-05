@@ -66,10 +66,27 @@ class _TopkOutputCache:
 
     Eliminates per-call allocations of ~10 output tensors + workspace.
     Each entry grows by 1.25x when re-allocated to amortize cost.
+
+    Fast path: when a call requests the SAME (shape, dtype, device) as the
+    previous call for that ``name``, we return the *exact same tensor object*
+    with zero Paddle dispatch (~0.05µs dict hit) — no ``view(-1)[:n].view()``
+    round-trip (measured ~8.3µs, slower than a fresh ``torch.empty`` at 3.9µs).
+    Only on a shape change do we recompute the sliced view.  This matters
+    because these scratch tensors are re-requested with a stable shape across
+    the many sub-batch calls within a step.
+
+    IMPORTANT: entries handed out here alias a shared backing buffer and are
+    only safe for **scratch** that does NOT survive into backward.  Never cache
+    a tensor that is ctx-saved (x_gather_idx / s_scatter_idx /
+    s_reverse_scatter_idx / naept / topk_scores / score_src_idx /
+    expert_offsets), because interleaved forward/backward (pipeline parallel,
+    1F1B) would let a later forward overwrite an earlier layer's saved metadata.
     """
 
     def __init__(self):
         self._bufs: dict[str, torch.Tensor] = {}
+        # Per-name memo of the last exact view returned, keyed by (shape, dtype, device).
+        self._views: dict[str, tuple[tuple, object, str, torch.Tensor]] = {}
 
     def get_or_alloc(
         self,
@@ -80,24 +97,38 @@ class _TopkOutputCache:
         zero: bool = False,
     ) -> torch.Tensor:
         """Return a tensor of *exact* ``shape``.  Reuses cached buffer if large enough."""
+        shape = tuple(shape)
+        dev_s = str(device)
+
+        # Fast path: identical (shape, dtype, device) as last time → return the
+        # memoized view object directly (no view/slice dispatch).
+        memo = self._views.get(name)
+        if memo is not None:
+            m_shape, m_dtype, m_dev, m_view = memo
+            if m_shape == shape and m_dtype == dtype and m_dev == dev_s:
+                if zero:
+                    m_view.zero_()
+                return m_view
+
         needed = math.prod(shape) if shape else 1
         t = self._bufs.get(name)
 
-        if t is not None and t.dtype == dtype and str(t.device) == str(device) and t.numel() >= needed:
+        if t is not None and t.dtype == dtype and str(t.device) == dev_s and t.numel() >= needed:
             view = t.view(-1)[:needed].view(shape)
-            if zero:
-                view.zero_()
-            return view
+        else:
+            alloc = max(needed, int(t.numel() * 1.25) if t is not None else needed)
+            t = torch.empty(alloc, dtype=dtype, device=device)
+            self._bufs[name] = t
+            view = t[:needed].view(shape)
 
-        alloc = max(needed, int(t.numel() * 1.25) if t is not None else needed)
-        t = torch.empty(alloc, dtype=dtype, device=device)
+        self._views[name] = (shape, dtype, dev_s, view)
         if zero:
-            t.zero_()
-        self._bufs[name] = t
-        return t[:needed].view(shape)
+            view.zero_()
+        return view
 
     def clear(self):
         self._bufs.clear()
+        self._views.clear()
 
 
 # Global cache instance — cleared by invalidate_topk_cache().
@@ -471,67 +502,37 @@ def _deepep_topk_to_sonic_metadata_cuda(
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
         return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
 
-    # NOTE: ``seg_starts`` / ``real_bases`` and the kernel scratch buffers are
-    # allocated below alongside the device-typed outputs. An earlier draft
-    # also pre-allocated ``expert_offsets`` etc. here without ``device=`` —
-    # those duplicates were dead code immediately overwritten by the block
-    # below, and under raw torch they would have been CPU tensors silently
-    # smuggled into the CUDA launcher. Removed S76.
-
-    # ── Output tensors (saved on autograd ctx) — MUST be per-call ────────────
-    # Bug 2026-04: when two MoE layers' forwards run before any backward (true
-    # in pipeline parallel and 1F1B-style schedules), reusing a global cache
-    # for these outputs causes the second forward to overwrite the first
-    # layer's saved metadata, silently corrupting its dw1/dw2/dx grads. The
-    # extra alloc cost is ~5–10 µs total via the torch caching allocator,
-    # negligible vs. the GEMM cost; correctness is non-negotiable.
-    expert_offsets = torch.empty(E + 1, dtype=torch.int32, device=device)
-    seg_starts = torch.empty(E, dtype=torch.int32, device=device)
-    real_bases = torch.empty(E, dtype=torch.int32, device=device)
-    x_gather_idx = torch.zeros(TK_padded, dtype=torch.int32, device=device)
-    s_scatter_idx = torch.empty(TK_padded, dtype=torch.int32, device=device)
-    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
-    topk_scores = torch.zeros(TK_padded, dtype=torch.float32, device=device)
-    naept = torch.empty(N_recv + 1, dtype=torch.int32, device=device)
-    score_src_idx = torch.empty(TK, dtype=torch.int32, device=device)
-
-    num_blocks = (N_recv + 31) // 32  # ROWS_PER_BLOCK = 32
-    # Workspace layout (must match kernel.cu's launcher partition):
-    #   block_hist[scatter_blocks*E] + block_offset[scatter_blocks*E]
-    #   + block_naept_sum[scatter_blocks] + block_naept_base[scatter_blocks]
-    # = 2*num_blocks*(E+1) int32 slots.
-    # NOTE: an earlier (pre-session-71) layout used `2*num_blocks*E + 1`
-    # (single int32 completion-flag tail). The session-71 kernel rewrite added
-    # per-block naept arrays but did not update this caller, causing the
-    # launcher to write `2*num_blocks` ints past the buffer end -> silent
-    # cudaErrorIllegalAddress in downstream consumers when the OOB region
-    # happens to sit on top of a live allocation. Keep this size exact.
-    cumsum_workspace = torch.empty([2 * num_blocks * (E + 1)], dtype=torch.int32, device=device)
-
+    # ── Output + scratch allocation now lives in C++ ─────────────────────────
+    # The launcher allocates all output tensors (expert_offsets / x_gather_idx /
+    # s_scatter_idx / s_reverse_scatter_idx / naept / topk_scores /
+    # score_src_idx) plus its internal scratch (seg_starts / real_bases /
+    # cumsum_workspace) via the caching allocator and returns the 7 outputs.
+    # This removes ~9-11 Python empty/zeros dygraph dispatches per call.
+    # Each call gets INDEPENDENT storage (not cross-call reuse), so ctx-saved
+    # metadata stays correct under interleaved forward/backward (PP / 1F1B) —
+    # semantically identical to the previous per-call Python allocation.
     _stream_obj = torch.cuda.current_stream(device)
     stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
 
-    deepep_topk_metadata_cuda(
-        dispatched_indices=dispatched_indices.contiguous(),
-        dispatched_probs=dispatched_probs.contiguous(),
-        tokens_per_expert=tpe_dev,
-        expert_offsets=expert_offsets,
-        seg_starts=seg_starts,
-        real_bases=real_bases,
-        x_gather_idx=x_gather_idx,
-        s_scatter_idx=s_scatter_idx,
-        s_reverse_scatter_idx=s_reverse_scatter_idx,
-        topk_scores=topk_scores,
-        naept=naept,
-        global_block_cumsum=cumsum_workspace,
-        score_src_idx=score_src_idx,
-        N_recv=N_recv,
-        E=E,
-        topk=topk,
-        TK=TK,
-        TK_padded=TK_padded,
-        alignment=block,
-        stream=stream,
+    (
+        expert_offsets,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        naept,
+        topk_scores,
+        score_src_idx,
+    ) = deepep_topk_metadata_cuda(
+        dispatched_indices.contiguous(),
+        dispatched_probs.contiguous(),
+        tpe_dev,
+        N_recv,
+        E,
+        topk,
+        TK,
+        TK_padded,
+        block,
+        stream,
     )
 
     # topk_scores is TK_padded-sized with zeros at pad positions.

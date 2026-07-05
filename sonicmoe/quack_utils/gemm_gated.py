@@ -102,6 +102,7 @@ def gemm_gated(
     postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
     swiglu_clamp_value: float = 0.0,
     postact_bf16_trunc: bool = False,
+    current_stream=None,
 ) -> None:
     if activation != "swiglu":
         swiglu_clamp_value = 0.0
@@ -241,8 +242,16 @@ def gemm_gated(
         A_idx,
     )
 
-    _stream_obj = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(_stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream)
+    _stream_obj = (
+        current_stream
+        if current_stream is not None
+        else torch.cuda.current_stream()
+    )
+    current_stream = cuda.CUstream(
+        _stream_obj.stream_base.raw_stream
+        if hasattr(_stream_obj, "stream_base")
+        else _stream_obj.cuda_stream
+    )
 
     blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None

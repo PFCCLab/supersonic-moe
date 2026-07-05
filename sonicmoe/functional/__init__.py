@@ -230,6 +230,7 @@ def _fused_blockscaled_gated_forward(
     w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
     store_z: bool = True,
     fp8_config: _FP8Config | None = None,
+    current_stream=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
@@ -331,6 +332,7 @@ def _fused_blockscaled_gated_forward(
         postact_scale_out=postact_scale_out,
         swiglu_clamp_value=cfg.swiglu_clamp_value,
         postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
+        current_stream=current_stream,
     )
     del x_fp8, x_scales_tk_e8m0
 
@@ -1121,6 +1123,7 @@ class _UpProjection(torch.autograd.Function):
                         x_fp8_pre=prequant_activation_payload,
                         w1_fp8_pre=w1_fp8, store_z=not cfg.recompute_z,
                         fp8_config=cfg,
+                        current_stream=stream_id,
                     )
                     if cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);

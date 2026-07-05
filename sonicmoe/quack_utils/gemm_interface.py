@@ -147,6 +147,7 @@ def gemm_gated_tuned(
     postact_scale_out: Optional[Tensor] = None,  # ISA-packed UE8M0 scales for postact (y1) quant
     swiglu_clamp_value: float = 0.0,
     postact_bf16_trunc: bool = False,
+    current_stream=None,
 ) -> None:
     if config is None:
         config = quack_default_config(A.device)
@@ -196,6 +197,7 @@ def gemm_gated_tuned(
         postact_scale_out=postact_scale_out,
         swiglu_clamp_value=swiglu_clamp_value,
         postact_bf16_trunc=postact_bf16_trunc,
+        current_stream=current_stream,
     )
 
 
@@ -323,6 +325,7 @@ def gemm_gated(
     postact_scale_out: Optional[Tensor] = None,
     swiglu_clamp_value: float = 0.0,
     postact_bf16_trunc: bool = False,
+    current_stream=None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -343,11 +346,26 @@ def gemm_gated(
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
     if z_scale_out is not None or postact_scale_out is not None:
         # Epilogue quant (z or postact/y1): bypass custom_op, call tuned fn directly (untuned for blockscaled).
-        fn = partial(gemm_gated_tuned.fn, config=None)
-        fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx,
-           dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out,
-           postact_scale_out=postact_scale_out, swiglu_clamp_value=swiglu_clamp_value,
-           postact_bf16_trunc=postact_bf16_trunc)
+        gemm_gated_tuned.fn(
+            A,
+            B,
+            preact_out,
+            postact_out,
+            C,
+            bias,
+            activation,
+            cu_seqlens_m,
+            A_idx,
+            dynamic_scheduler,
+            config=None,
+            a_scales=a_scales,
+            b_scales=b_scales,
+            z_scale_out=z_scale_out,
+            postact_scale_out=postact_scale_out,
+            swiglu_clamp_value=swiglu_clamp_value,
+            postact_bf16_trunc=postact_bf16_trunc,
+            current_stream=current_stream,
+        )
     else:
         gemm_gated_out(
             A, B, preact_out, postact_out, C, bias, activation,

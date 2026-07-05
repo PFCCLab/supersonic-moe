@@ -18,5 +18,5 @@
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `__init__.py` | Package marker and re-export surface. | — |
-| `kernel.cu` | CUDA source for kernel. | — |
+| `__init__.py` | `@torch.library.custom_op` + `@cpp_jit()` stub. Op takes (indices, probs, tokens_per_expert, dims, stream) and **returns** the 7 metadata tensors (`mutates_args=()`) instead of mutating pre-allocated buffers. | — |
+| `kernel.cu` | CUDA source. Launcher allocates the 7 output tensors + scratch via the caching allocator and returns them (independent storage per call → PP/1F1B ctx-save safe); the 4 kernels (histogram / block_offset_scan / prefix_sums / scatter_and_fixup) are unchanged. | — |
