@@ -69,10 +69,12 @@ class SonicMoEConfig:
         fused_zy1_quant: Enable fused z+y1 quantization.
             Env: ``SONIC_MOE_FP8_FUSED_ZY1_QUANT``. Default: False.
         fuse_y1_quant: Enable y1 postact FP8 quantization in the up-proj epilogue.
-            Python-config only. Default: False.
+            Python-config only. Default: True.
         fuse_y1_bf16_trunc: RNE-truncate fused y1 postact to bf16 before FP8 quant.
             Python-config only. Default: tracks ``fuse_y1_quant`` (None ->
             follows fuse_y1_quant); set explicitly to decouple.
+        fused_weight_layout: Use fused Triton kernels for expert weight layout
+            conversion. Python-config only. Default: True.
         assume_aligned: Force alignment assumption (skip D2H check).
             Env: ``SONIC_MOE_FP8_ASSUME_ALIGNED``. Default: False.
         stagewise_memory: Enable per-stage memory logging.
@@ -92,6 +94,7 @@ class SonicMoEConfig:
     fused_zy1_quant: Optional[bool] = None
     fuse_y1_quant: Optional[bool] = None
     fuse_y1_bf16_trunc: Optional[bool] = None
+    fused_weight_layout: Optional[bool] = None
     assume_aligned: Optional[bool] = None
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
@@ -164,7 +167,7 @@ class SonicMoEConfig:
     def resolve_fuse_y1_quant(self) -> bool:
         if self.fuse_y1_quant is not None:
             return self.fuse_y1_quant
-        return False
+        return True
 
     def resolve_fuse_y1_bf16_trunc(self) -> bool:
         # Defaults to tracking fuse_y1_quant: enabling the fused y1 quant turns
@@ -173,6 +176,11 @@ class SonicMoEConfig:
         if self.fuse_y1_bf16_trunc is not None:
             return self.fuse_y1_bf16_trunc
         return self.resolve_fuse_y1_quant()
+
+    def resolve_fused_weight_layout(self) -> bool:
+        if self.fused_weight_layout is not None:
+            return self.fused_weight_layout
+        return True
 
     def resolve_assume_aligned(self) -> bool:
         if self.assume_aligned is not None:

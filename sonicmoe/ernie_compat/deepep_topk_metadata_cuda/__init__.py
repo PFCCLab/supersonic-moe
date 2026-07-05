@@ -23,34 +23,13 @@ from ...jit import cpp_jit
 
 @torch.library.custom_op(
     f"{LIBRARY_NAME}::deepep_topk_metadata_cuda",
-    mutates_args={
-        "expert_offsets",
-        "seg_starts",
-        "real_bases",
-        "x_gather_idx",
-        "s_scatter_idx",
-        "s_reverse_scatter_idx",
-        "topk_scores",
-        "naept",
-        "global_block_cumsum",
-        "score_src_idx",
-    },
+    mutates_args=(),
 )
 @cpp_jit()
 def deepep_topk_metadata_cuda(
     dispatched_indices: torch.Tensor,
     dispatched_probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    expert_offsets: torch.Tensor,
-    seg_starts: torch.Tensor,
-    real_bases: torch.Tensor,
-    x_gather_idx: torch.Tensor,
-    s_scatter_idx: torch.Tensor,
-    s_reverse_scatter_idx: torch.Tensor,
-    topk_scores: torch.Tensor,
-    naept: torch.Tensor,
-    global_block_cumsum: torch.Tensor,
-    score_src_idx: torch.Tensor,
     N_recv: int,
     E: int,
     topk: int,
@@ -58,4 +37,4 @@ def deepep_topk_metadata_cuda(
     TK_padded: int,
     alignment: int,
     stream: int,
-) -> None: ...
+) -> list[torch.Tensor]: ...

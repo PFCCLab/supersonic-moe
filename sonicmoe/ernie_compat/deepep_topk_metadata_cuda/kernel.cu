@@ -18,6 +18,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <vector>
 
 static constexpr int ROWS_PER_BLOCK = 32;  // = warp size for ballot
 static constexpr int BLOCK_DIM = 256;
@@ -501,21 +502,46 @@ void scatter_and_fixup_kernel(
 
 // ============================================================================
 //  C++ entry point
+//
+//  Allocation contract: this launcher now OWNS its output tensors. It allocates
+//  them via the caching allocator (torch::empty/zeros) and returns them,
+//  instead of receiving pre-allocated buffers through ``mutates_args``.
+//  Motivation: the Python side previously issued ~9-11
+//  ``torch.empty``/``torch.zeros`` dygraph dispatches per call. Sinking
+//  allocation into C++ turns those into caching-allocator calls with zero
+//  Python dispatch.
+//
+//  Correctness note (ctx-save / PP-1F1B safety): every torch::empty/zeros
+//  below returns an INDEPENDENT storage per call — this is NOT cross-call
+//  buffer reuse.  The returned tensors (expert_offsets / x_gather_idx /
+//  s_scatter_idx / s_reverse_scatter_idx / naept / topk_scores /
+//  score_src_idx) are saved on the autograd ctx by _UpProjection /
+//  _DownProjection; giving each forward its own storage keeps interleaved
+//  forward/backward (pipeline parallel, 1F1B) correct — identical semantics
+//  to the previous per-call Python allocation.  ``seg_starts`` / ``real_bases``
+//  / ``cumsum_workspace`` are pure scratch consumed entirely within this
+//  launch and never escape.
+//
+//  The 4 kernels (histogram / block_offset_scan / prefix_sums /
+//  scatter_and_fixup) are bit-identical to the previous revision; only the
+//  ownership of the output buffers changed.
+//
+//  Returned vector order (must match the Python thin wrapper's unpacking):
+//    [0] expert_offsets         int32 [E+1]
+//    [1] x_gather_idx           int32 [TK_padded]  (zero-init)
+//    [2] s_scatter_idx          int32 [TK_padded]
+//    [3] s_reverse_scatter_idx  int32 [TK]
+//    [4] naept                  int32 [N_recv+1]
+//    [5] topk_scores            float32 [TK_padded] (zero-init)
+//    [6] score_src_idx          int32 [TK]
+//
+//  Caller guarantees TK > 0 and N_recv > 0 (the TK==0 edge case is handled in
+//  Python before dispatch, matching the previous behavior).
 // ============================================================================
-void deepep_topk_metadata_cuda(
+std::vector<torch::Tensor> deepep_topk_metadata_cuda(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
     torch::Tensor& tokens_per_expert,
-    torch::Tensor& expert_offsets,
-    torch::Tensor& seg_starts,
-    torch::Tensor& real_bases,
-    torch::Tensor& x_gather_idx,
-    torch::Tensor& s_scatter_idx,
-    torch::Tensor& s_reverse_scatter_idx,
-    torch::Tensor& topk_scores,
-    torch::Tensor& naept,
-    torch::Tensor& global_block_cumsum,  // reused as workspace
-    torch::Tensor& score_src_idx,
     int64_t N_recv,
     int64_t E,
     int64_t topk,
@@ -526,21 +552,38 @@ void deepep_topk_metadata_cuda(
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    if (N_recv == 0 || TK == 0) {
-        cudaMemsetAsync(naept.data_ptr<int>(), 0, (N_recv + 1) * sizeof(int), stream);
-        return;
-    }
+    auto opt_i = torch::dtype(torch::kInt32).device(torch::kCUDA);
+    auto opt_f = torch::dtype(torch::kFloat32).device(torch::kCUDA);
+
+    // ── Output tensors (saved on autograd ctx) — independent storage/call ────
+    // Mirror the exact init the previous Python path used: x_gather_idx and
+    // topk_scores are zero-initialised (pad slots must read 0), the rest are
+    // fully written by the kernels below so torch::empty is sufficient.
+    torch::Tensor expert_offsets        = torch::empty({E + 1}, opt_i);
+    torch::Tensor x_gather_idx          = torch::zeros({TK_padded}, opt_i);
+    torch::Tensor s_scatter_idx         = torch::empty({TK_padded}, opt_i);
+    torch::Tensor s_reverse_scatter_idx = torch::empty({TK}, opt_i);
+    torch::Tensor topk_scores           = torch::zeros({TK_padded}, opt_f);
+    torch::Tensor naept                 = torch::empty({N_recv + 1}, opt_i);
+    torch::Tensor score_src_idx         = torch::empty({TK}, opt_i);
 
     const int scatter_blocks = (N_recv + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
 
-    // Workspace layout within global_block_cumsum:
+    // ── Pure scratch (NOT returned, NOT ctx-saved) ───────────────────────────
+    torch::Tensor seg_starts = torch::empty({E}, opt_i);
+    torch::Tensor real_bases = torch::empty({E}, opt_i);
+    // Workspace layout (must match the launcher partition below):
+    //   block_hist[scatter_blocks*E] + block_offset[scatter_blocks*E]
+    //   + block_naept_sum[scatter_blocks] + block_naept_base[scatter_blocks]
+    // = 2*scatter_blocks*(E+1) int32 slots.
+    torch::Tensor cumsum_workspace =
+        torch::empty({2 * scatter_blocks * (static_cast<int64_t>(E) + 1)}, opt_i);
+
+    // Workspace layout within cumsum_workspace:
     //   [0 .. scatter_blocks*E-1]:                  block_hist
     //   [scatter_blocks*E .. 2*scatter_blocks*E-1]: block_offset
-    //   [2*scatter_blocks*E] (legacy):              previously completion_flag
-    //                                               (no longer used; barrier
-    //                                                is now a separate kernel
-    //                                                launch).
-    int* workspace = global_block_cumsum.data_ptr<int>();
+    //   [2*scatter_blocks*E ..]:                    block_naept_sum / base
+    int* workspace = cumsum_workspace.data_ptr<int>();
     int* block_hist = workspace;
     int* block_offset = workspace + scatter_blocks * E;
     int* block_naept_sum = workspace + 2 * scatter_blocks * E;
@@ -590,12 +633,7 @@ void deepep_topk_metadata_cuda(
     // ── Kernel 2: Scatter + fixup ────────────────────────────────────────────
     // Grid must cover ALL scatter blocks: scatter phase relies on blockIdx.x
     // mapping 1:1 to a 32-row chunk of N_recv (block_row_base = blockIdx.x*32).
-    // Capping the grid here would silently skip rows beyond cap*32 — which is
-    // exactly what caused the SEQ_LEN ≥ 12K illegal-memory-access in
-    // token_gather_sum_kernel: scatter_blocks=2712 capped at 2048 left rows
-    // 65536..86768 unscattered, so x_gather_idx beyond TK_padded position
-    // 2048*32 stayed at the pad-fill default and downstream gathers tried to
-    // read 0-row data using s_scatter_idx pointing past valid topk_scores.
+    // Capping the grid here would silently skip rows beyond cap*32.
     // Pad-fill (Phase 2) uses a grid-stride loop, so any grid ≥ scatter_blocks
     // is correct and equally efficient.
     int grid2_blocks = scatter_blocks;
@@ -631,25 +669,25 @@ void deepep_topk_metadata_cuda(
     else if (topk <= 8) { LAUNCH_K2(8); }
     else { LAUNCH_K2(16); }
     #undef LAUNCH_K2
+
+    return {
+        expert_offsets,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        naept,
+        topk_scores,
+        score_src_idx,
+    };
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("deepep_topk_metadata_cuda",
           &deepep_topk_metadata_cuda,
-          "DeepEP topk metadata: 2-kernel histogram + scatter (CUDA)",
+          "DeepEP topk metadata: allocates + returns metadata tensors (CUDA)",
           py::arg("dispatched_indices"),
           py::arg("dispatched_probs"),
           py::arg("tokens_per_expert"),
-          py::arg("expert_offsets"),
-          py::arg("seg_starts"),
-          py::arg("real_bases"),
-          py::arg("x_gather_idx"),
-          py::arg("s_scatter_idx"),
-          py::arg("s_reverse_scatter_idx"),
-          py::arg("topk_scores"),
-          py::arg("naept"),
-          py::arg("global_block_cumsum"),
-          py::arg("score_src_idx"),
           py::arg("N_recv"),
           py::arg("E"),
           py::arg("topk"),
