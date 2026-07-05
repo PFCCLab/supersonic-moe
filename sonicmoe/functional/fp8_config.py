@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 
-from ..config import get_active_config
+from ..config import SonicMoEConfig, get_active_config
 from .utils import is_fp8_active
 
 
@@ -101,15 +101,15 @@ def _use_fused_blockscaled_gated() -> bool:
 
 
 def _use_fuse_y1_quant() -> bool:
-    """Fuse y1 (=SwiGLU(z)) FP8 quant into the up-proj GEMM epilogue (default OFF).
+    """Fuse y1 (=SwiGLU(z)) FP8 quant into the up-proj GEMM epilogue.
 
-    This is intentionally Python-config only: set ``SonicMoEConfig(fuse_y1_quant=True)``
-    to enable it.  No standalone env flag is consulted here.
+    This is intentionally Python-config only.  It defaults on through
+    ``SonicMoEConfig`` and does not consult a standalone env flag.
     """
     cfg = get_active_config()
     if cfg is not None:
         return cfg.resolve_fuse_y1_quant()
-    return False
+    return SonicMoEConfig().resolve_fuse_y1_quant()
 
 
 def _use_fuse_y1_bf16_trunc() -> bool:
@@ -122,7 +122,19 @@ def _use_fuse_y1_bf16_trunc() -> bool:
     cfg = get_active_config()
     if cfg is not None:
         return cfg.resolve_fuse_y1_bf16_trunc()
-    return False
+    return SonicMoEConfig().resolve_fuse_y1_bf16_trunc()
+
+
+def _use_fused_weight_layout() -> bool:
+    """Use fused expert weight layout conversion kernels.
+
+    This is Python-config only and defaults on.  Fleet integration consults the
+    same resolver before choosing the fused layout path.
+    """
+    cfg = get_active_config()
+    if cfg is not None:
+        return cfg.resolve_fused_weight_layout()
+    return SonicMoEConfig().resolve_fused_weight_layout()
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +150,7 @@ class _FP8Config:
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "_fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
         "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant", "fuse_y1_bf16_trunc",
+        "fused_weight_layout",
     )
 
     def __init__(self) -> None:
@@ -153,6 +166,7 @@ class _FP8Config:
         self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
         self.fuse_y1_quant: bool = _use_fuse_y1_quant()
         self.fuse_y1_bf16_trunc: bool = _use_fuse_y1_bf16_trunc()
+        self.fused_weight_layout: bool = _use_fused_weight_layout()
         _active = get_active_config()
         self.swiglu_clamp_value: float = (
             _active.resolve_swiglu_clamp_value() if _active is not None else 0.0
@@ -194,6 +208,7 @@ class _FP8Config:
         cfg.swiglu_clamp_value = 0.0
         cfg.fuse_y1_quant = False
         cfg.fuse_y1_bf16_trunc = False
+        cfg.fused_weight_layout = False
         return cfg
 
 
