@@ -32,6 +32,27 @@ def _make_cute_tensor_dynamic(tensor: torch.Tensor, leading_dim: int) -> cute.Te
     )
 
 
+def _validate_16b_dynamic_alignment(name: str, tensor: Optional[torch.Tensor]) -> None:
+    if tensor is None:
+        return
+    elem_size = tensor.element_size()
+    if tensor.data_ptr() % 16 != 0:
+        raise RuntimeError(
+            f"BF16 wgrad {name} data_ptr must be 16-byte aligned, "
+            f"got data_ptr % 16 = {tensor.data_ptr() % 16}"
+        )
+    for dim, stride in enumerate(tensor.stride()):
+        # Unit stride is the vectorized contiguous dimension; tile starts are
+        # multiples of 128/256 elements.  Non-unit dynamic strides can shift the
+        # base address of each copied row/expert and must preserve 16B alignment.
+        if stride not in (0, 1) and (stride * elem_size) % 16 != 0:
+            raise RuntimeError(
+                f"BF16 wgrad {name}.stride({dim}) must preserve 16-byte alignment, "
+                f"got stride={stride}, element_size={elem_size}, "
+                f"byte_stride % 16 = {(stride * elem_size) % 16}"
+            )
+
+
 def _get_raw_cuda_stream(device=None) -> int:
     stream = torch.cuda.current_stream(device)
     if hasattr(stream, "stream_base"):
@@ -47,10 +68,28 @@ _GEMM_FAST_PATH_BF16_VK_ACCUM: dict = {}
 _GEMM_FAST_PATH_BF16_VK_TMA_ADD: dict = {}
 
 
-def _bf16_wgrad_config(device: torch.device) -> GemmConfig:
+def _bf16_wgrad_default_config(
+    device: torch.device, M: Optional[int] = None, N: Optional[int] = None,
+) -> GemmConfig:
     cap = get_device_capacity(device)
     if cap[0] < 10:
         raise RuntimeError("bf16 wgrad direct varlen_k path requires SM100+")
+    # A35B BF16 wgrad shapes are large enough to benefit from Blackwell 2CTA UMMA
+    # along M.  gather_A requires cluster_n=1 in GemmSm100, so cluster_m is the
+    # safe cluster dimension for this direct, non-materialized path.  Smaller or
+    # unqualified shapes fall back to the previous conservative 1CTA tile.
+    if M is not None and N is not None and M >= 4096 and N >= 2048:
+        return GemmConfig(
+            tile_m=256,
+            tile_n=256,
+            cluster_m=2,
+            cluster_n=1,
+            pingpong=False,
+            swap_ab=False,
+            is_dynamic_persistent=True,
+            max_swizzle_size=8,
+            device_capacity=cap[0],
+        )
     return GemmConfig(
         tile_m=128,
         tile_n=128,
@@ -70,6 +109,10 @@ def _prepare_tensors(
     D: torch.Tensor,
     C: Optional[torch.Tensor],
 ) -> dict[str, GemmTensorInfo]:
+    _validate_16b_dynamic_alignment("A", A)
+    _validate_16b_dynamic_alignment("B", B)
+    _validate_16b_dynamic_alignment("D", D)
+    _validate_16b_dynamic_alignment("C", C)
     tensor_infos = {
         "A": GemmTensorInfo(A),
         "B": GemmTensorInfo(B.mT),
@@ -111,9 +154,18 @@ def _run_bf16_wgrad_varlen_k(
     compile_cache,
     fast_cache: dict,
     epi_args,
+    config: Optional[GemmConfig] = None,
 ) -> torch.Tensor:
+    if config is None:
+        config = _bf16_wgrad_default_config(device, M=M, N=N)
     fast_key = (
         variant,
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.is_dynamic_persistent,
+        config.max_swizzle_size,
         M,
         N,
         total_K,
@@ -133,7 +185,6 @@ def _run_bf16_wgrad_varlen_k(
         device.index if device.index is not None else -1,
     )
     cached = fast_cache.get(fast_key)
-    config = _bf16_wgrad_config(device)
     tensor_infos = _prepare_tensors(A, B, out, C)
 
     if cached is not None:
