@@ -24,6 +24,8 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils.blockscaled_layout import BlockScaledBasicChunk
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+
+from .sm_limit import capped_max_active_clusters
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_interface import default_config
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
@@ -2265,7 +2267,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None, batch_idx_permute=None,
@@ -2433,7 +2435,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k accumulate")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None, batch_idx_permute=None,
@@ -2596,7 +2598,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k tma_add")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None, batch_idx_permute=None,
@@ -2875,7 +2877,7 @@ def blockscaled_fp8_gemm_grouped(
     ):
         raise TypeError("Skipping due to unsupported FP8 blockscaled type/major combination")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
@@ -4591,7 +4593,7 @@ def _run_cutlass_blockscaled_gemm(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
 
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
@@ -4842,7 +4844,7 @@ def blockscaled_fp8_weight_grad_gemm(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for weight-grad GEMM")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
@@ -5038,7 +5040,7 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     ):
         raise TypeError("Unsupported FP8 blockscaled type/major combination for weight-grad GEMM")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,

@@ -49,6 +49,8 @@ from .gemm_sm100_fp8_zeromat import (
     GemmDGatedFP8CLoadSm100ZeroMat,
 )
 
+from .sm_limit import capped_max_active_clusters
+
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 
@@ -194,7 +196,7 @@ def gemm_dgated(
     ):
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N, persistent=persistent)
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
             info.cute_tensor = _make_cute_tensor_dynamic(

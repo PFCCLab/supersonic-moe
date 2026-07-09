@@ -81,6 +81,12 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_STAGEWISE_MEMORY``. Default: False.
         swiglu_clamp_value: Optional user-controlled SwiGLU clamp value.
             Default: 0.0 (disabled).
+        gemm_num_sms: Cap the number of SMs the frontier CuTe-DSL GEMMs may
+            occupy, by shrinking each persistent kernel's ``max_active_clusters``
+            (grid.z).  Modeled after DeepGEMM's ``set_num_sms`` single knob.
+            Used to leave SMs free for communication kernels when overlapping
+            compute and comm on separate CUDA streams.  Env:
+            ``SONIC_MOE_GEMM_NUM_SMS``. Default: None (use all SMs).
     """
 
     use_fp8: Optional[bool] = None
@@ -99,6 +105,7 @@ class SonicMoEConfig:
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
     swiglu_clamp_value: Optional[float] = None
+    gemm_num_sms: Optional[int] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -201,6 +208,23 @@ class SonicMoEConfig:
         if self.swiglu_clamp_value is not None:
             return max(float(self.swiglu_clamp_value), 0.0)
         return 0.0
+
+    def resolve_gemm_num_sms(self) -> Optional[int]:
+        """Return the SM cap for frontier GEMMs, or None to use all SMs.
+
+        Priority: explicit field > env ``SONIC_MOE_GEMM_NUM_SMS`` > None.
+        A value <= 0 is treated as unset (None).
+        """
+        if self.gemm_num_sms is not None:
+            return self.gemm_num_sms if self.gemm_num_sms > 0 else None
+        raw = os.getenv("SONIC_MOE_GEMM_NUM_SMS", "").strip()
+        if not raw:
+            return None
+        try:
+            n = int(raw)
+        except ValueError:
+            return None
+        return n if n > 0 else None
 
     # --- Context manager for temporary activation ----------------------------
 

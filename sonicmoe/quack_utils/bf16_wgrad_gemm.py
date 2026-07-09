@@ -9,6 +9,8 @@ import torch
 from cutlass import Float32
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+
+from .sm_limit import capped_max_active_clusters
 from quack.gemm_config import GemmConfig
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
@@ -219,7 +221,7 @@ def _run_bf16_wgrad_varlen_k(
     ):
         raise TypeError("Unsupported BF16 wgrad type/major combination for varlen_k")
 
-    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    max_active_clusters = capped_max_active_clusters(config.cluster_m * config.cluster_n)
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
