@@ -48,6 +48,7 @@ from .gemm_sm100_fp8_zeromat import (
     GemmDGatedSm100ZeroMat,
     GemmDGatedFP8CLoadSm100ZeroMat,
 )
+from .sm_limit import capped_max_active_clusters, clc_persistence_default, sm_cap_enabled
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
@@ -194,7 +195,7 @@ def gemm_dgated(
     ):
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
+    max_active_clusters = capped_max_active_clusters(cluster_M * cluster_N, persistent=persistent)
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
             info.cute_tensor = _make_cute_tensor_dynamic(
@@ -265,12 +266,16 @@ def gemm_dgated(
         blockscaled,
         fp8_preact_mode,
         float(swiglu_clamp_value),
+        sm_cap_enabled(),
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dgated.compile_cache
     if compile_key not in cache:
         if device_capacity[0] == 9:
             GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+            extra_kwargs = {}
+        else:
+            extra_kwargs = {"use_clc_persistence": clc_persistence_default(True)}
         gemm_obj = GemmCls(
             acc_dtype,
             tensor_infos["A"].dtype,
@@ -278,6 +283,7 @@ def gemm_dgated(
             cluster_shape_mnk,
             gather_A=gather_A,
             sf_vec_size=sf_vec_size,
+            **extra_kwargs,
         )
         cache[compile_key] = cute.compile(
             gemm_obj,
