@@ -1024,7 +1024,6 @@ class GemmDGatedMixin(GemmActMixin):
     _epi_ops = (*GemmDefaultEpiMixin._epi_ops, TileStore("mPostAct"), ColVecReduce("mColVecReduce"))
     _extra_param_fields = (
         ("act_bwd_fn", cutlass.Constexpr, None),
-        ("implicit_dtype", cutlass.Constexpr, None),
         ("swiglu_clamp_value", cutlass.Constexpr, 0.0),
     )
 
@@ -1072,7 +1071,6 @@ class GemmDGatedMixin(GemmActMixin):
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
-        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
         swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
@@ -1088,14 +1086,13 @@ class GemmDGatedMixin(GemmActMixin):
         self.rounding_mode = getattr(args, "rounding_mode", 0)
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        assert args.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
+        assert self.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         assert self.c_dtype.width == 32, "C storage type must be 32 bit"
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
         self.swiglu_clamp_value = args.swiglu_clamp_value
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
-        d["implicit_dtype"] = args.implicit_dtype
         d["swiglu_clamp_value"] = args.swiglu_clamp_value
         return self.EpilogueParams(**d)
 
@@ -1104,7 +1101,7 @@ class GemmDGatedMixin(GemmActMixin):
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
         assert tRS_rC is not None
-        implicit_dtype = params.implicit_dtype
+        implicit_dtype = self.implicit_dtype
         assert implicit_dtype.width == 16, "GemmDGatedMixin only supports 16bit for now"
         tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
         tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
@@ -1320,13 +1317,12 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         fp8_mode = getattr(args, "mFP8PreAct_fp8", None) is not None
         if not fp8_mode:
-            assert args.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
+            assert self.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
             assert self.c_dtype.width == 32, "C storage type must be 32 bit"
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
-        d["implicit_dtype"] = args.implicit_dtype
         d["swiglu_clamp_value"] = args.swiglu_clamp_value
         self.swiglu_clamp_value = args.swiglu_clamp_value
         return self.EpilogueParams(**d)
@@ -1335,7 +1331,6 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
-        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
         swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
@@ -1403,7 +1398,7 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
         else:
             # ── Standard bf16 PreAct path ──
             assert tRS_rC is not None
-            implicit_dtype = params.implicit_dtype
+            implicit_dtype = self.implicit_dtype
             tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
             tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
             tRS_rXY_f32x2.store(tRS_rXY_f16x2.load().to(Float32))
@@ -1497,7 +1492,7 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
         if const_expr(fp8_preact_info is not None):
             pack_dtype = cutlass.BFloat16
         else:
-            pack_dtype = params.implicit_dtype
+            pack_dtype = self.implicit_dtype
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
@@ -1547,7 +1542,6 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
-        d["implicit_dtype"] = args.implicit_dtype
         d["swiglu_clamp_value"] = args.swiglu_clamp_value
         self.swiglu_clamp_value = args.swiglu_clamp_value
         return self.EpilogueParams(**d)
@@ -1590,7 +1584,6 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
         act_bwd_fn: cutlass.Constexpr[Callable] = None
-        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
         swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
@@ -1640,7 +1633,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         else:
             # ── Standard bf16 C path ──
             assert tRS_rC is not None
-            implicit_dtype = params.implicit_dtype
+            implicit_dtype = self.implicit_dtype
             tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
             tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
             tRS_rXY_f32x2.store(tRS_rXY_f16x2.load().to(Float32))
@@ -1725,7 +1718,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         if const_expr(self.c_dtype == cutlass.Int16):
             pack_dtype = cutlass.BFloat16
         else:
-            pack_dtype = params.implicit_dtype
+            pack_dtype = self.implicit_dtype
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
