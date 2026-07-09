@@ -25,6 +25,6 @@
 | File | Summary | Notes |
 | --- | --- | --- |
 | `__init__.py` | Package marker and re-export surface. | — |
-| `deepep_metadata.py` | DeepEP → SonicMoE metadata conversion (zero argsort, zero sync). Topk-path output tensors are now allocated inside the CUDA launcher (see `deepep_topk_metadata_cuda/`) and returned, so the Python layer no longer pre-allocates them — cuts per-call dygraph dispatch. | — |
+| `deepep_metadata.py` | DeepEP → SonicMoE metadata conversion (zero argsort, zero sync). Topk-path output tensors are allocated inside the CUDA launcher; the internal `deepep_topk_to_sonic_metadata_with_scales()` helper can also return Sonic ISA-packed FP8 activation scales to remove the separate Python/Triton raw-scale gather before GEMM. | — |
 | `mlp_node_v2.py` | SonicMoE ↔ ERNIE integration: ``SonicMoEMlpNode`` (FP8 production path). | — |
 | `weight_layout_fusion.py` | Triton kernels for SonicMoE expert weight layout conversion used by paddlefleet_ops integration. | — |

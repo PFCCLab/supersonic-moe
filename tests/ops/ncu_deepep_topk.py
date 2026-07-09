@@ -22,6 +22,7 @@ Metrics to watch (from ``--set full``):
 """
 
 import argparse
+import os
 import sys
 
 _REPO = os.environ.get("SONIC_MOE_REPO", os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -30,16 +31,27 @@ for _p in (_QUACK, _REPO):
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
+import paddle
+paddle.enable_compat()
 import torch
 
-from sonicmoe.ernie_compat.deepep_metadata import _HAS_TOPK_CUDA_KERNEL
-from sonicmoe.ernie_compat.deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
+from sonicmoe.ernie_compat.deepep_metadata import (
+    _HAS_TOPK_CUDA_KERNEL,
+    _HAS_TOPK_CUDA_SCALES_KERNEL,
+)
+from sonicmoe.ernie_compat.deepep_topk_metadata_cuda import (
+    deepep_topk_metadata_cuda,
+    deepep_topk_metadata_cuda_with_scales,
+    deepep_topk_metadata_cuda_with_scales_rowpack,
+    deepep_topk_metadata_cuda_with_scales_scatterpack,
+)
 
 
 CONFIGS = {
-    "n16k_top8_e8":   {"N_recv": 16384, "topk": 8, "E": 8,   "block": 128},
-    "n16k_top8_e256": {"N_recv": 16384, "topk": 8, "E": 256, "block": 128},
-    "n512_top4_e8":   {"N_recv": 512,   "topk": 4, "E": 8,   "block": 128},
+    "n16k_top8_e8":   {"N_recv": 16384, "topk": 8, "E": 8,   "block": 128, "cols": 7168},
+    "n16k_top8_e256": {"N_recv": 16384, "topk": 8, "E": 256, "block": 128, "cols": 7168},
+    "n512_top4_e8":   {"N_recv": 512,   "topk": 4, "E": 8,   "block": 128, "cols": 7168},
+    "prod_a35b":      {"N_recv": 116000, "topk": 8, "E": 8,  "block": 128, "cols": 7168},
 }
 
 N_WARMUP = 10
@@ -80,10 +92,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="n16k_top8_e8",
                         choices=list(CONFIGS.keys()))
+    parser.add_argument("--with-scales", action="store_true",
+                        help="Profile metadata plus raw-scale gather/ISA-pack in the same C++ launcher.")
+    parser.add_argument("--scatter-pack", action="store_true",
+                        help="Pack raw scales inside scatter/fixup instead of launching the follow-up pack kernel.")
+    parser.add_argument("--row-pack", action="store_true",
+                        help="Use row-major-load shared-transpose scale pack kernel.")
+    parser.add_argument("--cols", type=int, default=None,
+                        help="Activation hidden size for scale packing; defaults to config cols.")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="Number of measured launches inside one CUDA-event timing region.")
     args = parser.parse_args()
 
     if not _HAS_TOPK_CUDA_KERNEL:
         print("ERROR: topk CUDA kernel not compiled.")
+        sys.exit(1)
+    if args.with_scales and not _HAS_TOPK_CUDA_SCALES_KERNEL:
+        print("ERROR: topk CUDA scale-packing kernel not compiled.")
         sys.exit(1)
 
     cfg = CONFIGS[args.config]
@@ -91,50 +116,47 @@ def main():
     topk = cfg["topk"]
     E = cfg["E"]
     block = cfg["block"]
+    cols = args.cols if args.cols is not None else cfg["cols"]
     device = "cuda"
 
     print(f"Config: {args.config}")
-    print(f"  N_recv={N_recv}, topk={topk}, E={E}, block={block}")
+    print(
+        f"  N_recv={N_recv}, topk={topk}, E={E}, block={block}, cols={cols}, "
+        f"with_scales={args.with_scales}, scatter_pack={args.scatter_pack}, "
+        f"row_pack={args.row_pack}"
+    )
 
     dispatched_indices, dispatched_probs, tpe_dev, TK, TK_padded = \
         _make_data(N_recv, topk, E, block, device)
+    scale_cols = (cols + 31) // 32
+    raw_scales = (
+        torch.arange(N_recv * scale_cols, dtype=torch.int32, device=device)
+        .reshape(N_recv, scale_cols)
+        % 251
+    )
 
-    # Output buffers (reused across iterations)
-    expert_offsets = torch.empty(E + 1, dtype=torch.int32, device=device)
-    seg_starts = torch.empty(E, dtype=torch.int32, device=device)
-    real_bases = torch.empty(E, dtype=torch.int32, device=device)
-    x_gather_idx = torch.zeros(TK_padded, dtype=torch.int32, device=device)
-    s_scatter_idx = torch.empty(TK_padded, dtype=torch.int32, device=device)
-    s_reverse = torch.empty(TK, dtype=torch.int32, device=device)
-    topk_scores = torch.zeros(TK_padded, dtype=torch.float32, device=device)
-    naept = torch.empty(N_recv + 1, dtype=torch.int32, device=device)
-
-    num_blocks = (N_recv + 31) // 32
-    cumsum_workspace = torch.empty(2 * num_blocks * E + 1, dtype=torch.int32, device=device)
-
-    stream = torch.cuda.current_stream(device).stream_base.raw_stream
+    stream_obj = torch.cuda.current_stream(device)
+    stream = stream_obj.stream_base.raw_stream if hasattr(stream_obj, "stream_base") else stream_obj.cuda_stream
 
     def _launch():
-        deepep_topk_metadata_cuda(
-            dispatched_indices=dispatched_indices,
-            dispatched_probs=dispatched_probs,
-            tokens_per_expert=tpe_dev,
-            expert_offsets=expert_offsets,
-            seg_starts=seg_starts,
-            real_bases=real_bases,
-            x_gather_idx=x_gather_idx,
-            s_scatter_idx=s_scatter_idx,
-            s_reverse_scatter_idx=s_reverse,
-            topk_scores=topk_scores,
-            naept=naept,
-            global_block_cumsum=cumsum_workspace,
-            N_recv=N_recv,
-            E=E,
-            topk=topk,
-            TK=TK,
-            TK_padded=TK_padded,
-            alignment=block,
-            stream=stream,
+        if args.with_scales:
+            if args.scatter_pack and args.row_pack:
+                raise ValueError("--scatter-pack and --row-pack are mutually exclusive")
+            op = (
+                deepep_topk_metadata_cuda_with_scales_scatterpack
+                if args.scatter_pack
+                else deepep_topk_metadata_cuda_with_scales_rowpack
+                if args.row_pack
+                else deepep_topk_metadata_cuda_with_scales
+            )
+            return op(
+                dispatched_indices, dispatched_probs, tpe_dev,
+                N_recv, E, topk, TK, TK_padded, block,
+                raw_scales, cols, stream,
+            )
+        return deepep_topk_metadata_cuda(
+            dispatched_indices, dispatched_probs, tpe_dev,
+            N_recv, E, topk, TK, TK_padded, block, stream,
         )
 
     # Warmup
@@ -143,9 +165,18 @@ def main():
         if i == 0:
             torch.cuda.synchronize()
 
-    # The profiled call (NCU captures this one)
-    _launch()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    last = None
+    for _ in range(args.repeat):
+        last = _launch()
+    end.record()
     torch.cuda.synchronize()
+    avg_ms = start.elapsed_time(end) / max(args.repeat, 1)
+    print(f"  TK={TK}, TK_padded={TK_padded}, avg_gpu_ms={avg_ms:.6f}, repeats={args.repeat}")
+    if args.with_scales and last is not None:
+        print(f"  packed_scales_shape={tuple(last[-1].shape)}")
     print("  DONE")
 
 

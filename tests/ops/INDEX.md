@@ -32,12 +32,12 @@
 | `bench_wgrad_epilogue.py` | A/B benchmark: TMA reduce-add vs fused beta=1.0 for wgrad GEMM epilogue. | — |
 | `conftest.py` | Shared fixtures, precision helpers, gold references, and shape constants for FP8 op tests. | — |
 | `mlpnode_nsys_worker.py` | Minimal MlpNode worker for nsys profiling. | — |
-| `ncu_deepep_topk.py` | Isolated NCU profiling harness for deepep_topk_metadata CUDA kernels. | — |
+| `ncu_deepep_topk.py` | Isolated NCU/CUDA-event profiling harness for deepep_topk_metadata CUDA kernels, including the metadata+scale-pack `--with-scales` path. | — |
 | `test_argsort_sync.py` | Minimal reproducer: Paddle argsort 1D path triggers cudaStreamSynchronize. | — |
 | `test_cold_start_e2e.py` | Production cold-start E2E: cache-clear → warmup → multi-shape precision + perf. | — |
 | `test_colwise_quant.py` | Unit tests for colwise_quantize_and_pack and colwise_quantize_cute. | — |
 | `test_deepep_metadata_perf.py` | Test and benchmark deepep_metadata: CUDA kernel vs Python fallback. | — |
-| `test_deepep_topk_metadata.py` | Tests for deepep_topk_to_sonic_metadata: real DeepEP topk dispatch conversion. | — |
+| `test_deepep_topk_metadata.py` | Tests for deepep_topk_to_sonic_metadata: real DeepEP topk dispatch conversion plus bit-exact validation of metadata-side FP8 raw-scale packing. | — |
 | `test_dequant.py` | Unit tests for dequantize_blockscaled_fp8. | — |
 | `test_dual_quant.py` | Unit tests for dual_quantize_varlen (fused row+col quant). | — |
 | `test_e2e_mlpnode.py` | End-to-end SonicMoEMlpNode benchmark simulating real DeepEP pre-training. | — |
