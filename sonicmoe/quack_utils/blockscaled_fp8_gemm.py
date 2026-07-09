@@ -5122,13 +5122,13 @@ def quantize_native_fp8_weights(
     if iso32:
         return {
             "format": "iso32",
-            "w1": iso32_dual_quantize_weight_3d(w1.permute(2, 0, 1)),
-            "w2": iso32_dual_quantize_weight_3d(w2.permute(2, 0, 1)),
+            "w1": iso32_dual_quantize_weight_3d(w1),
+            "w2": iso32_dual_quantize_weight_3d(w2),
         }
     return {
         "format": "1x32",
-        "w1": _quantize_weight_pair_3d_triton(w1.permute(2, 0, 1)),
-        "w2": _quantize_weight_pair_3d_triton(w2.permute(2, 0, 1)),
+        "w1": _quantize_weight_pair_3d_triton(w1),
+        "w2": _quantize_weight_pair_3d_triton(w2),
     }
 
 

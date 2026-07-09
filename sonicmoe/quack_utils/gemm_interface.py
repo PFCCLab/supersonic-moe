@@ -147,6 +147,7 @@ def gemm_gated_tuned(
     swiglu_clamp_value: float = 0.0,
     postact_bf16_trunc: bool = False,
     current_stream=None,
+    b_pretransposed: bool = False,
 ) -> None:
     if config is None:
         config = quack_default_config(A.device)
@@ -155,7 +156,8 @@ def gemm_gated_tuned(
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
     if A.ndim == 2 and not varlen_m:
         A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
+    if not b_pretransposed:
+        B = B.mT  # (N, K) or (L, N, K)
     if B.ndim == 2:
         B = B.unsqueeze(0)  # (1, N, K)
     if C is not None and C.ndim == 2 and not varlen_m:
@@ -325,19 +327,23 @@ def gemm_gated(
     swiglu_clamp_value: float = 0.0,
     postact_bf16_trunc: bool = False,
     current_stream=None,
+    b_pretransposed: bool = False,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
     postact_dtype = A.dtype if postact_dtype is None else postact_dtype
     varlen_m = cu_seqlens_m is not None
+    # When B is already transposed to kernel layout (L, N, K), N is dim -2;
+    # otherwise B is the (L, K, N) API layout and N is the last dim.
+    n_dim = B.shape[-2] if b_pretransposed else B.shape[-1]
     # Determine output shape based on gather_A
     if varlen_m:
         total_m = A_idx.shape[0] if A_idx is not None else A.shape[0]
-        out_shape = (total_m, B.shape[-1])
+        out_shape = (total_m, n_dim)
     elif A.ndim == 2:
-        out_shape = (A.shape[0], B.shape[-1])
+        out_shape = (A.shape[0], n_dim)
     else:
-        out_shape = (A.shape[0], A.shape[-2], B.shape[-1])
+        out_shape = (A.shape[0], A.shape[-2], n_dim)
     postact_shape = (*out_shape[:-1], out_shape[-1] // 2)
     if preact_out is None and store_preact:
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
@@ -364,8 +370,12 @@ def gemm_gated(
             swiglu_clamp_value=swiglu_clamp_value,
             postact_bf16_trunc=postact_bf16_trunc,
             current_stream=current_stream,
+            b_pretransposed=b_pretransposed,
         )
     else:
+        assert not b_pretransposed, (
+            "b_pretransposed is only supported on the blockscaled epilogue-quant path"
+        )
         gemm_gated_out(
             A, B, preact_out, postact_out, C, bias, activation,
             cu_seqlens_m, A_idx, dynamic_scheduler, tuned, a_scales, b_scales, swiglu_clamp_value,

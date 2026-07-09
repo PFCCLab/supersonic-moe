@@ -230,6 +230,7 @@ def _fused_blockscaled_gated_forward(
     store_z: bool = True,
     fp8_config: _FP8Config | None = None,
     current_stream=None,
+    w1_pretransposed: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
@@ -339,6 +340,7 @@ def _fused_blockscaled_gated_forward(
         swiglu_clamp_value=cfg.swiglu_clamp_value,
         postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
         current_stream=current_stream,
+        b_pretransposed=w1_pretransposed,
     )
     del x_fp8, x_scales_tk_e8m0
 
@@ -408,7 +410,7 @@ def _recompute_z_fp8(
 
     z_fp8, z_raw_scales = blockscaled_fp8_gemm_zeromat_quant(
         x_fp8,
-        w1_fp8.mT,
+        w1_fp8,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
@@ -457,7 +459,7 @@ def _recompute_z_bf16(
 
     z = blockscaled_fp8_gemm_zeromat_bf16(
         x_fp8,
-        w1_fp8.mT,
+        w1_fp8,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
@@ -984,49 +986,49 @@ def _reset_stage_memory_probe() -> None:
 _DGATED_DUMP_CALL_COUNTER = 0
 
 
-def _maybe_dump_dgated(payload: dict) -> None:
-    """Env-gated dump of the *real* dgated-backward inputs for offline replay.
+# def _maybe_dump_dgated(payload: dict) -> None:
+#     """Env-gated dump of the *real* dgated-backward inputs for offline replay.
 
-    Active ONLY when SONIC_MOE_DGATED_DUMP=<dir> is set (default: unset -> this
-    function returns on the first getenv with zero tensor work, so the normal /
-    2CTA-off path is completely unaffected). When active it overwrites, on every
-    dgated backward, two rank-private snapshots:
-        <dir>/rank{R}_dgated_latest.pt   (the most recent call)
-        <dir>/rank{R}_dgated_prev.pt     (the call before it)
-    so that when a training step faults, `_latest` holds the offending call's
-    inputs and `_prev` the last clean one -- no need to know the crash step in
-    advance. Writes go through a .tmp + os.replace to stay atomic, and tensors
-    are moved to CPU so the dump is replayable in a fresh single process.
-    """
-    out_dir = os.getenv("SONIC_MOE_DGATED_DUMP", "")
-    if not out_dir:
-        return
-    global _DGATED_DUMP_CALL_COUNTER
-    _DGATED_DUMP_CALL_COUNTER += 1
-    call_no = _DGATED_DUMP_CALL_COUNTER
-    rank = os.environ.get(
-        "PADDLE_TRAINER_ID", os.environ.get("RANK", os.environ.get("FLAGS_selected_gpus", "0"))
-    )
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        cpu = {}
-        for k, v in payload.items():
-            if isinstance(v, torch.Tensor):
-                cpu[k] = v.detach().to("cpu").contiguous()
-            else:
-                cpu[k] = v
-        cpu["_call_no"] = call_no
-        cpu["_rank"] = rank
-        latest = os.path.join(out_dir, f"rank{rank}_dgated_latest.pt")
-        prev = os.path.join(out_dir, f"rank{rank}_dgated_prev.pt")
-        # Roll latest -> prev (keep the last clean call alongside the faulting one).
-        if os.path.exists(latest):
-            os.replace(latest, prev)
-        tmp = latest + ".tmp"
-        torch.save(cpu, tmp)
-        os.replace(tmp, latest)
-    except Exception as e:  # never let a debug dump take down training
-        print(f"[dgated-dump] rank{rank} call{call_no} dump failed: {e}", flush=True)
+#     Active ONLY when SONIC_MOE_DGATED_DUMP=<dir> is set (default: unset -> this
+#     function returns on the first getenv with zero tensor work, so the normal /
+#     2CTA-off path is completely unaffected). When active it overwrites, on every
+#     dgated backward, two rank-private snapshots:
+#         <dir>/rank{R}_dgated_latest.pt   (the most recent call)
+#         <dir>/rank{R}_dgated_prev.pt     (the call before it)
+#     so that when a training step faults, `_latest` holds the offending call's
+#     inputs and `_prev` the last clean one -- no need to know the crash step in
+#     advance. Writes go through a .tmp + os.replace to stay atomic, and tensors
+#     are moved to CPU so the dump is replayable in a fresh single process.
+#     """
+#     out_dir = os.getenv("SONIC_MOE_DGATED_DUMP", "")
+#     if not out_dir:
+#         return
+#     global _DGATED_DUMP_CALL_COUNTER
+#     _DGATED_DUMP_CALL_COUNTER += 1
+#     call_no = _DGATED_DUMP_CALL_COUNTER
+#     rank = os.environ.get(
+#         "PADDLE_TRAINER_ID", os.environ.get("RANK", os.environ.get("FLAGS_selected_gpus", "0"))
+#     )
+#     try:
+#         os.makedirs(out_dir, exist_ok=True)
+#         cpu = {}
+#         for k, v in payload.items():
+#             if isinstance(v, torch.Tensor):
+#                 cpu[k] = v.detach().to("cpu").contiguous()
+#             else:
+#                 cpu[k] = v
+#         cpu["_call_no"] = call_no
+#         cpu["_rank"] = rank
+#         latest = os.path.join(out_dir, f"rank{rank}_dgated_latest.pt")
+#         prev = os.path.join(out_dir, f"rank{rank}_dgated_prev.pt")
+#         # Roll latest -> prev (keep the last clean call alongside the faulting one).
+#         if os.path.exists(latest):
+#             os.replace(latest, prev)
+#         tmp = latest + ".tmp"
+#         torch.save(cpu, tmp)
+#         os.replace(tmp, latest)
+#     except Exception as e:  # never let a debug dump take down training
+#         print(f"[dgated-dump] rank{rank} call{call_no} dump failed: {e}", flush=True)
 
 
 def _log_stage_memory(stage: str) -> None:
@@ -1162,6 +1164,7 @@ class _UpProjection(torch.autograd.Function):
                         w1_fp8_pre=w1_fp8, store_z=not cfg.recompute_z,
                         fp8_config=cfg,
                         current_stream=stream_id,
+                        w1_pretransposed=True,
                     )
                     if cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);
@@ -2194,29 +2197,29 @@ class _DownProjection(torch.autograd.Function):
                         K_bwd,
                     )
 
-                    _maybe_dump_dgated({
-                        "dout_fp8": dout_fp8,
-                        "w2_fp8_enk": w2_fp8_enk,
-                        "z": z if not use_fp8_preact else None,
-                        "y1s_shape": list(y1s.shape),
-                        "dz_shape": list(dz.shape),
-                        "s_float": s_float,
-                        "x_gather_idx": x_gather_idx,
-                        "expert_frequency_offset": expert_frequency_offset,
-                        "dout_scales": dout_scales,
-                        "w2_scales": w2_scales,
-                        "z_fp8": z_fp8 if use_fp8_preact else None,
-                        "z_raw_scales_u8": z_raw_scales_u8 if use_fp8_preact else None,
-                        "use_fp8_preact": bool(use_fp8_preact),
-                        "tile_m": int(config.tile_m),
-                        "tile_n": int(config.tile_n),
-                        "cluster_m": int(config.cluster_m),
-                        "cluster_n": int(config.cluster_n),
-                        "pingpong": bool(config.pingpong),
-                        "max_swizzle_size": int(config.max_swizzle_size),
-                        "swiglu_clamp_value": float(ctx._fp8_cfg.swiglu_clamp_value),
-                        "num_experts": int(w2_fp8_enk.shape[0]),
-                    })
+                    # _maybe_dump_dgated({
+                    #     "dout_fp8": dout_fp8,
+                    #     "w2_fp8_enk": w2_fp8_enk,
+                    #     "z": z if not use_fp8_preact else None,
+                    #     "y1s_shape": list(y1s.shape),
+                    #     "dz_shape": list(dz.shape),
+                    #     "s_float": s_float,
+                    #     "x_gather_idx": x_gather_idx,
+                    #     "expert_frequency_offset": expert_frequency_offset,
+                    #     "dout_scales": dout_scales,
+                    #     "w2_scales": w2_scales,
+                    #     "z_fp8": z_fp8 if use_fp8_preact else None,
+                    #     "z_raw_scales_u8": z_raw_scales_u8 if use_fp8_preact else None,
+                    #     "use_fp8_preact": bool(use_fp8_preact),
+                    #     "tile_m": int(config.tile_m),
+                    #     "tile_n": int(config.tile_n),
+                    #     "cluster_m": int(config.cluster_m),
+                    #     "cluster_n": int(config.cluster_n),
+                    #     "pingpong": bool(config.pingpong),
+                    #     "max_swizzle_size": int(config.max_swizzle_size),
+                    #     "swiglu_clamp_value": float(ctx._fp8_cfg.swiglu_clamp_value),
+                    #     "num_experts": int(w2_fp8_enk.shape[0]),
+                    # })
 
                     gemm_dgated_kernel(
                         dout_fp8,
