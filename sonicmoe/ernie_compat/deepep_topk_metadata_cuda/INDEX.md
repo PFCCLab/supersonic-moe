@@ -18,5 +18,5 @@
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `__init__.py` | `@torch.library.custom_op` + `@cpp_jit()` stub. Op takes (indices, probs, tokens_per_expert, dims, stream) and **returns** the 7 metadata tensors (`mutates_args=()`) instead of mutating pre-allocated buffers. | — |
-| `kernel.cu` | CUDA source. Launcher allocates the 7 output tensors + scratch via the caching allocator and returns them (independent storage per call → PP/1F1B ctx-save safe); the 4 kernels (histogram / block_offset_scan / prefix_sums / scatter_and_fixup) are unchanged. | — |
+| `__init__.py` | `@torch.library.custom_op` + `@cpp_jit()` stubs. The base op returns the 7 metadata tensors; `deepep_topk_metadata_cuda_with_scales` additionally returns Sonic ISA-packed FP8 activation scales. Both use `mutates_args=()`. | — |
+| `kernel.cu` | CUDA source. Launcher allocates metadata outputs + scratch via the caching allocator and returns independent storage per call (PP/1F1B ctx-save safe). The optional `with_scales` entry appends a same-stream raw-scale gather/ISA-pack kernel after scatter/fixup and returns the packed scale tensor. | — |

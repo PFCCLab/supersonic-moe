@@ -18,11 +18,98 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <type_traits>
 #include <vector>
 
 static constexpr int ROWS_PER_BLOCK = 32;  // = warp size for ballot
 static constexpr int BLOCK_DIM = 256;
 static constexpr int MAX_TOPK = 16;
+static constexpr int SF_TILE_M = 128;
+static constexpr int SF_TILE_K = 128;
+static constexpr int SF_VEC_SIZE = 32;
+static constexpr int SF_TILE_STORAGE = SF_TILE_M * (SF_TILE_K / SF_VEC_SIZE);
+static constexpr int SCALE_PACK_BLOCK_DIM = 256;
+static constexpr int SCALE_PACK_WARPS_PER_CTA = SCALE_PACK_BLOCK_DIM / 32;
+
+template <typename RawT>
+__device__ __forceinline__ uint32_t pack_scale_row_4(
+    const RawT* __restrict__ raw_scales,
+    int64_t src_row,
+    int64_t src_col_base,
+    int64_t scale_cols,
+    int64_t raw_stride_row,
+    int64_t raw_stride_col)
+{
+    if (src_col_base + 3 < scale_cols) {
+        if constexpr (std::is_same<RawT, int>::value) {
+            if (raw_stride_col == 1) {
+                const int4 r = *reinterpret_cast<const int4*>(
+                    raw_scales + src_row * raw_stride_row + src_col_base);
+                return
+                    static_cast<uint32_t>(static_cast<uint8_t>(r.x)) |
+                    (static_cast<uint32_t>(static_cast<uint8_t>(r.y)) << 8) |
+                    (static_cast<uint32_t>(static_cast<uint8_t>(r.z)) << 16) |
+                    (static_cast<uint32_t>(static_cast<uint8_t>(r.w)) << 24);
+            }
+        } else if constexpr (
+            std::is_same<RawT, uint8_t>::value ||
+            std::is_same<RawT, int8_t>::value) {
+            if (raw_stride_col == 1) {
+                return *reinterpret_cast<const uint32_t*>(
+                    raw_scales + src_row * raw_stride_row + src_col_base);
+            }
+        }
+    }
+
+    uint32_t v = 0;
+    #pragma unroll
+    for (int k = 0; k < SF_TILE_K / SF_VEC_SIZE; ++k) {
+        const int64_t src_col = src_col_base + k;
+        uint8_t b = 1;
+        if (src_col < scale_cols) {
+            b = static_cast<uint8_t>(
+                raw_scales[src_row * raw_stride_row + src_col * raw_stride_col]);
+        }
+        v |= static_cast<uint32_t>(b) << (8 * k);
+    }
+    return v;
+}
+
+static inline int64_t div_up_i64(int64_t a, int64_t b) {
+    return (a + b - 1) / b;
+}
+
+static inline int64_t scale_storage_per_batch_i64(int64_t rows, int64_t cols) {
+    return div_up_i64(rows, SF_TILE_M) * div_up_i64(cols, SF_TILE_K) * SF_TILE_STORAGE;
+}
+
+template <typename RawT>
+__device__ __forceinline__ void pack_scale_row_to_sfa(
+    const RawT* __restrict__ raw_scales,
+    int64_t src_row,
+    int64_t dst_row,
+    uint8_t* __restrict__ packed_scales,
+    int64_t scale_cols,
+    int64_t raw_stride_row,
+    int64_t raw_stride_col,
+    int64_t k_tiles)
+{
+    const int64_t row_tile = dst_row / SF_TILE_M;
+    const int64_t row_in_tile = dst_row - row_tile * SF_TILE_M;
+    const int64_t lane_in_tile = row_in_tile & 31;
+    const int64_t row_quarter = row_in_tile >> 5;
+
+    for (int64_t k_tile_idx = 0; k_tile_idx < k_tiles; ++k_tile_idx) {
+        const int64_t src_col_base = k_tile_idx * (SF_TILE_K / SF_VEC_SIZE);
+        const uint32_t v = pack_scale_row_4(
+            raw_scales, src_row, src_col_base, scale_cols,
+            raw_stride_row, raw_stride_col);
+        const int64_t dst_offset =
+            (row_tile * k_tiles + k_tile_idx) * SF_TILE_STORAGE +
+            lane_in_tile * 16 + row_quarter * 4;
+        *reinterpret_cast<uint32_t*>(packed_scales + dst_offset) = v;
+    }
+}
 
 // ============================================================================
 //  Kernel 1a: Histogram only (Phase A)
@@ -310,7 +397,7 @@ void prefix_sums_kernel(
 //  then processes a chunk of TK_padded for fixup.
 //  All data needed (block_offset, expert_offsets, naept) is precomputed.
 // ============================================================================
-template <int TOPK>
+template <int TOPK, typename RawT = uint8_t, bool PACK_SCALES = false>
 __global__ __launch_bounds__(BLOCK_DIM)
 void scatter_and_fixup_kernel(
     const int*   __restrict__ dispatched_indices,   // [N_recv, topk]
@@ -331,7 +418,13 @@ void scatter_and_fixup_kernel(
     int          topk_param,
     int          TK,
     int          TK_padded,
-    int          scatter_blocks)
+    int          scatter_blocks,
+    const RawT*  __restrict__ raw_scales = nullptr,
+    uint8_t*     __restrict__ packed_scales = nullptr,
+    int64_t      scale_cols = 0,
+    int64_t      raw_stride_row = 0,
+    int64_t      raw_stride_col = 0,
+    int64_t      k_tiles = 0)
 {
     const int lane_id = threadIdx.x & 31;
     const int warp_id = threadIdx.x >> 5;
@@ -466,6 +559,11 @@ void scatter_and_fixup_kernel(
                     // (row * topk + col) flat index into dispatched_probs.
                     // Bit-exact replacement for _build_score_src_idx_kernel.
                     score_src_idx[token_major_pos] = global_row * topk_param + k;
+                    if constexpr (PACK_SCALES) {
+                        pack_scale_row_to_sfa(
+                            raw_scales, global_row, padded_pos, packed_scales,
+                            scale_cols, raw_stride_row, raw_stride_col, k_tiles);
+                    }
                 }
             }
         }
@@ -496,7 +594,132 @@ void scatter_and_fixup_kernel(
             x_gather_idx[pos] = 0;
             s_scatter_idx[pos] = TK;  // points to topk_scores[TK]=0
             // topk_scores[pos] already 0 from zero-init
+            if constexpr (PACK_SCALES) {
+                pack_scale_row_to_sfa(
+                    raw_scales, 0, pos, packed_scales,
+                    scale_cols, raw_stride_row, raw_stride_col, k_tiles);
+            }
         }
+    }
+}
+
+// ============================================================================
+//  Optional scale packing: raw DeepEP FP8 scales -> Sonic ISA/SFA layout.
+//
+//  This is intentionally kept as a separate stream-ordered CUDA kernel inside
+//  the same C++ custom-op launcher.  The data dependency is x_gather_idx, which
+//  is fully materialized by scatter_and_fixup_kernel.  Sinking this launch below
+//  the metadata op removes the Python/Triton dispatch bubble while preserving
+//  the safe grid barriers between metadata phases.
+// ============================================================================
+template <typename RawT>
+__global__ __launch_bounds__(SCALE_PACK_BLOCK_DIM)
+void pack_raw_scales_from_gather_kernel(
+    const RawT*   __restrict__ raw_scales,   // [N_recv, ceil(cols/32)]
+    const int*    __restrict__ x_gather_idx, // [TK_padded]
+    uint8_t*      __restrict__ packed_scales,
+    int64_t       TK_padded,
+    int64_t       scale_cols,
+    int64_t       raw_stride_row,
+    int64_t       raw_stride_col,
+    int64_t       k_tiles)
+{
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int64_t row_tile =
+        static_cast<int64_t>(blockIdx.x) * SCALE_PACK_WARPS_PER_CTA + warp;
+    const int64_t row_base = row_tile * SF_TILE_M;
+    if (row_base >= TK_padded) {
+        return;
+    }
+
+    const int64_t k_tile_idx = blockIdx.y;
+    const int64_t src_col_base = k_tile_idx * (SF_TILE_K / SF_VEC_SIZE);
+    const int64_t dst_tile_base =
+        (row_tile * k_tiles + k_tile_idx) * SF_TILE_STORAGE;
+    uint4 packed16;
+
+    #pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int64_t row = row_base + lane + q * 32;
+        uint32_t v = 0x01010101u;
+        if (row < TK_padded) {
+            const int64_t src_row = static_cast<int64_t>(x_gather_idx[row]);
+            v = pack_scale_row_4(
+                raw_scales, src_row, src_col_base, scale_cols,
+                raw_stride_row, raw_stride_col);
+        }
+        if (q == 0) packed16.x = v;
+        else if (q == 1) packed16.y = v;
+        else if (q == 2) packed16.z = v;
+        else packed16.w = v;
+    }
+
+    *reinterpret_cast<uint4*>(packed_scales + dst_tile_base + lane * 16) = packed16;
+}
+
+// Variant for int32/uint8 row-major raw scales.  It trades one shared-memory
+// transpose for coalesced global loads while preserving coalesced ISA stores.
+template <typename RawT>
+__global__ __launch_bounds__(SCALE_PACK_BLOCK_DIM)
+void pack_raw_scales_rowmajor_kernel(
+    const RawT*   __restrict__ raw_scales,   // [N_recv, ceil(cols/32)]
+    const int*    __restrict__ x_gather_idx, // [TK_padded]
+    uint8_t*      __restrict__ packed_scales,
+    int64_t       TK_padded,
+    int64_t       scale_cols,
+    int64_t       raw_stride_row,
+    int64_t       raw_stride_col,
+    int64_t       k_tiles)
+{
+    extern __shared__ uint8_t smem_scales[];
+    const int tid = threadIdx.x;
+    const int64_t row_tile = blockIdx.x;
+    const int64_t row_base = row_tile * SF_TILE_M;
+    const int64_t tile_elems = SF_TILE_M * scale_cols;
+
+    for (int64_t idx = tid; idx < tile_elems; idx += blockDim.x) {
+        const int64_t r = idx / scale_cols;
+        const int64_t c = idx - r * scale_cols;
+        const int64_t dst_row = row_base + r;
+        uint8_t b = 1;
+        if (dst_row < TK_padded) {
+            const int64_t src_row = static_cast<int64_t>(x_gather_idx[dst_row]);
+            b = static_cast<uint8_t>(
+                raw_scales[src_row * raw_stride_row + c * raw_stride_col]);
+        }
+        smem_scales[idx] = b;
+    }
+    __syncthreads();
+
+    const int64_t slots = k_tiles * 32;
+    for (int64_t slot = tid; slot < slots; slot += blockDim.x) {
+        const int64_t k_tile_idx = slot >> 5;
+        const int64_t lane = slot & 31;
+        const int64_t src_col_base = k_tile_idx * (SF_TILE_K / SF_VEC_SIZE);
+        const int64_t dst_tile_base =
+            (row_tile * k_tiles + k_tile_idx) * SF_TILE_STORAGE;
+        uint4 packed16;
+
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const int64_t r = lane + q * 32;
+            uint32_t v = 0;
+            #pragma unroll
+            for (int k = 0; k < SF_TILE_K / SF_VEC_SIZE; ++k) {
+                const int64_t c = src_col_base + k;
+                const uint8_t b = (c < scale_cols)
+                    ? smem_scales[r * scale_cols + c]
+                    : static_cast<uint8_t>(1);
+                v |= static_cast<uint32_t>(b) << (8 * k);
+            }
+            if (q == 0) packed16.x = v;
+            else if (q == 1) packed16.y = v;
+            else if (q == 2) packed16.z = v;
+            else packed16.w = v;
+        }
+
+        *reinterpret_cast<uint4*>(packed_scales + dst_tile_base + lane * 16) = packed16;
     }
 }
 
@@ -538,7 +761,7 @@ void scatter_and_fixup_kernel(
 //  Caller guarantees TK > 0 and N_recv > 0 (the TK==0 edge case is handled in
 //  Python before dispatch, matching the previous behavior).
 // ============================================================================
-std::vector<torch::Tensor> deepep_topk_metadata_cuda(
+std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
     torch::Tensor& tokens_per_expert,
@@ -548,7 +771,11 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda(
     int64_t TK,
     int64_t TK_padded,
     int64_t alignment,
-    int64_t stream_ptr)
+    int64_t stream_ptr,
+    torch::Tensor* raw_scales,
+    int64_t cols,
+    bool pack_scales_in_scatter,
+    bool pack_scales_rowmajor)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
@@ -630,6 +857,44 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda(
         static_cast<int>(N_recv), scatter_blocks, static_cast<int>(E),
         static_cast<int>(alignment));
 
+    torch::Tensor packed_scales;
+    int64_t scale_cols = 0;
+    int64_t stride_row = 0;
+    int64_t stride_col = 0;
+    int64_t k_tiles = 0;
+    at::ScalarType raw_dtype = at::ScalarType::Byte;
+    if (raw_scales != nullptr) {
+        TORCH_CHECK(cols > 0, "cols must be positive when raw_scales is provided");
+        TORCH_CHECK(raw_scales->is_cuda(), "raw_scales must be a CUDA tensor");
+        TORCH_CHECK(raw_scales->dim() == 2, "raw_scales must be rank-2 [N_recv, ceil(cols/32)]");
+        TORCH_CHECK(raw_scales->size(0) == N_recv,
+                    "raw_scales row count mismatch: expected ", N_recv,
+                    ", got ", raw_scales->size(0));
+
+        const int64_t expected_scale_cols = div_up_i64(cols, SF_VEC_SIZE);
+        scale_cols = raw_scales->size(1);
+        TORCH_CHECK(scale_cols == expected_scale_cols,
+                    "raw_scales column count mismatch: expected ", expected_scale_cols,
+                    " for cols=", cols, ", got ", scale_cols);
+
+        auto opt_u8 = torch::dtype(torch::kUInt8).device(torch::kCUDA);
+        const int64_t per_batch_storage = scale_storage_per_batch_i64(TK_padded, cols);
+        packed_scales =
+            (TK_padded % SF_TILE_M == 0 && cols % SF_TILE_K == 0)
+                ? torch::empty({1, per_batch_storage}, opt_u8)
+                : torch::full({1, per_batch_storage}, 1, opt_u8);
+
+        k_tiles = div_up_i64(cols, SF_TILE_K);
+        stride_row = raw_scales->stride(0);
+        stride_col = raw_scales->stride(1);
+        raw_dtype = raw_scales->scalar_type();
+        TORCH_CHECK(raw_dtype == at::ScalarType::Int ||
+                    raw_dtype == at::ScalarType::Byte ||
+                    raw_dtype == at::ScalarType::Char,
+                    "raw_scales dtype must be int32, uint8, or int8, got ",
+                    raw_scales->scalar_type());
+    }
+
     // ── Kernel 2: Scatter + fixup ────────────────────────────────────────────
     // Grid must cover ALL scatter blocks: scatter phase relies on blockIdx.x
     // mapping 1:1 to a 32-row chunk of N_recv (block_row_base = blockIdx.x*32).
@@ -665,12 +930,51 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda(
             static_cast<int>(topk), static_cast<int>(TK), \
             static_cast<int>(TK_padded), scatter_blocks);
 
-    if (topk <= 4) { LAUNCH_K2(4); }
-    else if (topk <= 8) { LAUNCH_K2(8); }
-    else { LAUNCH_K2(16); }
-    #undef LAUNCH_K2
+    #define LAUNCH_K2_PACK(TV, RAW_T) \
+        scatter_and_fixup_kernel<TV, RAW_T, true><<<grid2, block2, smem_k2, stream>>>( \
+            dispatched_indices.data_ptr<int>(), \
+            dispatched_probs.data_ptr<float>(), \
+            block_offset, \
+            block_naept_base, \
+            expert_offsets.data_ptr<int>(), \
+            seg_starts.data_ptr<int>(), \
+            tokens_per_expert.data_ptr<int>(), \
+            naept.data_ptr<int>(), \
+            x_gather_idx.data_ptr<int>(), \
+            s_scatter_idx.data_ptr<int>(), \
+            s_reverse_scatter_idx.data_ptr<int>(), \
+            topk_scores.data_ptr<float>(), \
+            score_src_idx.data_ptr<int>(), \
+            static_cast<int>(N_recv), static_cast<int>(E), \
+            static_cast<int>(topk), static_cast<int>(TK), \
+            static_cast<int>(TK_padded), scatter_blocks, \
+            raw_scales->data_ptr<RAW_T>(), \
+            packed_scales.data_ptr<uint8_t>(), \
+            scale_cols, stride_row, stride_col, k_tiles);
 
-    return {
+    if (raw_scales != nullptr && pack_scales_in_scatter) {
+        if (raw_dtype == at::ScalarType::Int) {
+            if (topk <= 4) { LAUNCH_K2_PACK(4, int); }
+            else if (topk <= 8) { LAUNCH_K2_PACK(8, int); }
+            else { LAUNCH_K2_PACK(16, int); }
+        } else if (raw_dtype == at::ScalarType::Byte) {
+            if (topk <= 4) { LAUNCH_K2_PACK(4, uint8_t); }
+            else if (topk <= 8) { LAUNCH_K2_PACK(8, uint8_t); }
+            else { LAUNCH_K2_PACK(16, uint8_t); }
+        } else {
+            if (topk <= 4) { LAUNCH_K2_PACK(4, int8_t); }
+            else if (topk <= 8) { LAUNCH_K2_PACK(8, int8_t); }
+            else { LAUNCH_K2_PACK(16, int8_t); }
+        }
+    } else {
+        if (topk <= 4) { LAUNCH_K2(4); }
+        else if (topk <= 8) { LAUNCH_K2(8); }
+        else { LAUNCH_K2(16); }
+    }
+    #undef LAUNCH_K2
+    #undef LAUNCH_K2_PACK
+
+    std::vector<torch::Tensor> out = {
         expert_offsets,
         x_gather_idx,
         s_scatter_idx,
@@ -679,6 +983,144 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda(
         topk_scores,
         score_src_idx,
     };
+
+    if (raw_scales != nullptr) {
+        if (!pack_scales_in_scatter) {
+            const int64_t row_tiles = div_up_i64(TK_padded, SF_TILE_M);
+            dim3 block_scale(SCALE_PACK_BLOCK_DIM);
+            const bool use_rowmajor_pack =
+                pack_scales_rowmajor &&
+                stride_col == 1 &&
+                static_cast<size_t>(SF_TILE_M * scale_cols) <= 48 * 1024;
+
+            if (use_rowmajor_pack) {
+                dim3 grid_scale(static_cast<unsigned int>(row_tiles));
+                size_t smem_scale = static_cast<size_t>(SF_TILE_M * scale_cols);
+                if (raw_dtype == at::ScalarType::Int) {
+                    pack_raw_scales_rowmajor_kernel<int><<<grid_scale, block_scale, smem_scale, stream>>>(
+                        raw_scales->data_ptr<int>(),
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scales.data_ptr<uint8_t>(),
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                } else if (raw_dtype == at::ScalarType::Byte) {
+                    pack_raw_scales_rowmajor_kernel<uint8_t><<<grid_scale, block_scale, smem_scale, stream>>>(
+                        raw_scales->data_ptr<uint8_t>(),
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scales.data_ptr<uint8_t>(),
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                } else {
+                    pack_raw_scales_rowmajor_kernel<int8_t><<<grid_scale, block_scale, smem_scale, stream>>>(
+                        raw_scales->data_ptr<int8_t>(),
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scales.data_ptr<uint8_t>(),
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                }
+            } else {
+                dim3 grid_scale(static_cast<unsigned int>(div_up_i64(row_tiles, SCALE_PACK_WARPS_PER_CTA)),
+                                static_cast<unsigned int>(k_tiles));
+                if (raw_dtype == at::ScalarType::Int) {
+                    pack_raw_scales_from_gather_kernel<int><<<grid_scale, block_scale, 0, stream>>>(
+                        raw_scales->data_ptr<int>(),
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scales.data_ptr<uint8_t>(),
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                } else if (raw_dtype == at::ScalarType::Byte) {
+                    pack_raw_scales_from_gather_kernel<uint8_t><<<grid_scale, block_scale, 0, stream>>>(
+                        raw_scales->data_ptr<uint8_t>(),
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scales.data_ptr<uint8_t>(),
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                } else {
+                    pack_raw_scales_from_gather_kernel<int8_t><<<grid_scale, block_scale, 0, stream>>>(
+                        raw_scales->data_ptr<int8_t>(),
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scales.data_ptr<uint8_t>(),
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                }
+            }
+        }
+        out.push_back(packed_scales);
+    }
+
+    return out;
+}
+
+std::vector<torch::Tensor> deepep_topk_metadata_cuda(
+    torch::Tensor& dispatched_indices,
+    torch::Tensor& dispatched_probs,
+    torch::Tensor& tokens_per_expert,
+    int64_t N_recv,
+    int64_t E,
+    int64_t topk,
+    int64_t TK,
+    int64_t TK_padded,
+    int64_t alignment,
+    int64_t stream_ptr)
+{
+    return deepep_topk_metadata_cuda_impl(
+        dispatched_indices, dispatched_probs, tokens_per_expert,
+        N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
+        nullptr, 0, false, false);
+}
+
+std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales(
+    torch::Tensor& dispatched_indices,
+    torch::Tensor& dispatched_probs,
+    torch::Tensor& tokens_per_expert,
+    int64_t N_recv,
+    int64_t E,
+    int64_t topk,
+    int64_t TK,
+    int64_t TK_padded,
+    int64_t alignment,
+    torch::Tensor& raw_scales,
+    int64_t cols,
+    int64_t stream_ptr)
+{
+    return deepep_topk_metadata_cuda_impl(
+        dispatched_indices, dispatched_probs, tokens_per_expert,
+        N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
+        &raw_scales, cols, false, false);
+}
+
+std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales_rowpack(
+    torch::Tensor& dispatched_indices,
+    torch::Tensor& dispatched_probs,
+    torch::Tensor& tokens_per_expert,
+    int64_t N_recv,
+    int64_t E,
+    int64_t topk,
+    int64_t TK,
+    int64_t TK_padded,
+    int64_t alignment,
+    torch::Tensor& raw_scales,
+    int64_t cols,
+    int64_t stream_ptr)
+{
+    return deepep_topk_metadata_cuda_impl(
+        dispatched_indices, dispatched_probs, tokens_per_expert,
+        N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
+        &raw_scales, cols, false, true);
+}
+
+std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales_scatterpack(
+    torch::Tensor& dispatched_indices,
+    torch::Tensor& dispatched_probs,
+    torch::Tensor& tokens_per_expert,
+    int64_t N_recv,
+    int64_t E,
+    int64_t topk,
+    int64_t TK,
+    int64_t TK_padded,
+    int64_t alignment,
+    torch::Tensor& raw_scales,
+    int64_t cols,
+    int64_t stream_ptr)
+{
+    return deepep_topk_metadata_cuda_impl(
+        dispatched_indices, dispatched_probs, tokens_per_expert,
+        N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
+        &raw_scales, cols, true, false);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -694,5 +1136,50 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("TK"),
           py::arg("TK_padded"),
           py::arg("alignment"),
+          py::arg("stream"));
+    m.def("deepep_topk_metadata_cuda_with_scales",
+          &deepep_topk_metadata_cuda_with_scales,
+          "DeepEP topk metadata: returns metadata tensors plus packed Sonic FP8 scales (CUDA)",
+          py::arg("dispatched_indices"),
+          py::arg("dispatched_probs"),
+          py::arg("tokens_per_expert"),
+          py::arg("N_recv"),
+          py::arg("E"),
+          py::arg("topk"),
+          py::arg("TK"),
+          py::arg("TK_padded"),
+          py::arg("alignment"),
+          py::arg("raw_scales"),
+          py::arg("cols"),
+          py::arg("stream"));
+    m.def("deepep_topk_metadata_cuda_with_scales_scatterpack",
+          &deepep_topk_metadata_cuda_with_scales_scatterpack,
+          "DeepEP topk metadata: packs Sonic FP8 scales inside scatter/fixup (CUDA)",
+          py::arg("dispatched_indices"),
+          py::arg("dispatched_probs"),
+          py::arg("tokens_per_expert"),
+          py::arg("N_recv"),
+          py::arg("E"),
+          py::arg("topk"),
+          py::arg("TK"),
+          py::arg("TK_padded"),
+          py::arg("alignment"),
+          py::arg("raw_scales"),
+          py::arg("cols"),
+          py::arg("stream"));
+    m.def("deepep_topk_metadata_cuda_with_scales_rowpack",
+          &deepep_topk_metadata_cuda_with_scales_rowpack,
+          "DeepEP topk metadata: row-major-load shared-transpose Sonic FP8 scale pack (CUDA)",
+          py::arg("dispatched_indices"),
+          py::arg("dispatched_probs"),
+          py::arg("tokens_per_expert"),
+          py::arg("N_recv"),
+          py::arg("E"),
+          py::arg("topk"),
+          py::arg("TK"),
+          py::arg("TK_padded"),
+          py::arg("alignment"),
+          py::arg("raw_scales"),
+          py::arg("cols"),
           py::arg("stream"));
 }

@@ -23,7 +23,7 @@
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `__init__.py` | Core FP8/BF16 forward-backward orchestration entrypoints. | — |
+| `__init__.py` | Core FP8/BF16 forward-backward orchestration entrypoints. The FP8 prequant activation payload may include an optional prepacked Sonic ISA scale tensor for forward-only GEMM consumption while backward still saves raw scales. | — |
 | `backward.py` | Python module for backward. | — |
 | `forward.py` | Python module for forward. | — |
 | `fp8_cutely_fused.py` | Python module for fp8 cutely fused. | — |

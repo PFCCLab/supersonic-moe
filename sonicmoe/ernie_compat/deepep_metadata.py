@@ -39,11 +39,22 @@ except Exception:
     pass
 
 _HAS_TOPK_CUDA_KERNEL = False
+_HAS_TOPK_CUDA_SCALES_KERNEL = False
 try:
-    from .deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
+    from .deepep_topk_metadata_cuda import (
+        deepep_topk_metadata_cuda,
+        deepep_topk_metadata_cuda_with_scales,
+        deepep_topk_metadata_cuda_with_scales_rowpack,
+        deepep_topk_metadata_cuda_with_scales_scatterpack,
+    )
     _HAS_TOPK_CUDA_KERNEL = True
+    _HAS_TOPK_CUDA_SCALES_KERNEL = True
 except Exception:
-    pass
+    try:
+        from .deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
+        _HAS_TOPK_CUDA_KERNEL = True
+    except Exception:
+        pass
 
 _HAS_CUDA_ART = False
 try:
@@ -326,6 +337,81 @@ def deepep_topk_to_sonic_metadata(
     )
 
 
+def deepep_topk_to_sonic_metadata_with_scales(
+    dispatched_indices: torch.Tensor,   # [N_recv, topk] int32, -1 = masked
+    dispatched_probs: torch.Tensor,     # [N_recv, topk] float32
+    tokens_per_expert: Sequence[int] | torch.Tensor,  # [E]
+    E: int,
+    raw_scales: torch.Tensor,           # [N_recv, ceil(cols/32)] int32/uint8
+    cols: int,
+    device: str | torch.device = "cuda",
+    block: int = 128,
+    pack_scales_in_scatter: bool = False,
+    pack_scales_rowmajor: bool = False,
+):
+    """Topk metadata conversion plus optional Sonic FP8 scale packing.
+
+    Public ``deepep_topk_to_sonic_metadata`` intentionally keeps its 10-value
+    return contract.  This helper is for the Sonic FP8 DeepEP path only: when
+    the CUDA extension supports it, metadata and raw-scale gather/ISA-pack are
+    launched from the same C++ op; otherwise the final value is ``None`` and
+    callers fall back to the existing scale gather path.
+    """
+    N_recv = dispatched_indices.shape[0]
+    device = _normalize_device(device)
+
+    if "int32" not in str(dispatched_indices.dtype):
+        raise ValueError(f"dispatched_indices: expected int32, got {dispatched_indices.dtype}")
+    if "float32" not in str(dispatched_probs.dtype):
+        raise ValueError(f"dispatched_probs: expected float32, got {dispatched_probs.dtype}")
+    if dispatched_indices.ndim != 2 or dispatched_probs.ndim != 2:
+        raise ValueError("dispatched_indices and dispatched_probs must be 2D")
+    if dispatched_probs.shape != dispatched_indices.shape:
+        raise ValueError(f"shape mismatch: indices={dispatched_indices.shape} vs probs={dispatched_probs.shape}")
+
+    raw_scales_2d = raw_scales
+    if raw_scales_2d.ndim == 3:
+        if raw_scales_2d.shape[0] != 1:
+            raise ValueError(f"raw_scales: expected batch=1, got shape {tuple(raw_scales_2d.shape)}")
+        raw_scales_2d = raw_scales_2d.squeeze(0)
+    if raw_scales_2d.ndim != 2:
+        raise ValueError(f"raw_scales: expected rank 2, got shape {tuple(raw_scales_2d.shape)}")
+    if raw_scales_2d.shape[0] != N_recv:
+        raise ValueError(
+            f"raw_scales row mismatch: expected {N_recv}, got {raw_scales_2d.shape[0]}"
+        )
+    expected_scale_cols = (int(cols) + 31) // 32
+    if raw_scales_2d.shape[1] != expected_scale_cols:
+        raise ValueError(
+            f"raw_scales col mismatch: expected {expected_scale_cols} for cols={cols}, "
+            f"got {raw_scales_2d.shape[1]}"
+        )
+
+    if _HAS_TOPK_CUDA_KERNEL and _HAS_TOPK_CUDA_SCALES_KERNEL:
+        return _deepep_topk_to_sonic_metadata_cuda(
+            dispatched_indices,
+            dispatched_probs,
+            tokens_per_expert,
+            E,
+            device,
+            block,
+            raw_scales=raw_scales_2d,
+            cols=int(cols),
+            pack_scales_in_scatter=pack_scales_in_scatter,
+            pack_scales_rowmajor=pack_scales_rowmajor,
+        )
+
+    meta = deepep_topk_to_sonic_metadata(
+        dispatched_indices,
+        dispatched_probs,
+        tokens_per_expert,
+        E,
+        device,
+        block,
+    )
+    return (*meta, None)
+
+
 # ── CUDA topk implementation ─────────────────────────────────────────────────
 
 _INITIALIZED_PADDLE_DEVICES: set[int] = set()
@@ -448,6 +534,10 @@ def _deepep_topk_to_sonic_metadata_cuda(
     E: int,
     device: str | torch.device = "cuda",
     block: int = 128,
+    raw_scales: torch.Tensor | None = None,
+    cols: int | None = None,
+    pack_scales_in_scatter: bool = False,
+    pack_scales_rowmajor: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
     """CUDA fused topk metadata conversion (warp-ballot, zero argsort).
 
@@ -500,7 +590,10 @@ def _deepep_topk_to_sonic_metadata_cuda(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
+        base = (efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None)
+        if raw_scales is not None:
+            return (*base, None)
+        return base
 
     # ── Output + scratch allocation now lives in C++ ─────────────────────────
     # The launcher allocates all output tensors (expert_offsets / x_gather_idx /
@@ -514,6 +607,49 @@ def _deepep_topk_to_sonic_metadata_cuda(
     _stream_obj = torch.cuda.current_stream(device)
     stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
 
+    if raw_scales is not None and _HAS_TOPK_CUDA_SCALES_KERNEL:
+        if cols is None:
+            raise ValueError("cols is required when raw_scales is provided")
+        raw_scales_2d = raw_scales
+        if raw_scales_2d.ndim == 3:
+            if raw_scales_2d.shape[0] != 1:
+                raise ValueError(f"raw_scales: expected batch=1, got shape {tuple(raw_scales_2d.shape)}")
+            raw_scales_2d = raw_scales_2d.squeeze(0)
+        raw_scales_2d = raw_scales_2d.contiguous()
+        if pack_scales_in_scatter:
+            metadata_with_scales = deepep_topk_metadata_cuda_with_scales_scatterpack
+        elif pack_scales_rowmajor:
+            metadata_with_scales = deepep_topk_metadata_cuda_with_scales_rowpack
+        else:
+            metadata_with_scales = deepep_topk_metadata_cuda_with_scales
+        outputs = metadata_with_scales(
+            dispatched_indices.contiguous(),
+            dispatched_probs.contiguous(),
+            tpe_dev,
+            N_recv,
+            E,
+            topk,
+            TK,
+            TK_padded,
+            block,
+            raw_scales_2d,
+            int(cols),
+            stream,
+        )
+    else:
+        outputs = deepep_topk_metadata_cuda(
+            dispatched_indices.contiguous(),
+            dispatched_probs.contiguous(),
+            tpe_dev,
+            N_recv,
+            E,
+            topk,
+            TK,
+            TK_padded,
+            block,
+            stream,
+        )
+
     (
         expert_offsets,
         x_gather_idx,
@@ -522,18 +658,8 @@ def _deepep_topk_to_sonic_metadata_cuda(
         naept,
         topk_scores,
         score_src_idx,
-    ) = deepep_topk_metadata_cuda(
-        dispatched_indices.contiguous(),
-        dispatched_probs.contiguous(),
-        tpe_dev,
-        N_recv,
-        E,
-        topk,
-        TK,
-        TK_padded,
-        block,
-        stream,
-    )
+    ) = outputs[:7]
+    packed_scales = outputs[7] if len(outputs) > 7 else None
 
     # topk_scores is TK_padded-sized with zeros at pad positions.
     # For the topk path, _DownProjection uses T=N_recv and _router_forward
@@ -541,7 +667,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
     # The backward indexes via s_scatter_idx which maps to token-major positions
     # for real entries and to >= TK for pad entries (where scores = 0).
     # Return topk_scores as full TK_padded buffer (compatible with backward).
-    return (
+    base = (
         expert_offsets,
         x_gather_idx,
         s_scatter_idx,
@@ -553,6 +679,9 @@ def _deepep_topk_to_sonic_metadata_cuda(
         N_recv,
         score_src_idx,
     )
+    if raw_scales is not None:
+        return (*base, packed_scales)
+    return base
 
 
 def deepep_to_sonic_metadata(

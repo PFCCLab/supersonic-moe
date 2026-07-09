@@ -38,3 +38,66 @@ def deepep_topk_metadata_cuda(
     alignment: int,
     stream: int,
 ) -> list[torch.Tensor]: ...
+
+
+@torch.library.custom_op(
+    f"{LIBRARY_NAME}::deepep_topk_metadata_cuda_with_scales",
+    mutates_args=(),
+)
+@cpp_jit()
+def deepep_topk_metadata_cuda_with_scales(
+    dispatched_indices: torch.Tensor,
+    dispatched_probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    N_recv: int,
+    E: int,
+    topk: int,
+    TK: int,
+    TK_padded: int,
+    alignment: int,
+    raw_scales: torch.Tensor,
+    cols: int,
+    stream: int,
+) -> list[torch.Tensor]: ...
+
+
+@torch.library.custom_op(
+    f"{LIBRARY_NAME}::deepep_topk_metadata_cuda_with_scales_scatterpack",
+    mutates_args=(),
+)
+@cpp_jit()
+def deepep_topk_metadata_cuda_with_scales_scatterpack(
+    dispatched_indices: torch.Tensor,
+    dispatched_probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    N_recv: int,
+    E: int,
+    topk: int,
+    TK: int,
+    TK_padded: int,
+    alignment: int,
+    raw_scales: torch.Tensor,
+    cols: int,
+    stream: int,
+) -> list[torch.Tensor]: ...
+
+
+@torch.library.custom_op(
+    f"{LIBRARY_NAME}::deepep_topk_metadata_cuda_with_scales_rowpack",
+    mutates_args=(),
+)
+@cpp_jit()
+def deepep_topk_metadata_cuda_with_scales_rowpack(
+    dispatched_indices: torch.Tensor,
+    dispatched_probs: torch.Tensor,
+    tokens_per_expert: torch.Tensor,
+    N_recv: int,
+    E: int,
+    topk: int,
+    TK: int,
+    TK_padded: int,
+    alignment: int,
+    raw_scales: torch.Tensor,
+    cols: int,
+    stream: int,
+) -> list[torch.Tensor]: ...
