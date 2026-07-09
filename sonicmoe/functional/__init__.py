@@ -226,7 +226,7 @@ def _fused_blockscaled_gated_forward(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
     *,
-    x_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
+    x_fp8_pre: tuple[torch.Tensor, ...] | None = None,
     w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
     store_z: bool = True,
     fp8_config: _FP8Config | None = None,
@@ -255,8 +255,12 @@ def _fused_blockscaled_gated_forward(
         raise RuntimeError("Sonic FP8 fused gated forward requires explicit w1_fused payload")
 
     # Step 1: Quantize at T-size (NOT TK)
+    x_scales_tk_pre = None
     if x_fp8_pre is not None:
-        x_fp8, x_scales_t = x_fp8_pre
+        if len(x_fp8_pre) == 3:
+            x_fp8, x_scales_t, x_scales_tk_pre = x_fp8_pre
+        else:
+            x_fp8, x_scales_t = x_fp8_pre
         _PREQUANT_HIT_COUNT["activation_fwd"] += 1
     else:
         x_fp8, x_scales_t = quantize_and_pack_activation(x)
@@ -264,9 +268,12 @@ def _fused_blockscaled_gated_forward(
     # Step 2: Gather scales T->TK in ISA layout (~3-8µs)
     TK = x_gather_idx.shape[0]
     K = x.shape[1]
-    x_scales_tk_e8m0 = _gather_1x32_scales_to_isa(
-        x_scales_t, x_gather_idx, int(x_fp8.shape[0]), K
-    )
+    if x_scales_tk_pre is not None:
+        x_scales_tk_e8m0 = x_scales_tk_pre.view(_E8M0_DTYPE)
+    else:
+        x_scales_tk_e8m0 = _gather_1x32_scales_to_isa(
+            x_scales_t, x_gather_idx, int(x_fp8.shape[0]), K
+        )
     del x_scales_t
 
     # Step 3: Zero-materialization GEMM via standard interface.
@@ -1092,7 +1099,7 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         use_low_precision_postact_buffer: bool = False,
-        prequant_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prequant_activation_payload: tuple[torch.Tensor, ...] | None = None,
         fp8_config: _FP8Config | None = None,
     ) -> torch.Tensor:
         T, H = x.shape
@@ -1133,7 +1140,8 @@ class _UpProjection(torch.autograd.Function):
                         # UpProj.ctx — UpProj is a different autograd Function).
                         _PREQUANTIZED_SCALES.pop("z_fp8", None)
                         if prequant_activation_payload is not None:
-                            _x_fp8_pre, _x_scales_pre = prequant_activation_payload
+                            _x_fp8_pre = prequant_activation_payload[0]
+                            _x_scales_pre = prequant_activation_payload[1]
                         else:
                             _x_fp8_pre, _x_scales_pre = None, None
                         x_recompute = None if _x_fp8_pre is not None else x
@@ -1263,6 +1271,9 @@ class _UpProjection(torch.autograd.Function):
         ctx._has_b1 = b1 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._prequant_activation_payload = prequant_activation_payload is not None
+        ctx._prequant_activation_payload_len = (
+            len(prequant_activation_payload) if prequant_activation_payload is not None else 0
+        )
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
@@ -1287,7 +1298,8 @@ class _UpProjection(torch.autograd.Function):
             x_fp8_pre, x_scales_pre = None, None
             x_saved = x
             if prequant_activation_payload is not None:
-                x_fp8_pre, x_scales_pre = prequant_activation_payload
+                x_fp8_pre = prequant_activation_payload[0]
+                x_scales_pre = prequant_activation_payload[1]
                 x_saved = torch.empty(1, dtype=x.dtype, device=x.device).as_strided((T, H), (0, 0))
 
             ctx.save_for_backward(
@@ -1656,7 +1668,7 @@ class _UpProjection(torch.autograd.Function):
         if ctx._has_num_activated:
             grads.append(None)
         if ctx._prequant_activation_payload:
-            grads.append((None, None))
+            grads.append(tuple(None for _ in range(ctx._prequant_activation_payload_len)))
         return tuple(grads)
 
 
