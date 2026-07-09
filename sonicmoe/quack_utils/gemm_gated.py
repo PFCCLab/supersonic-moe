@@ -2,7 +2,9 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+import os
 from functools import partial
+from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Tuple
 
 import cutlass
@@ -16,12 +18,22 @@ from cutlass import const_expr, Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
+from quack.cache_utils import EXTRA_SOURCE_DIRS, jit_cache
+from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, mlir_namedtuple
 from quack.epi_ops import TileStore, EpiOp, assume_stride_divisibility
 from quack.gemm_act import GemmActMixin
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
+from quack.gemm_tvm_ffi_utils import (
+    div_for_dtype,
+    make_fake_gemm_tensors,
+    make_fake_scheduler_args,
+    make_fake_varlen_args,
+    make_scheduler_args,
+    make_varlen_args,
+)
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 from quack.layout_utils import permute_gated_Cregs_b16
 
@@ -49,6 +61,36 @@ from .gemm_sm100_fp8_zeromat import (
 )
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+_SONIC_QUACK_UTILS_DIR = Path(__file__).resolve().parent
+if _SONIC_QUACK_UTILS_DIR not in EXTRA_SOURCE_DIRS:
+    EXTRA_SOURCE_DIRS.append(_SONIC_QUACK_UTILS_DIR)
+
+
+def _raw_stream_id(stream) -> Optional[int]:
+    if stream is None:
+        return None
+    if isinstance(stream, int):
+        return stream
+    if hasattr(stream, "stream_base"):
+        return int(stream.stream_base.raw_stream)
+    if hasattr(stream, "cuda_stream"):
+        return int(stream.cuda_stream)
+    try:
+        return int(stream)
+    except (TypeError, ValueError):
+        return None
+
+
+def _current_raw_stream_id() -> int:
+    stream = torch.cuda.current_stream()
+    if hasattr(stream, "stream_base"):
+        return int(stream.stream_base.raw_stream)
+    return int(stream.cuda_stream)
+
+
+def _stream_matches_current(stream) -> bool:
+    stream_id = _raw_stream_id(stream)
+    return stream_id is None or stream_id == _current_raw_stream_id()
 
 
 class GemmGatedSm90(GemmGatedMixin, GemmSm90):
@@ -75,6 +117,244 @@ gate_fn_map = {
     "geglu": quack.activation.geglu,
     "glu": quack.activation.glu,
 }
+
+
+_GATED_FFI_CLASSES = {
+    "GemmGatedSm100ZeroMat": GemmGatedSm100ZeroMat,
+    "GemmGatedSm100ZeroMatBlockscaledQuant": GemmGatedSm100ZeroMatBlockscaledQuant,
+    "GemmGatedSm100ZeroMatPostActQuant": GemmGatedSm100ZeroMatPostActQuant,
+    "GemmGatedSm100ZeroMatQuantPostActQuant": GemmGatedSm100ZeroMatQuantPostActQuant,
+}
+
+
+def _fake_tensor_rank(dtype, ndim: int, leading_dim: int):
+    if dtype is None or ndim <= 0:
+        return None
+    shape = tuple(cute.sym_int() for _ in range(ndim))
+    return fake_tensor(dtype, shape, leading_dim=leading_dim, divisibility=div_for_dtype(dtype))
+
+
+@jit_cache
+def _compile_gemm_gated_tvm_ffi(
+    gemm_cls_name,
+    a_dtype,
+    b_dtype,
+    d_dtype,
+    c_dtype,
+    postact_dtype,
+    a_major,
+    b_major,
+    d_major,
+    c_major,
+    postact_major,
+    tile_shape_mn,
+    cluster_shape_mnk,
+    pingpong,
+    persistent,
+    activation,
+    device_capacity,
+    max_swizzle_size,
+    varlen_m,
+    gather_A,
+    blockscaled,
+    epilogue_quant,
+    postact_quant,
+    swiglu_clamp_value,
+    postact_bf16_trunc,
+    a_scale_dtype,
+    a_scale_ndim,
+    b_scale_dtype,
+    b_scale_ndim,
+    z_scale_dtype,
+    z_scale_ndim,
+    postact_scale_dtype,
+    postact_scale_ndim,
+):
+    GemmCls = _GATED_FFI_CLASSES[gemm_cls_name]
+    mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
+        a_dtype,
+        b_dtype,
+        d_dtype,
+        c_dtype,
+        a_major,
+        b_major,
+        d_major,
+        c_major,
+        varlen_m=varlen_m,
+        gather_A=gather_A,
+    )
+    postact_shape = (m, cute.sym_int()) if varlen_m else (m, cute.sym_int(), l)
+    mPostAct = fake_tensor(
+        postact_dtype,
+        postact_shape,
+        leading_dim=1 if postact_major == "n" else 0,
+        divisibility=div_for_dtype(postact_dtype),
+    )
+    epi_kwargs = {}
+    if epilogue_quant:
+        epi_kwargs["mZScale"] = _fake_tensor_rank(z_scale_dtype, z_scale_ndim, leading_dim=1)
+    if postact_quant:
+        epi_kwargs["mPostActScaleIsa"] = _fake_tensor_rank(
+            postact_scale_dtype, postact_scale_ndim, leading_dim=2
+        )
+        epi_kwargs["postact_bf16_trunc"] = bool(postact_bf16_trunc)
+    epi_args = GemmCls.EpilogueArguments(
+        mPostAct,
+        gate_fn_map[activation],
+        swiglu_clamp_value=float(swiglu_clamp_value),
+        mRowVecBroadcast=None,
+        mColVecBroadcast=None,
+        **epi_kwargs,
+    )
+    scheduler_args = make_fake_scheduler_args(False, False, l)
+    varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
+    mSFA = _fake_tensor_rank(a_scale_dtype, a_scale_ndim, leading_dim=1)
+    mSFB = _fake_tensor_rank(b_scale_dtype, b_scale_ndim, leading_dim=1)
+
+    gemm_obj = GemmCls(
+        Float32,
+        a_dtype,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        gather_A=gather_A,
+        sf_vec_size=32 if blockscaled else None,
+    )
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        gemm_obj,
+        mA,
+        mB,
+        mD,
+        mC,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        stream,
+        mSFA,
+        mSFB,
+        options="--enable-tvm-ffi",
+    )
+
+
+def _can_use_gated_tvm_ffi(
+    GemmCls,
+    device_capacity,
+    gather_A,
+    blockscaled,
+    tile_count_semaphore,
+    rowvec_bias,
+    colvec_bias,
+    current_stream,
+    tensor_infos,
+) -> bool:
+    if os.getenv("SONIC_MOE_DISABLE_GATED_TVM_FFI", "0").lower() in {"1", "true", "yes", "on"}:
+        return False
+    return (
+        device_capacity[0] > 9
+        and GemmCls.__name__ in _GATED_FFI_CLASSES
+        and gather_A
+        and blockscaled
+        and tile_count_semaphore is None
+        and rowvec_bias is None
+        and colvec_bias is None
+        and _stream_matches_current(current_stream)
+        and tensor_infos["D"].tensor is not None
+    )
+
+
+def _run_gemm_gated_tvm_ffi(
+    GemmCls,
+    tensor_infos,
+    activation,
+    tile_shape_mn,
+    cluster_shape_mnk,
+    pingpong,
+    persistent,
+    max_swizzle_size,
+    device_capacity,
+    cu_seqlens_m,
+    A_idx,
+    a_scales,
+    b_scales,
+    z_scale_out,
+    postact_scale_out,
+    swiglu_clamp_value,
+    postact_bf16_trunc,
+):
+    varlen_m = cu_seqlens_m is not None
+    gather_A = A_idx is not None
+    blockscaled = a_scales is not None and b_scales is not None
+    epilogue_quant = z_scale_out is not None
+    postact_quant = postact_scale_out is not None
+    compiled_fn = _compile_gemm_gated_tvm_ffi(
+        GemmCls.__name__,
+        tensor_infos["A"].dtype,
+        tensor_infos["B"].dtype,
+        tensor_infos["D"].dtype,
+        tensor_infos["C"].dtype,
+        tensor_infos["PostAct"].dtype,
+        tensor_infos["A"].major,
+        tensor_infos["B"].major,
+        tensor_infos["D"].major,
+        tensor_infos["C"].major,
+        tensor_infos["PostAct"].major,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        pingpong,
+        persistent,
+        activation,
+        device_capacity,
+        max_swizzle_size,
+        varlen_m,
+        gather_A,
+        blockscaled,
+        epilogue_quant,
+        postact_quant,
+        float(swiglu_clamp_value),
+        bool(postact_bf16_trunc),
+        _TORCH_TO_CUTLASS_DTYPE[a_scales.dtype] if a_scales is not None else None,
+        a_scales.ndim if a_scales is not None else 0,
+        _TORCH_TO_CUTLASS_DTYPE[b_scales.dtype] if b_scales is not None else None,
+        b_scales.ndim if b_scales is not None else 0,
+        _TORCH_TO_CUTLASS_DTYPE[z_scale_out.dtype] if z_scale_out is not None else None,
+        z_scale_out.ndim if z_scale_out is not None else 0,
+        _TORCH_TO_CUTLASS_DTYPE[postact_scale_out.dtype] if postact_scale_out is not None else None,
+        postact_scale_out.ndim if postact_scale_out is not None else 0,
+    )
+    from quack.cache_utils import COMPILE_ONLY as _COMPILE_ONLY
+    if _COMPILE_ONLY:
+        return
+
+    epi_kwargs = {}
+    if epilogue_quant:
+        epi_kwargs["mZScale"] = z_scale_out
+    if postact_quant:
+        epi_kwargs["mPostActScaleIsa"] = postact_scale_out
+        epi_kwargs["postact_bf16_trunc"] = None
+    epi_args = GemmCls.EpilogueArguments(
+        tensor_infos["PostAct"].tensor,
+        None,
+        swiglu_clamp_value=None,
+        mRowVecBroadcast=None,
+        mColVecBroadcast=None,
+        rounding_mode=None,
+        sr_seed=None,
+        **epi_kwargs,
+    )
+    max_active_clusters = get_max_active_clusters(cluster_shape_mnk[0] * cluster_shape_mnk[1]) if persistent else 0
+    scheduler_args = make_scheduler_args(max_active_clusters, max_swizzle_size, None)
+    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
+    compiled_fn(
+        tensor_infos["A"].tensor,
+        tensor_infos["B"].tensor,
+        tensor_infos["D"].tensor,
+        tensor_infos["C"].tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        a_scales,
+        b_scales,
+    )
 
 
 def gemm_gated(
@@ -199,6 +479,39 @@ def gemm_gated(
     ):
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
+    blockscaled = a_scales is not None and b_scales is not None
+    if _can_use_gated_tvm_ffi(
+        GemmCls,
+        device_capacity,
+        gather_A,
+        blockscaled,
+        tile_count_semaphore,
+        rowvec_bias,
+        colvec_bias,
+        current_stream,
+        tensor_infos,
+    ):
+        _run_gemm_gated_tvm_ffi(
+            GemmCls,
+            tensor_infos,
+            activation,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            pingpong,
+            persistent,
+            max_swizzle_size,
+            device_capacity,
+            cu_seqlens_m,
+            A_idx,
+            a_scales,
+            b_scales,
+            z_scale_out,
+            postact_scale_out,
+            swiglu_clamp_value,
+            postact_bf16_trunc,
+        )
+        return
+
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
     for name, info in tensor_infos.items():
         if info.tensor is not None and name in major_configs:
@@ -247,13 +560,11 @@ def gemm_gated(
         if current_stream is not None
         else torch.cuda.current_stream()
     )
-    current_stream = cuda.CUstream(
-        _stream_obj.stream_base.raw_stream
-        if hasattr(_stream_obj, "stream_base")
-        else _stream_obj.cuda_stream
-    )
+    _stream_raw = _raw_stream_id(_stream_obj)
+    if _stream_raw is None:
+        _stream_raw = _current_raw_stream_id()
+    current_stream = cuda.CUstream(_stream_raw)
 
-    blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None
 
     # Prepare blockscaled scale cute tensors if provided

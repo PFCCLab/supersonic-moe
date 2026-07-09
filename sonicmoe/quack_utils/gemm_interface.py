@@ -13,7 +13,6 @@ from quack.gemm_config import GemmConfig, get_all_configs
 from quack.gemm_interface import default_config as quack_default_config, prune_invalid_gemm_configs as prune_invalid_gemm_configs_base
 from torch import Tensor
 
-
 def _custom_op_or_plain(name, **kwargs):
     """torch.library.custom_op that falls back to plain function if already registered."""
     def decorator(fn):

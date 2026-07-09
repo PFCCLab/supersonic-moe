@@ -36,7 +36,6 @@ from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
 
 apply_fp8_quack_patch()
 
-
 from .backward import (
     _softmax_topk_bwd,
     _token_broadcast_backward,
@@ -651,7 +650,24 @@ def _padded_blockscaled_gated_forward(
 
 
 def _use_wgrad_beta_accum() -> bool:
-    return os.getenv("SONIC_MOE_FP8_WGRAD_TMA_ADD", "").lower() not in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FP8_WGRAD_TMA_ADD", "1").lower() in {"1", "true", "yes", "on"}
+
+
+def _main_grad_accumulator(weight):
+    if weight is None or not hasattr(weight, "main_grad"):
+        return None
+    if weight.main_grad is None:
+        weight.main_grad = paddle.zeros_like(weight, dtype=paddle.float32)
+    return weight.main_grad
+
+
+def _apply_weight_backward_hook(weight):
+    if (
+        weight is not None
+        and hasattr(weight, "_apply_backward_hook")
+        and not weight.stop_gradient
+    ):
+        weight._apply_backward_hook()
 
 
 def _can_reuse_bf16_preact_for_dz(z: torch.Tensor | None, total_m: int, n: int, device) -> bool:
@@ -1097,7 +1113,7 @@ class _UpProjection(torch.autograd.Function):
     def forward(
         ctx,
         x: torch.Tensor,
-        w1: torch.Tensor,
+        w1_original: torch.Tensor,
         b1: torch.Tensor | None,
         expert_frequency_offset: torch.Tensor,
         total_expert_freq: int,
@@ -1114,6 +1130,9 @@ class _UpProjection(torch.autograd.Function):
         prequant_activation_payload: tuple[torch.Tensor, ...] | None = None,
         fp8_config: _FP8Config | None = None,
     ) -> torch.Tensor:
+        w1 = w1_original.permute([1, 2, 0])
+        w1.fp8 = getattr(w1_original, "fp8", None)
+        w1.transposed_fp8 = getattr(w1_original, "transposed_fp8", None)
         T, H = x.shape
         I, H, E = w1.shape
         is_glu_activation = is_glu(activation_type)
@@ -1284,8 +1303,12 @@ class _UpProjection(torch.autograd.Function):
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._prequant_activation_payload = prequant_activation_payload is not None
         ctx._prequant_activation_payload_len = (
-            len(prequant_activation_payload) if prequant_activation_payload is not None else 0
+            len(prequant_activation_payload)
+            if prequant_activation_payload is not None
+            else 0
         )
+        ctx._w1_original = w1_original
+        ctx._wgrad_w1_accumulator = _main_grad_accumulator(w1_original)
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
@@ -1672,7 +1695,11 @@ class _UpProjection(torch.autograd.Function):
         )
 
         # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum)
-        grads = [dx_reduced, dw1]
+        grads = [dx_reduced]
+        if ctx._wgrad_w1_accumulator is None:
+            grads.append(dw1.permute([2, 0, 1]))
+        else:
+            grads.append(None)
         if ctx._has_b1:
             grads.append(db1)
         # expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
@@ -1681,6 +1708,8 @@ class _UpProjection(torch.autograd.Function):
             grads.append(None)
         if ctx._prequant_activation_payload:
             grads.append(tuple(None for _ in range(ctx._prequant_activation_payload_len)))
+        if ctx._wgrad_w1_accumulator is not None:
+            _apply_weight_backward_hook(ctx._w1_original)
         return tuple(grads)
 
 
@@ -1690,7 +1719,7 @@ class _DownProjection(torch.autograd.Function):
         ctx,
         y1: torch.Tensor,
         z: torch.Tensor,
-        w2: torch.Tensor,
+        w2_original: torch.Tensor,
         b2: torch.Tensor | None,
         topk_scores: torch.Tensor,
         selected_experts: torch.Tensor,
@@ -1708,6 +1737,9 @@ class _DownProjection(torch.autograd.Function):
         fp8_combine_grad_handle=None,
         fp8_config: _FP8Config | None = None,
     ) -> torch.Tensor:
+        w2 = w2_original.permute([1, 2, 0])
+        w2.fp8 = getattr(w2_original, "fp8", None)
+        w2.transposed_fp8 = getattr(w2_original, "transposed_fp8", None)
         TK = y1.size(0)
         H, I, E = w2.shape
 
@@ -1847,6 +1879,8 @@ class _DownProjection(torch.autograd.Function):
         ctx._has_b2 = b2 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
+        ctx._w2_original = w2_original
+        ctx._wgrad_w2_accumulator = _main_grad_accumulator(w2_original)
         # Always compute ds (topk_scores gradient) — needed for router training.
         # NOTE: topk_scores.stop_gradient is unreliable inside .apply() because
         # Paddle's torch-proxy resets stop_gradient=True on inputs (mirroring
@@ -2544,13 +2578,19 @@ class _DownProjection(torch.autograd.Function):
         # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum/None)
         # Tensor inputs: y1, z, w2, [b2], topk_scores, selected_experts, expert_frequency_offset,
         #   x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, [num_activated_expert_per_token_offset]
-        grads = [None, dz, dw2]  # y1, z, w2
+        grads = [None, dz]  # y1, z, w2
+        if ctx._wgrad_w2_accumulator is None:
+            grads.append(dw2.permute([2, 0, 1]))
+        else:
+            grads.append(None)
         if ctx._has_b2:
             grads.append(db2)
         grads.extend([ds if ctx._topk_scores_needs_grad else None, None, None])  # topk_scores, selected_experts, expert_frequency_offset
         grads.extend([None, None, None])  # x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
         if ctx._has_num_activated:
             grads.append(None)
+        if ctx._wgrad_w2_accumulator is not None:
+            _apply_weight_backward_hook(ctx._w2_original)
         return tuple(grads)
 
 

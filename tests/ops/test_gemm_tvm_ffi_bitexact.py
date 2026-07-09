@@ -1,0 +1,168 @@
+"""Bit-exact regression tests for the Sonic MoE TVM-FFI GEMM launch path."""
+
+from contextlib import contextmanager, nullcontext
+from importlib import import_module
+
+import numpy as np
+import pytest
+import torch
+
+from tests.ops.conftest import requires_blackwell, requires_quack
+
+pytestmark = [requires_blackwell, requires_quack]
+
+_SHAPE = (128, 512, 512, 4, 8)  # T, H, I, E, topk; TK=256, all 128-aligned.
+
+
+@contextmanager
+def _force_executor(module_name: str, predicate_name: str):
+    module = import_module(module_name)
+    original = getattr(module, predicate_name)
+    setattr(module, predicate_name, lambda *args, **kwargs: False)
+    try:
+        yield
+    finally:
+        setattr(module, predicate_name, original)
+
+
+def _assert_byte_exact(actual, expected, label):
+    a = actual.contiguous().view(torch.uint8)
+    b = expected.contiguous().view(torch.uint8)
+    mismatches = (a != b).sum().item()
+    assert mismatches == 0, f"{label}: {mismatches}/{a.numel()} bytes differ"
+
+
+def _current_raw_stream():
+    stream = torch.cuda.current_stream()
+    if hasattr(stream, "stream_base"):
+        return int(stream.stream_base.raw_stream)
+    return int(stream.cuda_stream)
+
+
+def test_gemm_gated_tvm_ffi_matches_executor_combined_quant():
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+        precompute_weight_fp8_for_fused_gated,
+        quantize_and_pack_activation,
+    )
+    from sonicmoe.quack_utils.gemm_interface import gemm_gated
+
+    T, H, I, E, topk = _SHAPE
+    TK = T * topk // E
+    total_m = TK * E
+    rng = np.random.RandomState(123)
+    x = torch.from_numpy((rng.randn(total_m, H).astype(np.float32) * 0.02)).to(
+        "cuda", dtype=torch.bfloat16
+    )
+    w1 = torch.from_numpy((rng.randn(2 * I, H, E).astype(np.float32) * 0.02)).to(
+        "cuda", dtype=torch.bfloat16
+    )
+    cu_seqlens = torch.arange(0, (E + 1) * TK, TK, dtype=torch.int32, device="cuda")
+    a_idx = torch.arange(total_m, dtype=torch.int32, device="cuda")
+    x_fp8, a_scales = quantize_and_pack_activation(x)
+    w_fp8, b_scales = precompute_weight_fp8_for_fused_gated(w1)
+
+    def run(enabled):
+        context = (
+            nullcontext()
+            if enabled
+            else _force_executor("sonicmoe.quack_utils.gemm_gated", "_can_use_gated_tvm_ffi")
+        )
+        with context:
+            z_scale = torch.empty((total_m, 2 * I // 32), dtype=torch.uint8, device="cuda")
+            y1_scale = torch.empty((total_m // 128, I // 128, 512), dtype=torch.uint8, device="cuda")
+            z, y1 = gemm_gated(
+                x_fp8,
+                w_fp8,
+                activation="swiglu",
+                out_dtype=torch.float8_e4m3fn,
+                postact_dtype=torch.float8_e4m3fn,
+                cu_seqlens_m=cu_seqlens,
+                A_idx=a_idx,
+                a_scales=a_scales,
+                b_scales=b_scales,
+                z_scale_out=z_scale,
+                postact_scale_out=y1_scale,
+                tuned=False,
+                current_stream=_current_raw_stream(),
+            )
+            torch.cuda.synchronize()
+            return z, y1, z_scale, y1_scale
+
+    executor = run(False)
+    tvm_ffi = run(True)
+    for label, lhs, rhs in zip(("z", "y1", "z_scale", "y1_scale"), tvm_ffi, executor):
+        _assert_byte_exact(lhs, rhs, label)
+
+
+def test_gemm_dgated_tvm_ffi_matches_executor_fp8_preact_reduce():
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+        precompute_weight_fp8_for_direct_fused_dgated,
+        quantize_activation_blockscaled_fast,
+        quantize_and_pack_activation,
+    )
+    from sonicmoe.quack_utils.gemm_dgated import gemm_dgated as gemm_dgated_kernel
+    from sonicmoe.quack_utils.gemm_interface import default_config
+
+    T, H, I, E, topk = _SHAPE
+    TK = T * topk // E
+    total_m = TK * E
+    rng = np.random.RandomState(456)
+    dout = torch.from_numpy((rng.randn(total_m, H).astype(np.float32) * 0.02)).to(
+        "cuda", dtype=torch.bfloat16
+    )
+    w2 = torch.from_numpy((rng.randn(H, I, E).astype(np.float32) * 0.02)).to(
+        "cuda", dtype=torch.bfloat16
+    )
+    z_bf16 = torch.from_numpy((rng.randn(total_m, 2 * I).astype(np.float32) * 0.02)).to(
+        "cuda", dtype=torch.bfloat16
+    )
+    colvec_scale = torch.from_numpy((rng.rand(total_m).astype(np.float32) + 0.5)).to("cuda")
+    cu_seqlens = torch.arange(0, (E + 1) * TK, TK, dtype=torch.int32, device="cuda")
+    a_idx = torch.arange(total_m, dtype=torch.int32, device="cuda")
+    dout_fp8, dout_scales = quantize_and_pack_activation(dout)
+    w2_fp8, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+    z_fp8, z_scales = quantize_activation_blockscaled_fast(z_bf16.contiguous())
+    config = default_config(dout.device, num_experts=E)
+    partial_shape = (total_m, (I + config.tile_n - 1) // config.tile_n)
+
+    def run(enabled):
+        context = (
+            nullcontext()
+            if enabled
+            else _force_executor("sonicmoe.quack_utils.gemm_dgated", "_can_use_dgated_tvm_ffi")
+        )
+        with context:
+            dz = torch.empty((total_m, 2 * I), dtype=torch.bfloat16, device="cuda")
+            y1s = torch.empty((total_m, I), dtype=torch.bfloat16, device="cuda")
+            partial = torch.zeros(partial_shape, dtype=torch.float32, device="cuda")
+            gemm_dgated_kernel(
+                dout_fp8,
+                w2_fp8,
+                dz,
+                dz,
+                y1s,
+                None,
+                "swiglu",
+                config.tile_m,
+                config.tile_n,
+                config.cluster_m,
+                config.cluster_n,
+                config.pingpong,
+                persistent=True,
+                max_swizzle_size=config.max_swizzle_size,
+                colvec_scale=colvec_scale,
+                colvec_reduce=partial,
+                cu_seqlens_m=cu_seqlens,
+                A_idx=a_idx,
+                a_scales=dout_scales,
+                b_scales=w2_scales,
+                preact_fp8=z_fp8,
+                preact_scales=z_scales,
+            )
+            torch.cuda.synchronize()
+            return dz, y1s, partial
+
+    executor = run(False)
+    tvm_ffi = run(True)
+    for label, lhs, rhs in zip(("dz", "y1s", "colvec_reduce"), tvm_ffi, executor):
+        _assert_byte_exact(lhs, rhs, label)
