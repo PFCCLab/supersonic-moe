@@ -123,6 +123,38 @@ For the production-like shape used by the scale-pack benchmark
 paths.  Any reuse scheme must prove that a buffer is not overwritten before all
 autograd users are done.
 
+## Can `view`/`transpose` Be Hoisted To Global Step?
+
+Partially.  The safe boundary is tensor storage lifetime, not the textual
+operation name.  A tensor view captures a data pointer, storage offset, shape,
+stride, and dtype interpretation.  A cached view can be reused only while all of
+those remain valid.
+
+| source | lifetime | can hoist to global step? | best optimization |
+|---|---|---:|---|
+| FP8 weight `B.mT` and low-level `B.permute(1,2,0)` | static for all microbatches until optimizer updates the weight | yes | Build the final CUTE-facing B layout once when the per-step FP8 weight cache is populated, then route a gated fast path that skips generic `B.mT`/`permute_tensors`. |
+| weight scale dtype/storage view | static for all microbatches until optimizer updates the weight | yes | Cache the uint8 storage view or CUTE scale tensor with the weight cache; invalidate on weight version change. |
+| compile key, major-order metadata, scheduler args for fixed SM100 gated config | static for the model shape/config | yes | Cache with the compiled gated kernel fast path; do not rebuild per microbatch. |
+| activation FP8 `x_fp8` | new storage per microbatch | no | Avoid Python dtype-view overhead by passing uint8 storage plus explicit CUTE element type, or create any alias inside the producing C++ op. |
+| packed activation scales `x_scales_tk_pre.view(E8M0)` | new storage and new data per DeepEP dispatch/microbatch | no | Prefer returning an E8M0-typed tensor directly from the metadata C++ op, or keep uint8 storage and pass `Float8E8M0FNU` explicitly to CUTE. |
+| z/y1 output FP8 tensors | new storage per microbatch and saved for backward/downstream | no | Allocate/alias at the microbatch boundary, ideally through one C++ carrier factory or a lifetime-aware workspace. |
+| z/y1 scale outputs | new storage per microbatch and consumed by backward/downstream | no | Store as uint8 plus explicit scale type, or create the typed alias once next to allocation; do not recreate it in the GEMM prelaunch path. |
+| lightweight bf16 zero-stride placeholders | graph/lifetime tied to the current autograd microbatch | no by default | Can be optimized only with an autograd-aware placeholder/cache test; not a P0 compared with B/view/CUTE wrapper costs. |
+
+Therefore the most useful split is:
+
+1. **Global-step hoist:** static weight views, static scale views, B major-order
+   metadata, compile key, scheduler args, and any static CUTE wrappers whose
+   data pointer is stable for the whole optimizer step.
+2. **Microbatch-level elimination:** dynamic activation/output/scale aliases
+   cannot be reused globally, but their Python `view_dtype` cost can be removed
+   by using typed C++ outputs or a CUTE helper that accepts raw uint8 storage with
+   an explicit FP8/E8M0 element type.
+3. **Carrier allocation:** `empty` for z/y1 carriers cannot be globally reused
+   without autograd lifetime proof.  The safe optimization is either a C++ carrier
+   factory that returns all required tensors in one call, or a ring/workspace
+   keyed by in-flight microbatch lifetime.
+
 ## Existing Reproduction Commands
 
 Use the ERNIEBot venv when reproducing in the integrated environment:
