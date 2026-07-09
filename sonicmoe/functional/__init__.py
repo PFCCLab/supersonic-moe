@@ -654,6 +654,18 @@ def _use_wgrad_beta_accum() -> bool:
     return os.getenv("SONIC_MOE_FP8_WGRAD_TMA_ADD", "").lower() not in {"1", "true", "yes", "on"}
 
 
+def _can_reuse_bf16_preact_for_dz(z: torch.Tensor | None, total_m: int, n: int, device) -> bool:
+    if z is None:
+        return False
+    if str(z.dtype) not in {"torch.bfloat16", "paddle.bfloat16", "bfloat16"}:
+        return False
+    if z.device != device:
+        return False
+    if tuple(z.shape) != (int(total_m), int(n) * 2):
+        return False
+    return z.is_contiguous() and z.stride(-1) == 1
+
+
 def _use_fused_zy1_quant() -> bool:
     """Check if fused z+y1 quantization is enabled (default: disabled).
 
@@ -2102,7 +2114,16 @@ class _DownProjection(torch.autograd.Function):
                     # config = _safe_dgated_config(dout.device, w2_shape[2])
                     total_m = x_gather_idx.shape[0]  # TK (not T — dout_fp8 is T-sized)
                     n = w2_fp8_enk.shape[-2]
-                    dz = torch.empty((total_m, n * 2), dtype=torch.bfloat16, device=dout.device)
+                    dz = (
+                        z
+                        if (
+                            not use_fp8_preact
+                            and _can_reuse_bf16_preact_for_dz(z, total_m, n, dout.device)
+                        )
+                        else torch.empty(
+                            (total_m, n * 2), dtype=torch.bfloat16, device=dout.device
+                        )
+                    )
                     y1s = torch.empty((total_m, n), dtype=torch.bfloat16, device=dout.device)
                     colvec_reduce_partial = torch.empty(
                         (total_m, (n + config.tile_n - 1) // config.tile_n),

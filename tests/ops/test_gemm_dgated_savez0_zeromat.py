@@ -35,6 +35,73 @@ def _torch_swiglu_postact(z_preact, scale=None):
     return y.to(torch.bfloat16)
 
 
+def _run_zeromat_bf16_preact_case(*, inplace_dz: bool):
+    from sonicmoe.functional import _gather_1x32_scales_to_isa
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+        precompute_weight_fp8_for_direct_fused_dgated,
+        quantize_activation_blockscaled_fast,
+    )
+    from sonicmoe.quack_utils.gemm_dgated import gemm_dgated as gemm_dgated_kernel
+    from sonicmoe.quack_utils.gemm_interface import default_config
+
+    T, H, I, E, K = 128, 128, 128, 8, 8
+    TK, total_M, cu_seqlens = _setup(T, H, I, E, K)
+    source_rows = T
+    dout_source = (torch.randn(source_rows, H, dtype=torch.bfloat16, device="cuda") * 0.2).contiguous()
+    w2 = (torch.randn(H, I, E, dtype=torch.bfloat16, device="cuda") * 0.2).contiguous()
+    z_preact = (torch.randn(total_M, 2 * I, dtype=torch.bfloat16, device="cuda") * 0.5).contiguous()
+
+    base_idx = torch.arange(source_rows, dtype=torch.int32, device="cuda")
+    a_idx = base_idx.repeat_interleave(K).reshape(T, K).transpose(0, 1).contiguous().reshape(-1)
+    scale = (torch.rand(total_M, dtype=torch.float32, device="cuda") * 0.9 + 0.1).contiguous()
+
+    dout_fp8, dout_raw_scales = quantize_activation_blockscaled_fast(dout_source)
+    dout_scales = _gather_1x32_scales_to_isa(dout_raw_scales, a_idx, source_rows, H)
+    w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+
+    config = default_config(dout_source.device)
+    z_for_kernel = z_preact.clone()
+    dz = z_for_kernel if inplace_dz else torch.empty_like(z_for_kernel)
+    y1s = torch.empty((total_M, I), dtype=torch.bfloat16, device="cuda")
+    colvec_reduce = torch.zeros(
+        (total_M, (I + config.tile_n - 1) // config.tile_n),
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    gemm_dgated_kernel(
+        dout_fp8,
+        w2_fp8_enk,
+        dz,
+        z_for_kernel,
+        y1s,
+        None,
+        "swiglu",
+        config.tile_m,
+        config.tile_n,
+        config.cluster_m,
+        config.cluster_n,
+        config.pingpong,
+        persistent=True,
+        max_swizzle_size=config.max_swizzle_size,
+        colvec_scale=scale,
+        colvec_reduce=colvec_reduce,
+        cu_seqlens_m=cu_seqlens,
+        A_idx=a_idx,
+        a_scales=dout_scales,
+        b_scales=w2_scales,
+    )
+    torch.cuda.synchronize()
+
+    return {
+        "dz": dz.detach().clone(),
+        "y1s": y1s.detach().clone(),
+        "colvec_reduce": colvec_reduce.detach().clone(),
+        "z_preact": z_preact,
+        "aliased": dz.data_ptr() == z_for_kernel.data_ptr(),
+    }
+
+
 @pytest.mark.parametrize("T,H,I,E,K", [pytest.param(128, 128, 128, 8, 8, id="gather_repeated_aligned")])
 def test_fp8_zeromat_bf16_preact_vs_torch(T, H, I, E, K, seed):
     """FP8 ZeroMat dGated with BF16 PreAct must handle real A_idx gather."""
@@ -114,3 +181,20 @@ def test_fp8_zeromat_bf16_preact_vs_torch(T, H, I, E, K, seed):
     assert torch.isfinite(colvec_reduce).all()
     assert c_dz > 0.95, f"dz cosine too low: {c_dz:.8f}, RRMSE={r_dz:.6f}"
     assert c_y1 > 0.99, f"y1s cosine too low: {c_y1:.8f}, RRMSE={r_y1:.6f}"
+
+
+def test_fp8_zeromat_bf16_preact_dz_can_alias_z(seed):
+    """BF16 PreAct storage can be overwritten by dz after each tile is read."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    out_of_place = _run_zeromat_bf16_preact_case(inplace_dz=False)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    in_place = _run_zeromat_bf16_preact_case(inplace_dz=True)
+
+    assert in_place["aliased"], "inplace run did not reuse z storage for dz"
+    assert torch.equal(in_place["z_preact"], out_of_place["z_preact"])
+    assert torch.equal(in_place["dz"], out_of_place["dz"])
+    assert torch.equal(in_place["y1s"], out_of_place["y1s"])
+    assert torch.equal(in_place["colvec_reduce"], out_of_place["colvec_reduce"])

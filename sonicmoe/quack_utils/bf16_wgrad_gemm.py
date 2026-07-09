@@ -87,7 +87,7 @@ def _bf16_wgrad_default_config(
             pingpong=False,
             swap_ab=False,
             is_dynamic_persistent=True,
-            max_swizzle_size=8,
+            max_swizzle_size=1,
             device_capacity=cap[0],
         )
     return GemmConfig(
