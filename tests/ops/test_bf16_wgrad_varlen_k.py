@@ -43,6 +43,7 @@ DEFAULT_CANDIDATES = [
     "128,192,2,1,1,8",
     "128,256,2,1,1,8",
     "256,192,2,1,1,8",
+    "256,256,2,1,1,1",
     "256,256,2,1,1,8",
     "256,256,2,1,0,8",
 ]
@@ -410,7 +411,7 @@ def test_bf16_wgrad_2cta_large_and_skew_safety() -> None:
         ),
     ]
     for case in cases:
-        _assert_config_matches_reference(case, "256,256,2,1,1,8")
+        _assert_config_matches_reference(case, "256,256,2,1,1,1")
 
 
 def test_bf16_wgrad_2cta_sanitizer_safety_smoke() -> None:
@@ -435,7 +436,7 @@ def test_bf16_wgrad_2cta_sanitizer_safety_smoke() -> None:
         ),
     ]
     for case in cases:
-        _assert_config_matches_reference(case, "256,256,2,1,1,8")
+        _assert_config_matches_reference(case, "256,256,2,1,1,1")
 
 
 def test_bf16_wgrad_config_sweep() -> None:

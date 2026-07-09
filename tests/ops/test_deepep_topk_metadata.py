@@ -26,9 +26,14 @@ import torch
 import pytest
 
 from sonicmoe.ernie_compat.deepep_metadata import (
+    _HAS_TOPK_CUDA_SCALES_KERNEL,
     deepep_topk_to_sonic_metadata,
+    deepep_topk_to_sonic_metadata_with_scales,
     deepep_to_sonic_metadata,
     _host_prefix_sum,
+)
+from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+    gather_raw_blockscaled_1x32_scales_to_isa,
 )
 
 
@@ -737,6 +742,53 @@ class TestCudaVsPythonFallback:
             assert _t_eq(cu_rt, real_positions.to(cu_rt.dtype)), "CUDA round-trip fail"
         # Also drop expensive set-based per-expert check above by checking
         # token multiset across ALL experts in one go (already done in Check 2 via py_key/cu_key).
+
+
+class TestCudaScalePacking:
+    """Validate metadata-side raw scale packing against the existing reference."""
+
+    @pytest.mark.parametrize("N_recv,topk,E,cols,raw_dtype", [
+        (256, 4, 8, 256, torch.int32),
+        (513, 8, 16, 4096, torch.int32),
+        (384, 8, 8, 384, torch.uint8),
+    ])
+    @pytest.mark.parametrize("pack_mode", ["default", "scatter", "rowmajor"])
+    def test_with_scales_matches_raw_gather_reference(
+        self, N_recv, topk, E, cols, raw_dtype, pack_mode
+    ):
+        if not _HAS_TOPK_CUDA_SCALES_KERNEL:
+            pytest.skip("CUDA scale-packing metadata kernel not compiled")
+
+        torch.manual_seed(123)
+        indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
+        scale_cols = (cols + 31) // 32
+        raw_i32 = (
+            torch.arange(N_recv * scale_cols, dtype=torch.int32, device="cuda")
+            .reshape(N_recv, scale_cols)
+            % 251
+        )
+        raw_scales = raw_i32.to(torch.uint8) if raw_dtype is torch.uint8 else raw_i32
+
+        result = deepep_topk_to_sonic_metadata_with_scales(
+            indices,
+            probs,
+            tpe,
+            E,
+            raw_scales=raw_scales,
+            cols=cols,
+            block=128,
+            pack_scales_in_scatter=(pack_mode == "scatter"),
+            pack_scales_rowmajor=(pack_mode == "rowmajor"),
+        )
+        x_gather_idx = result[1]
+        packed = result[-1]
+        assert packed is not None
+
+        ref = gather_raw_blockscaled_1x32_scales_to_isa(raw_scales, x_gather_idx, cols)
+        assert packed.shape == ref.shape
+        assert _t_eq(packed.view(torch.uint8), ref.view(torch.uint8)), (
+            "metadata-side packed scales differ from raw gather reference"
+        )
 
 # ── Performance Benchmark ───────────────────────────────────────────────────
 
