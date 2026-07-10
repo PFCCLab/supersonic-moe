@@ -3869,8 +3869,8 @@ def precompute_weight_fp8(
     if cached is not None:
         return cached
 
-    w_ehi = w.permute(2, 0, 1).contiguous()
-    w_fp8, w_scales_packed = _quantize_weight_3d_triton(w_ehi)
+    # w_ehi = w.permute(2, 0, 1).contiguous()
+    w_fp8, w_scales_packed = _quantize_weight_3d_triton(w)
     result = (w_fp8, w_scales_packed)
     return result
 
@@ -4370,7 +4370,8 @@ def blockscaled_fp8_gemm_varlen(
     ----------
     a : Tensor (total_M, K) — fp8 (pre-quantized) or bf16 (legacy).
     w : Tensor (H, I, E) bf16 — expert weights (used for shape; ignored
-        if w_fp8/w_scales are provided).
+        if w_fp8/w_scales are provided. when w_fp8 is provided, w has 
+        shape (E, H, I)).
     cu_seqlens_m : Tensor (E+1,) int32 — expert boundaries.
     protocol : FP8Protocol — required for legacy bf16 path.
     out_dtype : output dtype (defaults to bf16).
@@ -4391,8 +4392,8 @@ def blockscaled_fp8_gemm_varlen(
         and w_scales is not None
     ):
         total_M, K = a.shape
-        H = w.shape[0]
-        num_experts = w.shape[2]
+        H = w.shape[1]
+        num_experts = w.shape[0]
         d_dtype = torch.bfloat16 if out_dtype is None else out_dtype
         return _run_cutlass_blockscaled_gemm(
             a, a_scales, w_fp8, w_scales, cu_seqlens_m,

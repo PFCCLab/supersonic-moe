@@ -4,7 +4,9 @@
 
 import paddle
 import inspect
+import logging
 
+logging.getLogger("quack.cache_utils").setLevel(logging.INFO)
 # ── Persistent Triton autotune cache ──────────────────────────────────────────
 # MUST run before any sonicmoe submodule (or upstream quack) executes its
 # `@triton.autotune` decorators, because Autotuner.__init__ snapshots the
