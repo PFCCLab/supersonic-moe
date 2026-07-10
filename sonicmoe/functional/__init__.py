@@ -230,6 +230,7 @@ def _fused_blockscaled_gated_forward(
     store_z: bool = True,
     fp8_config: _FP8Config | None = None,
     current_stream=None,
+    w1_pretransposed: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
@@ -285,7 +286,7 @@ def _fused_blockscaled_gated_forward(
     cfg = fp8_config if fp8_config is not None else _get_fp8_config()
     epilogue_quant = cfg.epilogue_quant and cfg.save_z_fp8
     if epilogue_quant:
-        N = w1.shape[0]  # (2I, H, E) -> w1.shape[0] = 2I
+        N = w1.shape[1]  # (2I, H, E) -> w1.shape[0] = 2I
         z_scale_out = torch.empty(TK, N // 32, dtype=torch.uint8, device=x.device)
     else:
         z_scale_out = None
@@ -300,7 +301,7 @@ def _fused_blockscaled_gated_forward(
     # path; both are supported.
     fuse_y1 = cfg.fuse_y1_quant
     if fuse_y1:
-        I_dim = w1.shape[0] // 2  # w1 is (2I, H, E) -> N=2I, postact y1 has I cols
+        I_dim = w1.shape[1] // 2  # w1 is (2I, H, E) -> N=2I, postact y1 has I cols
         assert TK % 128 == 0 and I_dim % 128 == 0, (
             f"fuse_y1_quant requires TK ({TK}) and I ({I_dim}) be multiples of 128 "
             "for the ISA-packed scale layout"
@@ -339,6 +340,7 @@ def _fused_blockscaled_gated_forward(
         swiglu_clamp_value=cfg.swiglu_clamp_value,
         postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
         current_stream=current_stream,
+        b_pretransposed=w1_pretransposed,
     )
     del x_fp8, x_scales_tk_e8m0
 
@@ -358,7 +360,7 @@ def _fused_blockscaled_gated_forward(
         )
     elif not store_z:
         z = torch.empty(1, dtype=torch.bfloat16, device=y1.device).as_strided(
-            (TK, w1.shape[0]), (0, 0)
+            (TK, w1.shape[1]), (0, 0)
         )
 
     y1_fp8_fused = None
@@ -369,7 +371,7 @@ def _fused_blockscaled_gated_forward(
         y1_fp8_fused = y1
         y1_scales_fused = postact_scale_out.reshape(1, -1).view(_E8M0_DTYPE)
         y1 = torch.empty(1, dtype=torch.bfloat16, device=y1_fp8_fused.device).as_strided(
-            (TK, w1.shape[0] // 2), (0, 0)
+            (TK, w1.shape[1] // 2), (0, 0)
         )
 
     return z, y1, y1_fp8_fused, y1_scales_fused
@@ -408,7 +410,7 @@ def _recompute_z_fp8(
 
     z_fp8, z_raw_scales = blockscaled_fp8_gemm_zeromat_quant(
         x_fp8,
-        w1_fp8.mT,
+        w1_fp8,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
@@ -457,7 +459,7 @@ def _recompute_z_bf16(
 
     z = blockscaled_fp8_gemm_zeromat_bf16(
         x_fp8,
-        w1_fp8.mT,
+        w1_fp8,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
@@ -984,49 +986,49 @@ def _reset_stage_memory_probe() -> None:
 _DGATED_DUMP_CALL_COUNTER = 0
 
 
-def _maybe_dump_dgated(payload: dict) -> None:
-    """Env-gated dump of the *real* dgated-backward inputs for offline replay.
+# def _maybe_dump_dgated(payload: dict) -> None:
+#     """Env-gated dump of the *real* dgated-backward inputs for offline replay.
 
-    Active ONLY when SONIC_MOE_DGATED_DUMP=<dir> is set (default: unset -> this
-    function returns on the first getenv with zero tensor work, so the normal /
-    2CTA-off path is completely unaffected). When active it overwrites, on every
-    dgated backward, two rank-private snapshots:
-        <dir>/rank{R}_dgated_latest.pt   (the most recent call)
-        <dir>/rank{R}_dgated_prev.pt     (the call before it)
-    so that when a training step faults, `_latest` holds the offending call's
-    inputs and `_prev` the last clean one -- no need to know the crash step in
-    advance. Writes go through a .tmp + os.replace to stay atomic, and tensors
-    are moved to CPU so the dump is replayable in a fresh single process.
-    """
-    out_dir = os.getenv("SONIC_MOE_DGATED_DUMP", "")
-    if not out_dir:
-        return
-    global _DGATED_DUMP_CALL_COUNTER
-    _DGATED_DUMP_CALL_COUNTER += 1
-    call_no = _DGATED_DUMP_CALL_COUNTER
-    rank = os.environ.get(
-        "PADDLE_TRAINER_ID", os.environ.get("RANK", os.environ.get("FLAGS_selected_gpus", "0"))
-    )
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-        cpu = {}
-        for k, v in payload.items():
-            if isinstance(v, torch.Tensor):
-                cpu[k] = v.detach().to("cpu").contiguous()
-            else:
-                cpu[k] = v
-        cpu["_call_no"] = call_no
-        cpu["_rank"] = rank
-        latest = os.path.join(out_dir, f"rank{rank}_dgated_latest.pt")
-        prev = os.path.join(out_dir, f"rank{rank}_dgated_prev.pt")
-        # Roll latest -> prev (keep the last clean call alongside the faulting one).
-        if os.path.exists(latest):
-            os.replace(latest, prev)
-        tmp = latest + ".tmp"
-        torch.save(cpu, tmp)
-        os.replace(tmp, latest)
-    except Exception as e:  # never let a debug dump take down training
-        print(f"[dgated-dump] rank{rank} call{call_no} dump failed: {e}", flush=True)
+#     Active ONLY when SONIC_MOE_DGATED_DUMP=<dir> is set (default: unset -> this
+#     function returns on the first getenv with zero tensor work, so the normal /
+#     2CTA-off path is completely unaffected). When active it overwrites, on every
+#     dgated backward, two rank-private snapshots:
+#         <dir>/rank{R}_dgated_latest.pt   (the most recent call)
+#         <dir>/rank{R}_dgated_prev.pt     (the call before it)
+#     so that when a training step faults, `_latest` holds the offending call's
+#     inputs and `_prev` the last clean one -- no need to know the crash step in
+#     advance. Writes go through a .tmp + os.replace to stay atomic, and tensors
+#     are moved to CPU so the dump is replayable in a fresh single process.
+#     """
+#     out_dir = os.getenv("SONIC_MOE_DGATED_DUMP", "")
+#     if not out_dir:
+#         return
+#     global _DGATED_DUMP_CALL_COUNTER
+#     _DGATED_DUMP_CALL_COUNTER += 1
+#     call_no = _DGATED_DUMP_CALL_COUNTER
+#     rank = os.environ.get(
+#         "PADDLE_TRAINER_ID", os.environ.get("RANK", os.environ.get("FLAGS_selected_gpus", "0"))
+#     )
+#     try:
+#         os.makedirs(out_dir, exist_ok=True)
+#         cpu = {}
+#         for k, v in payload.items():
+#             if isinstance(v, torch.Tensor):
+#                 cpu[k] = v.detach().to("cpu").contiguous()
+#             else:
+#                 cpu[k] = v
+#         cpu["_call_no"] = call_no
+#         cpu["_rank"] = rank
+#         latest = os.path.join(out_dir, f"rank{rank}_dgated_latest.pt")
+#         prev = os.path.join(out_dir, f"rank{rank}_dgated_prev.pt")
+#         # Roll latest -> prev (keep the last clean call alongside the faulting one).
+#         if os.path.exists(latest):
+#             os.replace(latest, prev)
+#         tmp = latest + ".tmp"
+#         torch.save(cpu, tmp)
+#         os.replace(tmp, latest)
+#     except Exception as e:  # never let a debug dump take down training
+#         print(f"[dgated-dump] rank{rank} call{call_no} dump failed: {e}", flush=True)
 
 
 def _log_stage_memory(stage: str) -> None:
@@ -1113,7 +1115,7 @@ class _UpProjection(torch.autograd.Function):
     def forward(
         ctx,
         x: torch.Tensor,
-        w1_original: torch.Tensor,
+        w1: torch.Tensor,
         b1: torch.Tensor | None,
         expert_frequency_offset: torch.Tensor,
         total_expert_freq: int,
@@ -1130,11 +1132,11 @@ class _UpProjection(torch.autograd.Function):
         prequant_activation_payload: tuple[torch.Tensor, ...] | None = None,
         fp8_config: _FP8Config | None = None,
     ) -> torch.Tensor:
-        w1 = w1_original.permute([1, 2, 0])
-        w1.fp8 = getattr(w1_original, "fp8", None)
-        w1.transposed_fp8 = getattr(w1_original, "transposed_fp8", None)
+        # w1 = w1_original.permute([1, 2, 0])
+        # w1.fp8 = getattr(w1_original, "fp8", None)
+        # w1.transposed_fp8 = getattr(w1_original, "transposed_fp8", None)
         T, H = x.shape
-        I, H, E = w1.shape
+        E, I, H = w1.shape
         is_glu_activation = is_glu(activation_type)
         if is_glu_activation:
             I //= 2
@@ -1147,7 +1149,6 @@ class _UpProjection(torch.autograd.Function):
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             cfg = fp8_config if fp8_config is not None else _get_fp8_config()
             if cfg.enabled:
-                cfg.resolve_wgrad(w1.shape[0] // 2)  # w1 is (2I, H, E), I = shape[0]/2
                 global _ALIGNMENT_ASSUMED
                 _evict_per_tensor_caches_once()
                 aligned = _all_segments_128_aligned(expert_frequency_offset)
@@ -1162,6 +1163,7 @@ class _UpProjection(torch.autograd.Function):
                         w1_fp8_pre=w1_fp8, store_z=not cfg.recompute_z,
                         fp8_config=cfg,
                         current_stream=stream_id,
+                        w1_pretransposed=True,
                     )
                     if cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);
@@ -1220,14 +1222,14 @@ class _UpProjection(torch.autograd.Function):
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                     # y1.untyped_storage().resize_(0)
                 elif aligned:
-                    w1_fp8, w1_scales = precompute_weight_fp8(w1)
+                    w1_fp8, w1_scales = precompute_weight_fp8(w1.permute([1, 2, 0]))
                     # All segments 128-aligned: use fused gather+quantize
                     # and pre-quantized GEMM (no padding overhead).
                     x_fp8, x_scales = fast_gather_quantize_and_pack_activation(
                         x, x_gather_idx
                     )
                     z = blockscaled_fp8_gemm_varlen(
-                        x_fp8, w1, expert_frequency_offset,
+                        x_fp8, w1.permute([1, 2, 0]), expert_frequency_offset,
                         a_scales=x_scales,
                         w_fp8=w1_fp8, w_scales=w1_scales,
                         out_dtype=torch.bfloat16,
@@ -1265,12 +1267,12 @@ class _UpProjection(torch.autograd.Function):
                     # path.  Overhead is only the extra padded GEMM rows (~5-25%
                     # depending on routing), much cheaper than full BF16 fallback.
                     z, y1 = _padded_blockscaled_gated_forward(
-                        x, w1, expert_frequency_offset, x_gather_idx
+                        x, w1.permute([1, 2, 0]), expert_frequency_offset, x_gather_idx
                     )
             else:
                 z, y1 = gemm_gated(
                     x,
-                    w1.permute(2, 1, 0),
+                    w1.permute(0, 2, 1),
                     activation="swiglu",
                     cu_seqlens_m=expert_frequency_offset,
                     A_idx=x_gather_idx,
@@ -1303,12 +1305,10 @@ class _UpProjection(torch.autograd.Function):
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._prequant_activation_payload = prequant_activation_payload is not None
         ctx._prequant_activation_payload_len = (
-            len(prequant_activation_payload)
-            if prequant_activation_payload is not None
-            else 0
+            len(prequant_activation_payload) if prequant_activation_payload is not None else 0
         )
-        ctx._w1_original = w1_original
-        ctx._wgrad_w1_accumulator = _main_grad_accumulator(w1_original)
+        ctx._w1_original = w1
+        ctx._wgrad_w1_accumulator = _main_grad_accumulator(w1)
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
@@ -1318,8 +1318,10 @@ class _UpProjection(torch.autograd.Function):
         # if _fp8_aligned and ctx._prequant_activation_payload and not cfg.fp8_wgrad:
         #     raise RuntimeError("prequant activation payload requires FP8 wgrad because BF16 x is not retained")
         if _fp8_aligned:
-            # Store metadata needed for dw1 allocation
-            ctx._w1_shape = w1.shape  # (2I, H, E)
+            # Store metadata needed for dw1 allocation. w1 is the (E, 2I, H) param;
+            # backward operates in the legacy (2I, H, E) convention, so store that shape.
+            ctx._w1_shape = w1.shape # (E, 2I, H)
+            # ctx._w1_shape = (w1.shape[1], w1.shape[2], w1.shape[0])  # (2I, H, E)
             ctx._w1_dtype = w1.dtype
             ctx._w1_device = w1.device
             # Eagerly lookup w1T fp8 cache — will be used in backward actgrad.
@@ -1399,7 +1401,7 @@ class _UpProjection(torch.autograd.Function):
                 x_fp8_pre,
                 x_scales_pre,
             ) = ctx.saved_tensor()
-            w1_shape = ctx._w1_shape   # (2I, H, E)
+            w1_shape = ctx._w1_shape   # (E, 2I, H)
             w1_dtype = ctx._w1_dtype
             w1_device = ctx._w1_device
         else:
@@ -1439,7 +1441,8 @@ class _UpProjection(torch.autograd.Function):
                     w1T_fp8 = ctx._w1T_fp8
                     w1T_scales = ctx._w1T_scales
                 else:
-                    w1T_fp8, w1T_scales = precompute_weight_fp8(w1, permute=(1, 0, 2))
+                    # w1T_fp8, w1T_scales = precompute_weight_fp8(w1, permute=(1, 0, 2))
+                    raise NotImplementedError("Quant in backward not supported yet.")
                 prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
                 if ctx._fp8_cfg.fp8_wgrad:
                     # FP8 wgrad: dz_bf16 was already freed in DownProj via dual-quant.
@@ -1482,7 +1485,7 @@ class _UpProjection(torch.autograd.Function):
                     else:
                         # Fallback: compute col-fp8 now (Triton nw=1)
                         dz_col_fp8, dz_col_scales = colwise_quantize_and_pack(
-                            dz_bf16, logical_rows=w1_shape[0], logical_cols=TK,
+                            dz_bf16, logical_rows=w1_shape[1], logical_cols=TK,
                         )
                     # FREE dz_bf16 NOW (-384 MiB before wgrad GEMM!)
                     # dz.untyped_storage().resize_(0)
@@ -1498,7 +1501,7 @@ class _UpProjection(torch.autograd.Function):
                                 dz_col_fp8, dz_col_scales,
                                 x_col_fp8, x_col_scales,
                                 expert_frequency_offset,
-                                M=w1_shape[0], N=H, total_K=TK,
+                                M=w1_shape[1], N=H, total_K=TK,
                                 num_experts=E, device=x.device,
                                 accumulator=_wgrad_accum,
                             )
@@ -1507,7 +1510,7 @@ class _UpProjection(torch.autograd.Function):
                                 dz_col_fp8, dz_col_scales,
                                 x_col_fp8, x_col_scales,
                                 expert_frequency_offset,
-                                M=w1_shape[0], N=H, total_K=TK,
+                                M=w1_shape[1], N=H, total_K=TK,
                                 num_experts=E, device=x.device,
                                 accumulator=_wgrad_accum,
                             )
@@ -1518,7 +1521,7 @@ class _UpProjection(torch.autograd.Function):
                             dz_col_fp8, dz_col_scales,
                             x_col_fp8, x_col_scales,
                             expert_frequency_offset,
-                            M=w1_shape[0], N=H, total_K=TK,
+                            M=w1_shape[1], N=H, total_K=TK,
                             num_experts=E, out_dtype=w1_dtype, device=x.device,
                         )
                         dw1 = dw1_base.permute(1, 2, 0)
@@ -1545,7 +1548,7 @@ class _UpProjection(torch.autograd.Function):
                                 x_gather_idx,
                                 accumulator=accum_view,
                                 M=H,
-                                N=w1_shape[0],
+                                N=w1_shape[1],
                                 total_K=TK,
                                 num_experts=E,
                                 device=x.device,
@@ -1558,7 +1561,7 @@ class _UpProjection(torch.autograd.Function):
                                 x_gather_idx,
                                 accumulator=accum_view,
                                 M=H,
-                                N=w1_shape[0],
+                                N=w1_shape[1],
                                 total_K=TK,
                                 num_experts=E,
                                 device=x.device,
@@ -1566,16 +1569,16 @@ class _UpProjection(torch.autograd.Function):
                         dw1_base = None
                         dw1 = None
                     else:
-                        dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
-                        dw1 = dw1_base.permute(1, 2, 0)
+                        dw1_base = torch.empty((E, w1_shape[1], w1_shape[2]), dtype=w1_dtype, device=w1_device) # (E, 2I, H)
+                        dw1 = dw1_base.permute(1, 2, 0) # (2I, H, E)
                         bf16_wgrad_gemm_varlen_k(
                             x_bf16.T,
                             dz_bf16,
                             expert_frequency_offset,
                             x_gather_idx,
-                            out=dw1_base.permute(0, 2, 1),
+                            out=dw1_base.permute(0, 2, 1), # (E, H, 2I)
                             M=H,
-                            N=w1_shape[0],
+                            N=w1_shape[1],
                             total_K=TK,
                             num_experts=E,
                             device=x.device,
@@ -1600,14 +1603,14 @@ class _UpProjection(torch.autograd.Function):
                             expert_frequency_offset,
                             total_M=dz_fp8.shape[0],
                             K=dz_fp8.shape[1],
-                            H=w1_shape[1],       # w1 is (2I, H, E), H=shape[1]
+                            H=w1_shape[2],       # w1 is (E, 2I, H), H=shape[2]
                             num_experts=E,
                             out_dtype=torch.bfloat16,
                             device=dz_fp8.device,
                         )
                     else:
                         dx_expanded = blockscaled_fp8_gemm_varlen(
-                            dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
+                            dz_fp8, w1.permute(2, 1, 0), expert_frequency_offset,
                             a_scales=dz_packed_scales,
                             w_fp8=w1T_fp8, w_scales=w1T_scales,
                             out_dtype=torch.bfloat16,
@@ -1638,7 +1641,7 @@ class _UpProjection(torch.autograd.Function):
                             x_gather_idx,
                             accumulator=accum_view,
                             M=H,
-                            N=w1_shape[0],
+                            N=w1_shape[1],
                             total_K=TK,
                             num_experts=E,
                             device=x.device,
@@ -1651,14 +1654,14 @@ class _UpProjection(torch.autograd.Function):
                             x_gather_idx,
                             accumulator=accum_view,
                             M=H,
-                            N=w1_shape[0],
+                            N=w1_shape[1],
                             total_K=TK,
                             num_experts=E,
                             device=x.device,
                         )
                     dw1 = None
                 else:
-                    dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
+                    dw1_base = torch.empty((E, w1_shape[1], w1_shape[2]), dtype=w1_dtype, device=w1_device)
                     dw1 = dw1_base.permute(1, 2, 0)
                     bf16_wgrad_gemm_varlen_k(
                         x.T,
@@ -1667,13 +1670,13 @@ class _UpProjection(torch.autograd.Function):
                         x_gather_idx,
                         out=dw1_base.permute(0, 2, 1),
                         M=H,
-                        N=w1_shape[0],
+                        N=w1_shape[1],
                         total_K=TK,
                         num_experts=E,
                         device=x.device,
                     )
                 dx_expanded = gemm(
-                    dz, w1.permute(2, 0, 1),
+                    dz, w1,
                     cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
                     tuned=False,
                 )
@@ -1719,7 +1722,7 @@ class _DownProjection(torch.autograd.Function):
         ctx,
         y1: torch.Tensor,
         z: torch.Tensor,
-        w2_original: torch.Tensor,
+        w2: torch.Tensor,
         b2: torch.Tensor | None,
         topk_scores: torch.Tensor,
         selected_experts: torch.Tensor,
@@ -1737,11 +1740,11 @@ class _DownProjection(torch.autograd.Function):
         fp8_combine_grad_handle=None,
         fp8_config: _FP8Config | None = None,
     ) -> torch.Tensor:
-        w2 = w2_original.permute([1, 2, 0])
-        w2.fp8 = getattr(w2_original, "fp8", None)
-        w2.transposed_fp8 = getattr(w2_original, "transposed_fp8", None)
+        # w2 = w2_original.permute([1, 2, 0])
+        # w2.fp8 = getattr(w2_original, "fp8", None)
+        # w2.transposed_fp8 = getattr(w2_original, "transposed_fp8", None)
         TK = y1.size(0)
-        H, I, E = w2.shape
+        E, H, I = w2.shape
 
         use_quack_gemm = is_using_quack_gemm()
 
@@ -1824,10 +1827,10 @@ class _DownProjection(torch.autograd.Function):
                 # with assume_aligned=False — it pads internally.
                 w2_fp8, w2_scales = (
                     _STASHED_FP8_WEIGHTS.get("w2_varlen", None)
-                    or precompute_weight_fp8(w2)
+                    or precompute_weight_fp8(w2.permute([1, 2, 0]))
                 )
                 y2 = blockscaled_fp8_gemm_varlen(
-                    y1, w2, expert_frequency_offset,
+                    y1, w2.permute([1, 2, 0]), expert_frequency_offset,
                     w_fp8=w2_fp8, w_scales=w2_scales,
                     out_dtype=torch.bfloat16,
                     assume_aligned=False,
@@ -1837,7 +1840,7 @@ class _DownProjection(torch.autograd.Function):
             else:
                 y2 = gemm(
                     y1,
-                    w2.permute(2, 1, 0),
+                    w2.permute(0, 2, 1),
                     cu_seqlens_m=expert_frequency_offset,
                     tuned=False,
                 )
@@ -1879,8 +1882,8 @@ class _DownProjection(torch.autograd.Function):
         ctx._has_b2 = b2 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
-        ctx._w2_original = w2_original
-        ctx._wgrad_w2_accumulator = _main_grad_accumulator(w2_original)
+        ctx._w2_original = w2
+        ctx._wgrad_w2_accumulator = _main_grad_accumulator(w2)
         # Always compute ds (topk_scores gradient) — needed for router training.
         # NOTE: topk_scores.stop_gradient is unreliable inside .apply() because
         # Paddle's torch-proxy resets stop_gradient=True on inputs (mirroring
@@ -1962,7 +1965,7 @@ class _DownProjection(torch.autograd.Function):
                 _w2_dgated_fp8, _w2_dgated_scales = _get_fp8_weight_attr(w2, "transposed_fp8")
                 ctx._w2_dgated_fp8 = _w2_dgated_fp8
                 ctx._w2_dgated_scales = _w2_dgated_scales
-                ctx._w2_shape = w2.shape  # (H, I, E)
+                ctx._w2_shape = w2.shape  # (E, H, I)
                 ctx._w2_dtype = w2.dtype
                 ctx._w2_device = w2.device
                 ctx.save_for_backward(
@@ -2143,7 +2146,7 @@ class _DownProjection(torch.autograd.Function):
                         w2_fp8_enk = ctx._w2_dgated_fp8
                         w2_scales = ctx._w2_dgated_scales
                     else:
-                        w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+                        w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2.permute([1, 2, 0]))
                     config = gemm_dgated.default_config(dout.device, num_experts=w2_fp8_enk.shape[0])
                     # config = _safe_dgated_config(dout.device, w2_shape[2])
                     total_m = x_gather_idx.shape[0]  # TK (not T — dout_fp8 is T-sized)
@@ -2199,29 +2202,29 @@ class _DownProjection(torch.autograd.Function):
                         K_bwd,
                     )
 
-                    _maybe_dump_dgated({
-                        "dout_fp8": dout_fp8,
-                        "w2_fp8_enk": w2_fp8_enk,
-                        "z": z if not use_fp8_preact else None,
-                        "y1s_shape": list(y1s.shape),
-                        "dz_shape": list(dz.shape),
-                        "s_float": s_float,
-                        "x_gather_idx": x_gather_idx,
-                        "expert_frequency_offset": expert_frequency_offset,
-                        "dout_scales": dout_scales,
-                        "w2_scales": w2_scales,
-                        "z_fp8": z_fp8 if use_fp8_preact else None,
-                        "z_raw_scales_u8": z_raw_scales_u8 if use_fp8_preact else None,
-                        "use_fp8_preact": bool(use_fp8_preact),
-                        "tile_m": int(config.tile_m),
-                        "tile_n": int(config.tile_n),
-                        "cluster_m": int(config.cluster_m),
-                        "cluster_n": int(config.cluster_n),
-                        "pingpong": bool(config.pingpong),
-                        "max_swizzle_size": int(config.max_swizzle_size),
-                        "swiglu_clamp_value": float(ctx._fp8_cfg.swiglu_clamp_value),
-                        "num_experts": int(w2_fp8_enk.shape[0]),
-                    })
+                    # _maybe_dump_dgated({
+                    #     "dout_fp8": dout_fp8,
+                    #     "w2_fp8_enk": w2_fp8_enk,
+                    #     "z": z if not use_fp8_preact else None,
+                    #     "y1s_shape": list(y1s.shape),
+                    #     "dz_shape": list(dz.shape),
+                    #     "s_float": s_float,
+                    #     "x_gather_idx": x_gather_idx,
+                    #     "expert_frequency_offset": expert_frequency_offset,
+                    #     "dout_scales": dout_scales,
+                    #     "w2_scales": w2_scales,
+                    #     "z_fp8": z_fp8 if use_fp8_preact else None,
+                    #     "z_raw_scales_u8": z_raw_scales_u8 if use_fp8_preact else None,
+                    #     "use_fp8_preact": bool(use_fp8_preact),
+                    #     "tile_m": int(config.tile_m),
+                    #     "tile_n": int(config.tile_n),
+                    #     "cluster_m": int(config.cluster_m),
+                    #     "cluster_n": int(config.cluster_n),
+                    #     "pingpong": bool(config.pingpong),
+                    #     "max_swizzle_size": int(config.max_swizzle_size),
+                    #     "swiglu_clamp_value": float(ctx._fp8_cfg.swiglu_clamp_value),
+                    #     "num_experts": int(w2_fp8_enk.shape[0]),
+                    # })
 
                     gemm_dgated_kernel(
                         dout_fp8,
@@ -2308,21 +2311,21 @@ class _DownProjection(torch.autograd.Function):
                         if _wgrad_accum_w2 is not None:
                             if _use_wgrad_beta_accum():
                                 _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
-                                    dout_col_fp8, dout_col_sc,
                                     y1s_col_fp8, y1s_col_sc,
+                                    dout_col_fp8, dout_col_sc,
                                     expert_frequency_offset,
-                                    M=dout.shape[1], N=w2_shape[1],
-                                    total_K=TK_wgrad, num_experts=w2_shape[2],
+                                    M=w2_shape[2], N=dout.shape[1],
+                                    total_K=TK_wgrad, num_experts=w2_shape[0],
                                     device=dout.device,
                                     accumulator=_wgrad_accum_w2,
                                 )
                             else:
                                 _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
-                                    dout_col_fp8, dout_col_sc,
                                     y1s_col_fp8, y1s_col_sc,
+                                    dout_col_fp8, dout_col_sc,
                                     expert_frequency_offset,
-                                    M=dout.shape[1], N=w2_shape[1],
-                                    total_K=TK_wgrad, num_experts=w2_shape[2],
+                                    M=w2_shape[2], N=dout.shape[1],
+                                    total_K=TK_wgrad, num_experts=w2_shape[0],
                                     device=dout.device,
                                     accumulator=_wgrad_accum_w2,
                                 )
@@ -2333,8 +2336,8 @@ class _DownProjection(torch.autograd.Function):
                                 dout_col_fp8, dout_col_sc,
                                 y1s_col_fp8, y1s_col_sc,
                                 expert_frequency_offset,
-                                M=dout.shape[1], N=w2_shape[1],
-                                total_K=TK_wgrad, num_experts=w2_shape[2],
+                                M=dout.shape[1], N=w2_shape[2],
+                                total_K=TK_wgrad, num_experts=w2_shape[0],
                                 out_dtype=w2_dtype, device=dout.device,
                             )
                             dw2 = dw2_base.permute(1, 2, 0)
@@ -2343,8 +2346,9 @@ class _DownProjection(torch.autograd.Function):
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
                         if _wgrad_accum_w2 is not None:
                             # BF16 wgrad + fp32 accumulate.
-                            # _wgrad_accum_w2: [E, H, I] fp32.
-                            # GEMM out: [E, H, I] — same layout, no permute needed.
+                            # _wgrad_accum_w2 stays in grouped layout [E, I, H];
+                            # GEMM out is [E, H, I], so accumulate via permute(0,2,1)
+                            # view (pure transpose, no gate/up interleave for w2).
                             y1s_wgrad = (
                                 y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
                             )
@@ -2354,11 +2358,11 @@ class _DownProjection(torch.autograd.Function):
                                     y1s_wgrad,
                                     expert_frequency_offset,
                                     x_gather_idx,
-                                    accumulator=_wgrad_accum_w2,
+                                    accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                                     M=dout.shape[1],
-                                    N=w2_shape[1],
+                                    N=w2_shape[2],
                                     total_K=TK_wgrad,
-                                    num_experts=w2_shape[2],
+                                    num_experts=w2_shape[0],
                                     device=dout.device,
                                 )
                             else:
@@ -2367,11 +2371,11 @@ class _DownProjection(torch.autograd.Function):
                                     y1s_wgrad,
                                     expert_frequency_offset,
                                     x_gather_idx,
-                                    accumulator=_wgrad_accum_w2,
+                                    accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                                     M=dout.shape[1],
-                                    N=w2_shape[1],
+                                    N=w2_shape[2],
                                     total_K=TK_wgrad,
-                                    num_experts=w2_shape[2],
+                                    num_experts=w2_shape[0],
                                     device=dout.device,
                                 )
                             del y1s_wgrad
@@ -2379,7 +2383,7 @@ class _DownProjection(torch.autograd.Function):
                             dw2_base = None
                             dw2 = None
                         else:
-                            dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
+                            dw2_base = torch.empty((w2_shape[0], w2_shape[1], w2_shape[2]), dtype=w2_dtype, device=w2_device)
                             dw2 = dw2_base.permute(1, 2, 0)
                             y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
                             bf16_wgrad_gemm_varlen_k(
@@ -2389,9 +2393,9 @@ class _DownProjection(torch.autograd.Function):
                                 x_gather_idx,
                                 out=dw2.permute(2, 0, 1),
                                 M=dout.shape[1],
-                                N=w2_shape[1],
+                                N=w2_shape[2],
                                 total_K=TK_wgrad,
-                                num_experts=w2_shape[2],
+                                num_experts=w2_shape[0],
                                 device=dout.device,
                             )
                             del y1s_wgrad
@@ -2404,14 +2408,14 @@ class _DownProjection(torch.autograd.Function):
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                     ds = ds[s_reverse_scatter_idx]
                 else:
-                    w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
-                    w2_fp8, w2_scales = precompute_weight_fp8(w2, permute=(1, 0, 2))
+                    # w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
+                    w2_fp8, w2_scales = precompute_weight_fp8(w2)
 
                     dout_fp8, dout_scales = fast_gather_quantize_and_pack_activation(
                         dout, x_gather_idx
                     )
                     dy1 = blockscaled_fp8_gemm_varlen(
-                        dout_fp8, w2_actgrad, expert_frequency_offset,
+                        dout_fp8, w2, expert_frequency_offset,
                         a_scales=dout_scales,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
@@ -2462,7 +2466,7 @@ class _DownProjection(torch.autograd.Function):
 
 
                     # Weight-grad: BF16 varlen GEMM
-                    dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
+                    dw2_base = torch.empty((w2_shape[0], w2_shape[1], w2_shape[2]), dtype=w2_dtype, device=w2_device)
                     dw2 = dw2_base.permute(1, 2, 0)
                     y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
                     bf16_wgrad_gemm_varlen_k(
@@ -2472,9 +2476,9 @@ class _DownProjection(torch.autograd.Function):
                         x_gather_idx,
                         out=dw2.permute(2, 0, 1),
                         M=dout.shape[1],
-                        N=w2_shape[1],
+                        N=w2_shape[2],
                         total_K=x_gather_idx.shape[0],
-                        num_experts=w2_shape[2],
+                        num_experts=w2_shape[0],
                         device=dout.device,
                     )
                     del y1s_wgrad
@@ -2495,7 +2499,7 @@ class _DownProjection(torch.autograd.Function):
                 dz = torch.empty_like(z)
                 _, y1s, ds = gemm_dgated(
                     dout,
-                    w2.permute(2, 0, 1),
+                    w2,
                     PreAct=z,
                     activation="swiglu",
                     dx_out=dz,
@@ -2517,11 +2521,11 @@ class _DownProjection(torch.autograd.Function):
                             y1s_wgrad,
                             expert_frequency_offset,
                             x_gather_idx,
-                            accumulator=_wgrad_accum_w2,
+                            accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                             M=dout.shape[1],
-                            N=w2.shape[1],
+                            N=w2.shape[2],
                             total_K=x_gather_idx.shape[0],
-                            num_experts=w2.shape[2],
+                            num_experts=w2.shape[0],
                             device=dout.device,
                         )
                     else:
@@ -2530,16 +2534,16 @@ class _DownProjection(torch.autograd.Function):
                             y1s_wgrad,
                             expert_frequency_offset,
                             x_gather_idx,
-                            accumulator=_wgrad_accum_w2,
+                            accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                             M=dout.shape[1],
-                            N=w2.shape[1],
+                            N=w2.shape[2],
                             total_K=x_gather_idx.shape[0],
-                            num_experts=w2.shape[2],
+                            num_experts=w2.shape[0],
                             device=dout.device,
                         )
                     dw2 = None
                 else:
-                    dw2_base = torch.empty((w2.shape[2], w2.shape[0], w2.shape[1]), dtype=w2.dtype, device=w2.device)
+                    dw2_base = torch.empty((w2.shape[0], w2.shape[1], w2.shape[2]), dtype=w2.dtype, device=w2.device)
                     dw2 = dw2_base.permute(1, 2, 0)
                     bf16_wgrad_gemm_varlen_k(
                         dout.T,
@@ -2548,9 +2552,9 @@ class _DownProjection(torch.autograd.Function):
                         x_gather_idx,
                         out=dw2.permute(2, 0, 1),
                         M=dout.shape[1],
-                        N=w2.shape[1],
+                        N=w2.shape[2],
                         total_K=x_gather_idx.shape[0],
-                        num_experts=w2.shape[2],
+                        num_experts=w2.shape[0],
                         device=dout.device,
                     )
                 ds = ds[s_reverse_scatter_idx]
