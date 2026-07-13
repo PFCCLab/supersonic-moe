@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager, nullcontext
 from importlib import import_module
+import os
 
 import numpy as np
 import pytest
@@ -25,6 +26,35 @@ def _force_executor(module_name: str, predicate_name: str):
         setattr(module, predicate_name, original)
 
 
+@contextmanager
+def _disable_gated_tvm_ffi():
+    name = "SONIC_MOE_DISABLE_GATED_TVM_FFI"
+    original = os.environ.get(name)
+    os.environ[name] = "1"
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = original
+
+
+@contextmanager
+def _forbid_gated_executor_fallback():
+    module = import_module("sonicmoe.quack_utils.gemm_interface")
+    original = module.gemm_gated_sm90_sm100
+
+    def fail(*args, **kwargs):
+        raise AssertionError("native-layout TVM-FFI path fell back to executor")
+
+    module.gemm_gated_sm90_sm100 = fail
+    try:
+        yield
+    finally:
+        module.gemm_gated_sm90_sm100 = original
+
+
 def _assert_byte_exact(actual, expected, label):
     a = actual.contiguous().view(torch.uint8)
     b = expected.contiguous().view(torch.uint8)
@@ -39,12 +69,23 @@ def _current_raw_stream():
     return int(stream.cuda_stream)
 
 
-def test_gemm_gated_tvm_ffi_matches_executor_combined_quant():
+@pytest.mark.parametrize(
+    "b_pretransposed,preallocated",
+    [(False, False), (True, False), (True, True)],
+    ids=["legacy_b", "native_enk", "native_enk_preallocated"],
+)
+@pytest.mark.parametrize(
+    "epilogue_mode", ["postact", "combined"], ids=["postact", "combined"]
+)
+def test_gemm_gated_tvm_ffi_matches_executor_quantized_postact(
+    b_pretransposed, preallocated, epilogue_mode
+):
     from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
         precompute_weight_fp8_for_fused_gated,
         quantize_and_pack_activation,
     )
     from sonicmoe.quack_utils.gemm_interface import gemm_gated
+    from sonicmoe.quack_utils.gemm_gated import prepare_gated_tvm_ffi_weight
 
     T, H, I, E, topk = _SHAPE
     TK = T * topk // E
@@ -60,21 +101,61 @@ def test_gemm_gated_tvm_ffi_matches_executor_combined_quant():
     a_idx = torch.arange(total_m, dtype=torch.int32, device="cuda")
     x_fp8, a_scales = quantize_and_pack_activation(x)
     w_fp8, b_scales = precompute_weight_fp8_for_fused_gated(w1)
+    b = w_fp8.mT if b_pretransposed else w_fp8
+    if b_pretransposed:
+        prepare_gated_tvm_ffi_weight(b)
 
     def run(enabled):
-        context = (
-            nullcontext()
-            if enabled
-            else _force_executor("sonicmoe.quack_utils.gemm_gated", "_can_use_gated_tvm_ffi")
-        )
+        if enabled and b_pretransposed:
+            context = _forbid_gated_executor_fallback()
+        elif enabled:
+            context = nullcontext()
+        else:
+            context = _disable_gated_tvm_ffi()
         with context:
-            z_scale = torch.empty((total_m, 2 * I // 32), dtype=torch.uint8, device="cuda")
+            z_scale = (
+                torch.empty(
+                    (total_m, 2 * I // 32),
+                    dtype=torch.uint8,
+                    device="cuda",
+                )
+                if epilogue_mode == "combined"
+                else None
+            )
             y1_scale = torch.empty((total_m // 128, I // 128, 512), dtype=torch.uint8, device="cuda")
+            preact = (
+                torch.empty(
+                    (total_m, 2 * I),
+                    dtype=(
+                        torch.float8_e4m3fn
+                        if epilogue_mode == "combined"
+                        else torch.bfloat16
+                    ),
+                    device="cuda",
+                )
+                if preallocated
+                else None
+            )
+            postact = (
+                torch.empty(
+                    (total_m, I),
+                    dtype=torch.float8_e4m3fn,
+                    device="cuda",
+                )
+                if preallocated
+                else None
+            )
             z, y1 = gemm_gated(
                 x_fp8,
-                w_fp8,
+                b,
                 activation="swiglu",
-                out_dtype=torch.float8_e4m3fn,
+                preact_out=preact,
+                postact_out=postact,
+                out_dtype=(
+                    torch.float8_e4m3fn
+                    if epilogue_mode == "combined"
+                    else torch.bfloat16
+                ),
                 postact_dtype=torch.float8_e4m3fn,
                 cu_seqlens_m=cu_seqlens,
                 A_idx=a_idx,
@@ -84,13 +165,20 @@ def test_gemm_gated_tvm_ffi_matches_executor_combined_quant():
                 postact_scale_out=y1_scale,
                 tuned=False,
                 current_stream=_current_raw_stream(),
+                b_pretransposed=b_pretransposed,
             )
             torch.cuda.synchronize()
-            return z, y1, z_scale, y1_scale
+            outputs = [z, y1, y1_scale]
+            if z_scale is not None:
+                outputs.append(z_scale)
+            return outputs
 
     executor = run(False)
     tvm_ffi = run(True)
-    for label, lhs, rhs in zip(("z", "y1", "z_scale", "y1_scale"), tvm_ffi, executor):
+    labels = ["z", "y1", "y1_scale"]
+    if epilogue_mode == "combined":
+        labels.append("z_scale")
+    for label, lhs, rhs in zip(labels, tvm_ffi, executor):
         _assert_byte_exact(lhs, rhs, label)
 
 

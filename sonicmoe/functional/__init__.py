@@ -95,6 +95,7 @@ from ..quack_utils.gemm_sm100_fp8_zeromat import (
 )
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+_GATED_OUTPUT_PAYLOAD_ATTR = "_sonic_preallocated_gated_outputs"
 
 
 # ---------------------------------------------------------------------------
@@ -169,14 +170,27 @@ def _swiglu_backward_clamp_reference(
 def _is_raw_1x32_scale_layout(scales: torch.Tensor, rows: int, cols: int) -> bool:
     return scales.ndim == 2 and tuple(scales.shape) == (rows, _div_up(cols, _SF_VEC_SIZE))
 
+
+def _is_compact_1x32_scale_carrier(
+    scales: torch.Tensor, rows: int, cols: int
+) -> bool:
+    groups = _div_up(cols, _SF_VEC_SIZE)
+    return (
+        groups % 4 == 0
+        and str(scales.dtype) in ("torch.int32", "paddle.int32", "int32")
+        and scales.ndim == 2
+        and tuple(scales.shape) == (rows, groups // 4)
+    )
+
+
 def _ensure_isa_1x32_scales(scales: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
+    if _is_compact_1x32_scale_carrier(scales, rows, cols):
+        scales = scales.view(torch.uint8).reshape(
+            rows, _div_up(cols, _SF_VEC_SIZE)
+        )
     if _is_raw_1x32_scale_layout(scales, rows, cols):
         return pack_blockscaled_1x32_scales_fast(scales, cols).view(_E8M0_DTYPE)
     return scales
-
-
-def _is_raw_1x32_scale_layout(scales: torch.Tensor, rows: int, cols: int) -> bool:
-    return scales.ndim == 2 and tuple(scales.shape) == (rows, _div_up(cols, _SF_VEC_SIZE))
 
 def _gather_1x32_scales_to_isa(
     scales: torch.Tensor,
@@ -186,6 +200,10 @@ def _gather_1x32_scales_to_isa(
     *,
     fill_value: int = 127,
 ) -> torch.Tensor:
+    if _is_compact_1x32_scale_carrier(scales, rows, cols):
+        scales = scales.view(torch.uint8).reshape(
+            rows, _div_up(cols, _SF_VEC_SIZE)
+        )
     if _is_raw_1x32_scale_layout(scales, rows, cols):
         return gather_raw_blockscaled_1x32_scales_to_isa(
             scales, gather_idx, cols
@@ -211,10 +229,20 @@ def _gather_1x32_scales_to_isa(
 def _is_fp8_e4m3_dtype(dtype) -> bool:
     return dtype == torch.float8_e4m3fn or str(dtype) == "paddle.float8_e4m3fn"
 
-def _raw_1x32_scale_bytes(scales: torch.Tensor) -> torch.Tensor:
+def _raw_1x32_scale_bytes(
+    scales: torch.Tensor, rows: int | None = None, cols: int | None = None
+) -> torch.Tensor:
     if str(scales.dtype) in ("torch.uint8", "paddle.uint8", "uint8"):
         return scales
     if str(scales.dtype) in ("torch.int32", "paddle.int32", "int32"):
+        if (
+            rows is not None
+            and cols is not None
+            and _is_compact_1x32_scale_carrier(scales, rows, cols)
+        ):
+            return scales.view(torch.uint8).reshape(
+                rows, _div_up(cols, _SF_VEC_SIZE)
+            )
         return scales.to(torch.uint8)
     return scales.view(torch.uint8)
 
@@ -256,11 +284,22 @@ def _fused_blockscaled_gated_forward(
 
     # Step 1: Quantize at T-size (NOT TK)
     x_scales_tk_pre = None
+    gated_output_payload = None
     if x_fp8_pre is not None:
-        if len(x_fp8_pre) == 3:
-            x_fp8, x_scales_t, x_scales_tk_pre = x_fp8_pre
-        else:
-            x_fp8, x_scales_t = x_fp8_pre
+        if len(x_fp8_pre) not in (2, 3, 7):
+            raise ValueError(
+                "prequant activation payload must contain 2, 3, or 7 tensors, "
+                f"got {len(x_fp8_pre)}"
+            )
+        x_fp8, x_scales_t = x_fp8_pre[:2]
+        if len(x_fp8_pre) >= 3:
+            x_scales_tk_pre = x_fp8_pre[2]
+        if len(x_fp8_pre) == 7:
+            gated_output_payload = x_fp8_pre[3:7]
+        elif x_scales_tk_pre is not None:
+            gated_output_payload = getattr(
+                x_scales_tk_pre, _GATED_OUTPUT_PAYLOAD_ATTR, None
+            )
         _PREQUANT_HIT_COUNT["activation_fwd"] += 1
     else:
         x_fp8, x_scales_t = quantize_and_pack_activation(x)
@@ -269,7 +308,11 @@ def _fused_blockscaled_gated_forward(
     TK = x_gather_idx.shape[0]
     K = x.shape[1]
     if x_scales_tk_pre is not None:
-        x_scales_tk_e8m0 = x_scales_tk_pre.view(_E8M0_DTYPE)
+        x_scales_tk_e8m0 = (
+            x_scales_tk_pre
+            if x_scales_tk_pre.dtype == _E8M0_DTYPE
+            else x_scales_tk_pre.view(_E8M0_DTYPE)
+        )
     else:
         x_scales_tk_e8m0 = _gather_1x32_scales_to_isa(
             x_scales_t, x_gather_idx, int(x_fp8.shape[0]), K
@@ -285,9 +328,14 @@ def _fused_blockscaled_gated_forward(
     # and halves D bandwidth (192MB fp8 vs 384MB bf16).
     cfg = fp8_config if fp8_config is not None else _get_fp8_config()
     epilogue_quant = cfg.epilogue_quant and cfg.save_z_fp8
+    N = w1.shape[1]  # pretransposed weight is (E, 2I, H)
     if epilogue_quant:
-        N = w1.shape[1]  # (2I, H, E) -> w1.shape[0] = 2I
-        z_scale_out = torch.empty(TK, N // 32, dtype=torch.uint8, device=x.device)
+        z_scale_out = (
+            gated_output_payload[2]
+            if gated_output_payload is not None
+            and gated_output_payload[2].numel() != 0
+            else torch.empty(TK, N // 32, dtype=torch.uint8, device=x.device)
+        )
     else:
         z_scale_out = None
 
@@ -308,7 +356,7 @@ def _fused_blockscaled_gated_forward(
         )
         postact_scale_out = torch.empty(
             (TK // 128, I_dim // 128, 512), dtype=torch.uint8, device=x.device
-        )
+        ) if gated_output_payload is None else gated_output_payload[3]
         postact_dtype = torch.float8_e4m3fn
     else:
         postact_scale_out = None
@@ -322,10 +370,42 @@ def _fused_blockscaled_gated_forward(
     # tensors in the autograd chain which cause illegal memory access in
     # backward at large shapes.
     z_out_dtype = torch.float8_e4m3fn if epilogue_quant else torch.bfloat16
+    preact_out = None
+    postact_out = None
+    if gated_output_payload is not None:
+        if not fuse_y1:
+            raise ValueError(
+                "preallocated gated outputs require fused y1 epilogue quantization"
+            )
+        preact_out, postact_out = gated_output_payload[:2]
+        expected = (
+            (preact_out, (TK, N), z_out_dtype, "preact"),
+            (postact_out, (TK, I_dim), postact_dtype, "postact"),
+            (
+                gated_output_payload[2],
+                (TK, N // 32) if epilogue_quant else (0,),
+                torch.uint8,
+                "z_scale",
+            ),
+            (
+                postact_scale_out,
+                (TK // 128, I_dim // 128, 512),
+                torch.uint8,
+                "postact_scale",
+            ),
+        )
+        for tensor, shape, dtype, name in expected:
+            if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+                raise ValueError(
+                    f"invalid preallocated {name}: shape={tuple(tensor.shape)}, "
+                    f"dtype={tensor.dtype}; expected shape={shape}, dtype={dtype}"
+                )
 
     z, y1 = gemm_gated(
         x_fp8, w1_fp8,
         activation="swiglu",
+        preact_out=preact_out,
+        postact_out=postact_out,
         out_dtype=z_out_dtype,
         postact_dtype=postact_dtype,
         cu_seqlens_m=expert_frequency_offset,
@@ -730,6 +810,26 @@ def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None)
         and _offset(lhs) == _offset(rhs)
         and lhs.data_ptr() == rhs.data_ptr()
     )
+
+
+def attach_preallocated_gated_outputs(
+    packed_scales: torch.Tensor,
+    outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> torch.Tensor:
+    """Carry per-call gated outputs without making them explicit PyLayer inputs."""
+    if len(outputs) != 4:
+        raise ValueError(f"expected four gated outputs, got {len(outputs)}")
+    setattr(packed_scales, _GATED_OUTPUT_PAYLOAD_ATTR, tuple(outputs))
+    return packed_scales
+
+
+def _alias_preallocated_pylayer_output(tensor: torch.Tensor) -> torch.Tensor:
+    """Return independent autograd metadata over the same temporary storage."""
+    alias = torch.empty(1, dtype=tensor.dtype, device=tensor.device).as_strided(
+        tensor.shape, tensor.stride()
+    )
+    tensor._share_buffer_to(alias)
+    return alias
 
 
 def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
@@ -1305,7 +1405,9 @@ class _UpProjection(torch.autograd.Function):
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._prequant_activation_payload = prequant_activation_payload is not None
         ctx._prequant_activation_payload_len = (
-            len(prequant_activation_payload) if prequant_activation_payload is not None else 0
+            len(prequant_activation_payload)
+            if prequant_activation_payload is not None
+            else 0
         )
         ctx._w1_original = w1
         ctx._wgrad_w1_accumulator = _main_grad_accumulator(w1)
@@ -1362,6 +1464,16 @@ class _UpProjection(torch.autograd.Function):
                 s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
             )
+
+        if (
+            prequant_activation_payload is not None
+            and len(prequant_activation_payload) == 7
+        ):
+            # Paddle forbids returning a differentiable PyLayer input directly.
+            # Keep the temporary storage but return fresh autograd metadata.
+            preallocated_z = prequant_activation_payload[3]
+            if _matches_prequant_tensor(preallocated_z, z):
+                z = _alias_preallocated_pylayer_output(preallocated_z)
 
         ctx.mark_non_differentiable(y1)
         ctx.set_materialize_grads(False)
@@ -1530,7 +1642,14 @@ class _UpProjection(torch.autograd.Function):
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
                     if ctx._prequant_activation_payload:
                         assert x_fp8_pre is not None and x_scales_pre is not None, "Pre-quantized input is None."
-                        x_bf16 = dequantize_blockscaled_fp8(x_fp8_pre, _raw_1x32_scale_bytes(x_scales_pre))
+                        x_bf16 = dequantize_blockscaled_fp8(
+                            x_fp8_pre,
+                            _raw_1x32_scale_bytes(
+                                x_scales_pre,
+                                int(x_fp8_pre.shape[0]),
+                                int(x_fp8_pre.shape[1]),
+                            ),
+                        )
                     else:
                         x_bf16 = x
                     _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
@@ -2190,7 +2309,11 @@ class _DownProjection(torch.autograd.Function):
                         dout_comm_fp8 = combine_grad_data
                         dout_fp8 = dout_comm_fp8
                         if not ctx._fp8_cfg.fp8_wgrad:
-                            dout_dequant_scales = _raw_1x32_scale_bytes(dout_raw_scales_t)
+                            dout_dequant_scales = _raw_1x32_scale_bytes(
+                                dout_raw_scales_t,
+                                int(dout_comm_fp8.shape[0]),
+                                int(dout_comm_fp8.shape[1]),
+                            )
                             dout = dequantize_blockscaled_fp8(dout_comm_fp8, dout_dequant_scales)
                     else:
                         dout_fp8, dout_raw_scales_t = quantize_activation_blockscaled_fast(dout)

@@ -3,7 +3,7 @@
 # ********************************************************************************
 
 import os
-from functools import partial
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Tuple
 
@@ -93,6 +93,33 @@ def _stream_matches_current(stream) -> bool:
     return stream_id is None or stream_id == _current_raw_stream_id()
 
 
+_GATED_FFI_B_VIEW_ATTR = "_sonic_gated_tvm_ffi_b_view"
+
+
+def prepare_gated_tvm_ffi_weight(B: Tensor) -> Tensor:
+    """Attach the storage-free TVM-FFI B view to one quantized weight."""
+    if B.ndim == 3 and B.is_cuda and B.is_contiguous():
+        setattr(B, _GATED_FFI_B_VIEW_ATTR, B.permute(1, 2, 0))
+    return B
+
+
+def _prepared_gated_tvm_ffi_weight(B: Tensor) -> Optional[Tensor]:
+    view = getattr(B, _GATED_FFI_B_VIEW_ATTR, None)
+    if view is None or B.ndim != 3:
+        return None
+    expected_shape = (B.shape[1], B.shape[2], B.shape[0])
+    expected_stride = (B.stride(1), B.stride(2), B.stride(0))
+    if (
+        view.dtype != B.dtype
+        or view.device != B.device
+        or tuple(view.shape) != expected_shape
+        or tuple(view.stride()) != expected_stride
+        or view.data_ptr() != B.data_ptr()
+    ):
+        return None
+    return view
+
+
 class GemmGatedSm90(GemmGatedMixin, GemmSm90):
     pass
 
@@ -134,6 +161,7 @@ def _fake_tensor_rank(dtype, ndim: int, leading_dim: int):
     return fake_tensor(dtype, shape, leading_dim=leading_dim, divisibility=div_for_dtype(dtype))
 
 
+@lru_cache(maxsize=32)
 @jit_cache
 def _compile_gemm_gated_tvm_ffi(
     gemm_cls_name,
@@ -355,6 +383,219 @@ def _run_gemm_gated_tvm_ffi(
         a_scales,
         b_scales,
     )
+
+
+@lru_cache(maxsize=16)
+def _static_gated_scheduler_args(
+    cluster_m: int,
+    cluster_n: int,
+    max_swizzle_size: int,
+    device_index: int,
+):
+    """Cache scheduler metadata that never contains a tensor pointer."""
+    del device_index  # Part of the cache key because cluster capacity is device-local.
+    max_active_clusters = get_max_active_clusters(cluster_m * cluster_n)
+    return make_scheduler_args(max_active_clusters, max_swizzle_size, None)
+
+
+def try_gemm_gated_tvm_ffi_sonic_fast(
+    A: Tensor,
+    B: Tensor,
+    D: Optional[Tensor],
+    C: Optional[Tensor],
+    PostAct: Optional[Tensor],
+    *,
+    activation: str,
+    tile_M: int,
+    tile_N: int,
+    cluster_M: int,
+    cluster_N: int,
+    pingpong: bool,
+    max_swizzle_size: int,
+    bias: Optional[Tensor],
+    cu_seqlens_m: Optional[Tensor],
+    A_idx: Optional[Tensor],
+    dynamic_scheduler: bool,
+    a_scales: Optional[Tensor],
+    b_scales: Optional[Tensor],
+    z_scale_out: Optional[Tensor],
+    postact_scale_out: Optional[Tensor],
+    swiglu_clamp_value: float,
+    postact_bf16_trunc: bool,
+    current_stream=None,
+) -> bool:
+    """Launch the exact Sonic forward contract without generic CuTe setup.
+
+    Only pointer-free scheduler and compilation state are cached. Epilogue and
+    varlen arguments are reconstructed for every call so PP/VPP microbatches
+    cannot observe stale tensor pointers.
+    """
+    if os.getenv("SONIC_MOE_DISABLE_GATED_TVM_FFI", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    if (
+        activation != "swiglu"
+        or D is None
+        or PostAct is None
+        or C is not None
+        or bias is not None
+        or dynamic_scheduler
+        or cu_seqlens_m is None
+        or A_idx is None
+        or a_scales is None
+        or b_scales is None
+        or postact_scale_out is None
+        or cluster_N != 1
+        or not _stream_matches_current(current_stream)
+    ):
+        return False
+    if (
+        A.ndim != 2
+        or B.ndim != 3
+        or D.ndim != 2
+        or PostAct.ndim != 2
+        or cu_seqlens_m.ndim != 1
+        or A_idx.ndim != 1
+        or not all(
+            tensor.is_cuda
+            for tensor in (A, B, D, PostAct, cu_seqlens_m, A_idx)
+        )
+    ):
+        return False
+
+    E, N, K = B.shape
+    total_m = A_idx.shape[0]
+    epilogue_quant = z_scale_out is not None
+    expected_d_dtype = (
+        torch.float8_e4m3fn if epilogue_quant else torch.bfloat16
+    )
+    if (
+        A.shape[1] != K
+        or tuple(D.shape) != (total_m, N)
+        or tuple(PostAct.shape) != (total_m, N // 2)
+        or tuple(cu_seqlens_m.shape) != (E + 1,)
+        or N % 128 != 0
+        or total_m % 128 != 0
+        or A.stride(-1) != 1
+        or D.stride(-1) != 1
+        or PostAct.stride(-1) != 1
+        or A.dtype != torch.float8_e4m3fn
+        or B.dtype != torch.float8_e4m3fn
+        or D.dtype != expected_d_dtype
+        or PostAct.dtype != torch.float8_e4m3fn
+        or cu_seqlens_m.dtype != torch.int32
+        or A_idx.dtype != torch.int32
+        or postact_scale_out.dtype != torch.uint8
+        or tuple(postact_scale_out.shape)
+        != (total_m // 128, (N // 2) // 128, 512)
+    ):
+        return False
+    if epilogue_quant and (
+        z_scale_out.dtype != torch.uint8
+        or tuple(z_scale_out.shape) != (total_m, N // 32)
+    ):
+        return False
+
+    B_ffi = _prepared_gated_tvm_ffi_weight(B)
+    if B_ffi is None:
+        return False
+    device_capacity = get_device_capacity(A.device)
+    if device_capacity[0] <= 9:
+        return False
+    scale_tensors = tuple(
+        tensor
+        for tensor in (a_scales, b_scales, z_scale_out, postact_scale_out)
+        if tensor is not None
+    )
+    if any(tensor.dtype not in _TORCH_TO_CUTLASS_DTYPE for tensor in scale_tensors):
+        return False
+
+    GemmCls = (
+        GemmGatedSm100ZeroMatQuantPostActQuant
+        if epilogue_quant
+        else GemmGatedSm100ZeroMatPostActQuant
+    )
+    compiled_fn = _compile_gemm_gated_tvm_ffi(
+        GemmCls.__name__,
+        _TORCH_TO_CUTLASS_DTYPE[A.dtype],
+        _TORCH_TO_CUTLASS_DTYPE[B_ffi.dtype],
+        _TORCH_TO_CUTLASS_DTYPE[D.dtype],
+        None,
+        _TORCH_TO_CUTLASS_DTYPE[PostAct.dtype],
+        "k",
+        "k",
+        "n",
+        None,
+        "n",
+        (tile_M, tile_N),
+        (cluster_M, cluster_N, 1),
+        pingpong,
+        True,
+        activation,
+        device_capacity,
+        max_swizzle_size,
+        True,
+        True,
+        True,
+        epilogue_quant,
+        True,
+        float(swiglu_clamp_value),
+        bool(postact_bf16_trunc),
+        _TORCH_TO_CUTLASS_DTYPE[a_scales.dtype],
+        a_scales.ndim,
+        _TORCH_TO_CUTLASS_DTYPE[b_scales.dtype],
+        b_scales.ndim,
+        (
+            _TORCH_TO_CUTLASS_DTYPE[z_scale_out.dtype]
+            if z_scale_out is not None
+            else None
+        ),
+        z_scale_out.ndim if z_scale_out is not None else 0,
+        _TORCH_TO_CUTLASS_DTYPE[postact_scale_out.dtype],
+        postact_scale_out.ndim,
+    )
+    from quack.cache_utils import COMPILE_ONLY as _COMPILE_ONLY
+
+    if _COMPILE_ONLY:
+        return True
+
+    epi_kwargs = {"mPostActScaleIsa": postact_scale_out}
+    if epilogue_quant:
+        epi_kwargs["mZScale"] = z_scale_out
+    epilogue_args = GemmCls.EpilogueArguments(
+        PostAct,
+        None,
+        swiglu_clamp_value=None,
+        postact_bf16_trunc=None,
+        mRowVecBroadcast=None,
+        mColVecBroadcast=None,
+        rounding_mode=None,
+        sr_seed=None,
+        **epi_kwargs,
+    )
+    scheduler_args = _static_gated_scheduler_args(
+        cluster_M,
+        cluster_N,
+        max_swizzle_size,
+        int(torch.cuda.current_device()),
+    )
+    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
+    compiled_fn(
+        A,
+        B_ffi,
+        D,
+        None,
+        epilogue_args,
+        scheduler_args,
+        varlen_args,
+        a_scales,
+        b_scales,
+    )
+    return True
 
 
 def gemm_gated(

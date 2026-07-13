@@ -34,6 +34,12 @@ from sonicmoe.ernie_compat.deepep_metadata import (
 )
 from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
     gather_raw_blockscaled_1x32_scales_to_isa,
+    quantize_activation_blockscaled_fast,
+)
+from sonicmoe.functional import (
+    _ensure_isa_1x32_scales,
+    _gather_1x32_scales_to_isa,
+    _raw_1x32_scale_bytes,
 )
 
 
@@ -745,6 +751,25 @@ class TestCudaVsPythonFallback:
 
 
 class TestCudaScalePacking:
+    @pytest.mark.parametrize("rows,cols", [(7, 256), (129, 6400)])
+    def test_quantizer_compact_scale_words_are_byte_exact(self, rows, cols):
+        torch.manual_seed(20260713)
+        source = torch.randn(
+            (rows, cols), dtype=torch.bfloat16, device="cuda"
+        )
+        fp8_raw, raw_scales = quantize_activation_blockscaled_fast(source)
+        fp8_compact, compact_scales = quantize_activation_blockscaled_fast(
+            source, pack_scale_words=True
+        )
+
+        assert compact_scales.dtype == torch.int32
+        assert compact_scales.shape == (rows, cols // 128)
+        assert _t_eq(fp8_raw.view(torch.uint8), fp8_compact.view(torch.uint8))
+        assert _t_eq(
+            raw_scales,
+            compact_scales.view(torch.uint8).reshape(rows, cols // 32),
+        )
+
     """Validate metadata-side raw scale packing against the existing reference."""
 
     @pytest.mark.parametrize("N_recv,topk,E,cols,raw_dtype", [
@@ -789,6 +814,223 @@ class TestCudaScalePacking:
         assert _t_eq(packed.view(torch.uint8), ref.view(torch.uint8)), (
             "metadata-side packed scales differ from raw gather reference"
         )
+
+    @pytest.mark.parametrize("N_recv,topk,E,cols", [
+        (257, 4, 8, 256),
+        (513, 8, 16, 4096),
+        (129, 4, 24, 6400),
+    ])
+    @pytest.mark.parametrize("pack_mode", ["default", "scatter", "rowmajor"])
+    def test_compact_int32_carrier_is_byte_exact(
+        self, N_recv, topk, E, cols, pack_mode
+    ):
+        if not _HAS_TOPK_CUDA_SCALES_KERNEL:
+            pytest.skip("CUDA scale-packing metadata kernel not compiled")
+
+        torch.manual_seed(20260713)
+        indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
+        scale_cols = (cols + 31) // 32
+        assert scale_cols % 4 == 0
+        raw_scales = (
+            torch.arange(N_recv * scale_cols, dtype=torch.int32, device="cuda")
+            .reshape(N_recv, scale_cols)
+            % 251
+        ).to(torch.uint8)
+        compact_carrier = raw_scales.view(torch.int32).reshape(
+            N_recv, scale_cols // 4
+        )
+        assert compact_carrier.data_ptr() == raw_scales.data_ptr()
+
+        kwargs = {
+            "block": 128,
+            "pack_scales_in_scatter": pack_mode == "scatter",
+            "pack_scales_rowmajor": pack_mode == "rowmajor",
+        }
+        raw_result = deepep_topk_to_sonic_metadata_with_scales(
+            indices, probs, tpe, E, raw_scales, cols, **kwargs
+        )
+        compact_result = deepep_topk_to_sonic_metadata_with_scales(
+            indices, probs, tpe, E, compact_carrier, cols, **kwargs
+        )
+
+        for index in (0, 1, 2, 3, 4, 5, 9, 10):
+            assert _t_eq(raw_result[index], compact_result[index]), (
+                f"output {index} differs for compact carrier in {pack_mode} mode"
+            )
+        assert raw_result[6:9] == compact_result[6:9]
+
+    def test_invalid_compact_carrier_shape_is_rejected(self):
+        N_recv, topk, E, cols = 32, 4, 8, 256
+        indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
+        malformed = torch.empty((N_recv, 3), dtype=torch.int32, device="cuda")
+        with pytest.raises(ValueError, match="raw_scales shape mismatch"):
+            deepep_topk_to_sonic_metadata_with_scales(
+                indices, probs, tpe, E, malformed, cols
+            )
+
+    @pytest.mark.parametrize("rows,cols", [(7, 256), (31, 4096), (129, 6400)])
+    def test_compact_carrier_fallbacks_are_byte_exact(self, rows, cols):
+        scale_cols = cols // 32
+        raw = (
+            torch.arange(rows * scale_cols, dtype=torch.int32, device="cuda")
+            .reshape(rows, scale_cols)
+            % 251
+        ).to(torch.uint8)
+        compact = raw.view(torch.int32).reshape(rows, scale_cols // 4)
+        gather_idx = torch.arange(128, dtype=torch.int32, device="cuda") % rows
+
+        restored = _raw_1x32_scale_bytes(compact, rows, cols)
+        assert restored.data_ptr() == compact.data_ptr()
+        assert _t_eq(restored, raw)
+
+        raw_gathered = _gather_1x32_scales_to_isa(
+            raw, gather_idx, rows, cols
+        )
+        compact_gathered = _gather_1x32_scales_to_isa(
+            compact, gather_idx, rows, cols
+        )
+        assert _t_eq(
+            raw_gathered.view(torch.uint8),
+            compact_gathered.view(torch.uint8),
+        )
+
+        raw_packed = _ensure_isa_1x32_scales(raw, rows, cols)
+        compact_packed = _ensure_isa_1x32_scales(compact, rows, cols)
+        assert _t_eq(
+            raw_packed.view(torch.uint8), compact_packed.view(torch.uint8)
+        )
+
+    @pytest.mark.parametrize(
+        "preact_bf16,allocate_z_scale",
+        [(False, True), (True, False)],
+        ids=["combined_quant", "postact_quant"],
+    )
+    def test_gated_output_allocation_contract(
+        self, preact_bf16, allocate_z_scale
+    ):
+        if not _HAS_TOPK_CUDA_SCALES_KERNEL:
+            pytest.skip("CUDA scale-packing metadata kernel not compiled")
+
+        N_recv, topk, E, cols, gated_n = 256, 4, 8, 256, 256
+        indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
+        raw_scales = torch.ones(
+            (N_recv, cols // 32), dtype=torch.uint8, device="cuda"
+        )
+        prototype = torch.empty(
+            (N_recv, cols), dtype=torch.float8_e4m3fn, device="cuda"
+        )
+
+        def run():
+            return deepep_topk_to_sonic_metadata_with_scales(
+                indices,
+                probs,
+                tpe,
+                E,
+                raw_scales=raw_scales,
+                cols=cols,
+                block=128,
+                gated_output_prototype=prototype,
+                gated_n=gated_n,
+                gated_preact_bf16=preact_bf16,
+                gated_allocate_z_scale=allocate_z_scale,
+            )
+
+        first = run()
+        second = run()
+        assert len(first) == 15
+        TK_padded = first[6]
+        for index in (0, 1, 2, 3, 4, 9):
+            assert first[index].data_ptr() % 16 == 0, (
+                f"metadata output {index} must satisfy TVM-FFI 16-byte alignment"
+            )
+        preact, postact, z_scale, postact_scale = first[11:15]
+        assert preact.shape == (TK_padded, gated_n)
+        assert postact.shape == (TK_padded, gated_n // 2)
+        assert z_scale.shape == (
+            (TK_padded, gated_n // 32) if allocate_z_scale else (0,)
+        )
+        assert postact_scale.shape == (
+            TK_padded // 128,
+            gated_n // 256,
+            512,
+        )
+        assert preact.dtype == (
+            torch.bfloat16 if preact_bf16 else torch.float8_e4m3fn
+        )
+        assert postact.dtype == torch.float8_e4m3fn
+        assert z_scale.dtype == torch.uint8
+        assert postact_scale.dtype == torch.uint8
+        assert all(t.is_contiguous() for t in first[11:15])
+        if not allocate_z_scale:
+            assert first[13].numel() == 0 and second[13].numel() == 0
+        assert all(
+            lhs.data_ptr() != rhs.data_ptr()
+            for lhs, rhs in zip(first[11:15], second[11:15])
+            if lhs.numel() > 0
+        ), "non-empty ctx-saved gated outputs must have independent storage per microbatch"
+
+    def test_production_shape_outputs_stay_byte_exact_across_live_calls(self):
+        """PP/VPP-live metadata must not alias later custom-op invocations."""
+        if not _HAS_TOPK_CUDA_SCALES_KERNEL:
+            pytest.skip("CUDA scale-packing metadata kernel not compiled")
+
+        N_recv, TK, topk, E, cols = 24577, 30001, 4, 24, 6400
+        rows = torch.arange(N_recv, dtype=torch.int32, device="cuda")
+        indices = torch.full(
+            (N_recv, topk), -1, dtype=torch.int32, device="cuda"
+        )
+        probs = torch.zeros(
+            (N_recv, topk), dtype=torch.float32, device="cuda"
+        )
+        indices[:, 0] = rows % E
+        probs[:, 0] = 1.0
+        extra = TK - N_recv
+        indices[:extra, 1] = (rows[:extra] + 1) % E
+        probs[:extra, :2] = 0.5
+        valid_experts = indices[indices >= 0].long()
+        tokens_per_expert = torch.bincount(
+            valid_experts, minlength=E
+        ).tolist()
+        compact_scales = torch.zeros(
+            (N_recv, cols // 128), dtype=torch.int32, device="cuda"
+        )
+
+        def run():
+            return deepep_topk_to_sonic_metadata_with_scales(
+                indices,
+                probs,
+                tokens_per_expert,
+                E,
+                compact_scales,
+                cols,
+                block=128,
+            )
+
+        output_indices = (0, 1, 2, 3, 4, 5, 9, 10)
+        first = run()
+        snapshots = {
+            index: first[index].clone() for index in output_indices
+        }
+        torch.cuda.synchronize()
+
+        live_outputs = [first]
+        for _ in range(4):
+            current = run()
+            live_outputs.append(current)
+            torch.cuda.synchronize()
+            for index in output_indices:
+                assert _t_eq(current[index], snapshots[index]), (
+                    f"metadata output {index} changed across live invocations"
+                )
+                assert _t_eq(first[index], snapshots[index]), (
+                    f"live metadata output {index} was overwritten by a later call"
+                )
+
+        for index in output_indices:
+            pointers = [result[index].data_ptr() for result in live_outputs]
+            assert len(set(pointers)) == len(pointers), (
+                f"metadata output {index} must own per-call storage"
+            )
 
 # ── Performance Benchmark ───────────────────────────────────────────────────
 
