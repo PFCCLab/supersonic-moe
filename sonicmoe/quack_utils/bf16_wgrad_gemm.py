@@ -156,6 +156,19 @@ def _run_bf16_wgrad_varlen_k(
     epi_args,
     config: Optional[GemmConfig] = None,
 ) -> torch.Tensor:
+    expected_out_shape = (int(num_experts), int(M), int(N))
+    if tuple(out.shape) != expected_out_shape:
+        raise ValueError(
+            "BF16 varlen-K wgrad output shape mismatch: expected "
+            f"{expected_out_shape}, got {tuple(out.shape)}. "
+            "A non-contiguous output view is supported, but its logical shape "
+            "must remain [num_experts, M, N]."
+        )
+    if C is not None and tuple(C.shape) != expected_out_shape:
+        raise ValueError(
+            "BF16 varlen-K wgrad accumulator shape mismatch: expected "
+            f"{expected_out_shape}, got {tuple(C.shape)}."
+        )
     if config is None:
         config = _bf16_wgrad_default_config(device, M=M, N=N)
     fast_key = (

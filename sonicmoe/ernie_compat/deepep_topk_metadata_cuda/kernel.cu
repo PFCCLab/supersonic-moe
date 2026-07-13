@@ -18,6 +18,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <limits>
 #include <type_traits>
 #include <vector>
 
@@ -302,11 +303,12 @@ void block_offset_scan_kernel(
 // ============================================================================
 __global__ __launch_bounds__(BLOCK_DIM)
 void prefix_sums_kernel(
-    const int*   __restrict__ tokens_per_expert,    // [E]
+    const int*   __restrict__ block_hist,            // [E * scatter_blocks]
+    const int*   __restrict__ block_offset,          // [E * scatter_blocks]
     const int*   __restrict__ block_naept_sum,       // [scatter_blocks] in
     int*         __restrict__ expert_offsets,        // [E+1] out
     int*         __restrict__ seg_starts,            // [E] out
-    int*         __restrict__ real_bases,            // [E] out
+    int*         __restrict__ expert_counts,         // [E] out
     int*         __restrict__ block_naept_base,      // [scatter_blocks] out: exclusive prefix
     int*         __restrict__ naept,                 // [N_recv+1] (only naept[0] and naept[N_recv] written here)
     int          N_recv,
@@ -320,15 +322,16 @@ void prefix_sums_kernel(
 
     // --- B.1: Expert offsets (thread 0, O(E) — typically 8..128) ---
     if (threadIdx.x == 0) {
-        int padded_cum = 0, real_cum = 0;
+        int padded_cum = 0;
         expert_offsets[0] = 0;
         for (int e = 0; e < num_experts; e++) {
-            int count = tokens_per_expert[e];
+            const int last = scatter_blocks - 1;
+            const int idx = e * scatter_blocks + last;
+            const int count = block_offset[idx] + block_hist[idx];
             int padded = (count > 0) ? ((count + alignment - 1) / alignment * alignment) : 0;
             seg_starts[e] = padded_cum;
-            real_bases[e] = real_cum;
+            expert_counts[e] = count;
             padded_cum += padded;
-            real_cum += count;
             expert_offsets[e + 1] = padded_cum;
         }
         naept[0] = 0;
@@ -406,7 +409,7 @@ void scatter_and_fixup_kernel(
     const int*   __restrict__ block_naept_base,      // [scatter_blocks] (Fusion v2)
     const int*   __restrict__ expert_offsets,        // [E+1] (padded cumsum)
     const int*   __restrict__ seg_starts,            // [E]
-    const int*   __restrict__ tokens_per_expert,    // [E]
+    const int*   __restrict__ expert_counts,         // [E]
     int*         __restrict__ naept,                 // [N_recv+1] OUT (we materialize naept[global_row])
     int*         __restrict__ x_gather_idx,          // [TK_padded] output
     int*         __restrict__ s_scatter_idx,         // [TK_padded] output
@@ -586,7 +589,7 @@ void scatter_and_fixup_kernel(
             else hi = mid;
         }
         const int seg_start = expert_offsets[lo];
-        const int real_count = tokens_per_expert[lo];
+        const int real_count = expert_counts[lo];
         const int local_pos = pos - seg_start;
 
         if (local_pos >= real_count) {
@@ -600,6 +603,13 @@ void scatter_and_fixup_kernel(
                     scale_cols, raw_stride_row, raw_stride_col, k_tiles);
             }
         }
+    }
+
+    // Real scores densely cover [0, TK); clear only the padded tail here.
+    for (int score_pos = TK + global_tid;
+         score_pos < TK_padded;
+         score_pos += total_threads) {
+        topk_scores[score_pos] = 0.0f;
     }
 }
 
@@ -764,7 +774,6 @@ void pack_raw_scales_rowmajor_kernel(
 std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
-    torch::Tensor& tokens_per_expert,
     int64_t N_recv,
     int64_t E,
     int64_t topk,
@@ -775,46 +784,45 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
     torch::Tensor* raw_scales,
     int64_t cols,
     bool pack_scales_in_scatter,
-    bool pack_scales_rowmajor)
+    bool pack_scales_rowmajor,
+    torch::Tensor* gated_output_prototype,
+    int64_t gated_n,
+    bool gated_preact_bf16,
+    bool gated_allocate_z_scale)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
     auto opt_i = torch::dtype(torch::kInt32).device(torch::kCUDA);
     auto opt_f = torch::dtype(torch::kFloat32).device(torch::kCUDA);
 
-    // ── Output tensors (saved on autograd ctx) — independent storage/call ────
-    // Mirror the exact init the previous Python path used: x_gather_idx and
-    // topk_scores are zero-initialised (pad slots must read 0), the rest are
-    // fully written by the kernels below so torch::empty is sufficient.
+    const int scatter_blocks = (N_recv + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    const int64_t workspace_elements =
+        2 * static_cast<int64_t>(scatter_blocks) * (E + 1) + 2 * E;
+
+    // Custom-op outputs must own independent storage. Undeclared output
+    // aliasing can let live PP/VPP contexts observe later invocations.
     torch::Tensor expert_offsets        = torch::empty({E + 1}, opt_i);
-    torch::Tensor x_gather_idx          = torch::zeros({TK_padded}, opt_i);
+    torch::Tensor x_gather_idx          = torch::empty({TK_padded}, opt_i);
     torch::Tensor s_scatter_idx         = torch::empty({TK_padded}, opt_i);
     torch::Tensor s_reverse_scatter_idx = torch::empty({TK}, opt_i);
-    torch::Tensor topk_scores           = torch::zeros({TK_padded}, opt_f);
     torch::Tensor naept                 = torch::empty({N_recv + 1}, opt_i);
     torch::Tensor score_src_idx         = torch::empty({TK}, opt_i);
-
-    const int scatter_blocks = (N_recv + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
-
-    // ── Pure scratch (NOT returned, NOT ctx-saved) ───────────────────────────
-    torch::Tensor seg_starts = torch::empty({E}, opt_i);
-    torch::Tensor real_bases = torch::empty({E}, opt_i);
-    // Workspace layout (must match the launcher partition below):
-    //   block_hist[scatter_blocks*E] + block_offset[scatter_blocks*E]
-    //   + block_naept_sum[scatter_blocks] + block_naept_base[scatter_blocks]
-    // = 2*scatter_blocks*(E+1) int32 slots.
     torch::Tensor cumsum_workspace =
-        torch::empty({2 * scatter_blocks * (static_cast<int64_t>(E) + 1)}, opt_i);
+        torch::empty({workspace_elements}, opt_i);
+    torch::Tensor topk_scores           = torch::empty({TK_padded}, opt_f);
 
     // Workspace layout within cumsum_workspace:
     //   [0 .. scatter_blocks*E-1]:                  block_hist
     //   [scatter_blocks*E .. 2*scatter_blocks*E-1]: block_offset
     //   [2*scatter_blocks*E ..]:                    block_naept_sum / base
+    //   [2*scatter_blocks*(E+1) ..]:                seg_starts / expert_counts
     int* workspace = cumsum_workspace.data_ptr<int>();
     int* block_hist = workspace;
     int* block_offset = workspace + scatter_blocks * E;
     int* block_naept_sum = workspace + 2 * scatter_blocks * E;
     int* block_naept_base = workspace + 2 * scatter_blocks * E + scatter_blocks;
+    int* seg_starts = workspace + 2 * scatter_blocks * (E + 1);
+    int* expert_counts = seg_starts + E;
 
     // Shared memory for histogram_kernel: expert_bitmask[E]
     int smem_hist = static_cast<int>(E * sizeof(uint32_t));
@@ -847,35 +855,47 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
 
     // ── Kernel 1c: Tail prefix sums (B.1 expert_offsets + scan over per-block sums) ──
     prefix_sums_kernel<<<dim3(1), block_prefix, smem_prefix, stream>>>(
-        tokens_per_expert.data_ptr<int>(),
+        block_hist,
+        block_offset,
         block_naept_sum,
         expert_offsets.data_ptr<int>(),
-        seg_starts.data_ptr<int>(),
-        real_bases.data_ptr<int>(),
+        seg_starts,
+        expert_counts,
         block_naept_base,
         naept.data_ptr<int>(),
         static_cast<int>(N_recv), scatter_blocks, static_cast<int>(E),
         static_cast<int>(alignment));
 
     torch::Tensor packed_scales;
+    uint8_t* packed_scale_output_bytes = nullptr;
     int64_t scale_cols = 0;
     int64_t stride_row = 0;
     int64_t stride_col = 0;
     int64_t k_tiles = 0;
     at::ScalarType raw_dtype = at::ScalarType::Byte;
+    bool compact_scale_words = false;
+    const uint8_t* compact_scale_bytes = nullptr;
     if (raw_scales != nullptr) {
         TORCH_CHECK(cols > 0, "cols must be positive when raw_scales is provided");
         TORCH_CHECK(raw_scales->is_cuda(), "raw_scales must be a CUDA tensor");
-        TORCH_CHECK(raw_scales->dim() == 2, "raw_scales must be rank-2 [N_recv, ceil(cols/32)]");
+        TORCH_CHECK(raw_scales->dim() == 2,
+                    "raw_scales must be a rank-2 raw scale matrix or compact int32 carrier");
         TORCH_CHECK(raw_scales->size(0) == N_recv,
                     "raw_scales row count mismatch: expected ", N_recv,
                     ", got ", raw_scales->size(0));
 
         const int64_t expected_scale_cols = div_up_i64(cols, SF_VEC_SIZE);
-        scale_cols = raw_scales->size(1);
-        TORCH_CHECK(scale_cols == expected_scale_cols,
+        const int64_t storage_scale_cols = raw_scales->size(1);
+        raw_dtype = raw_scales->scalar_type();
+        compact_scale_words =
+            raw_dtype == at::ScalarType::Int &&
+            expected_scale_cols % 4 == 0 &&
+            storage_scale_cols == expected_scale_cols / 4;
+        TORCH_CHECK(storage_scale_cols == expected_scale_cols || compact_scale_words,
                     "raw_scales column count mismatch: expected ", expected_scale_cols,
-                    " for cols=", cols, ", got ", scale_cols);
+                    " raw scale elements or ", expected_scale_cols / 4,
+                    " compact int32 words for cols=", cols,
+                    ", got ", storage_scale_cols);
 
         auto opt_u8 = torch::dtype(torch::kUInt8).device(torch::kCUDA);
         const int64_t per_batch_storage = scale_storage_per_batch_i64(TK_padded, cols);
@@ -883,16 +903,64 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
             (TK_padded % SF_TILE_M == 0 && cols % SF_TILE_K == 0)
                 ? torch::empty({1, per_batch_storage}, opt_u8)
                 : torch::full({1, per_batch_storage}, 1, opt_u8);
+        packed_scale_output_bytes = packed_scales.data_ptr<uint8_t>();
 
         k_tiles = div_up_i64(cols, SF_TILE_K);
-        stride_row = raw_scales->stride(0);
-        stride_col = raw_scales->stride(1);
-        raw_dtype = raw_scales->scalar_type();
         TORCH_CHECK(raw_dtype == at::ScalarType::Int ||
                     raw_dtype == at::ScalarType::Byte ||
                     raw_dtype == at::ScalarType::Char,
                     "raw_scales dtype must be int32, uint8, or int8, got ",
                     raw_scales->scalar_type());
+        scale_cols = expected_scale_cols;
+        if (compact_scale_words) {
+            // DeepEP transports four opaque E8M0 bytes in each int32 word.
+            stride_row = raw_scales->stride(0) * sizeof(int);
+            stride_col = 1;
+            compact_scale_bytes = reinterpret_cast<const uint8_t*>(
+                raw_scales->data_ptr<int>());
+        } else {
+            stride_row = raw_scales->stride(0);
+            stride_col = raw_scales->stride(1);
+        }
+    }
+
+    // Sink the four hot-path output allocations into this native bridge.
+    // Each invocation still receives independent storage for autograd safety.
+    torch::Tensor gated_preact;
+    torch::Tensor gated_postact;
+    torch::Tensor gated_z_scales;
+    torch::Tensor gated_postact_scales;
+    if (gated_output_prototype != nullptr) {
+        TORCH_CHECK(raw_scales != nullptr,
+                    "gated output allocation requires the with-scales path");
+        TORCH_CHECK(gated_output_prototype->is_cuda(),
+                    "gated_output_prototype must be a CUDA tensor");
+        TORCH_CHECK(gated_output_prototype->element_size() == 1,
+                    "gated_output_prototype must use a one-byte FP8 dtype");
+        TORCH_CHECK(gated_n > 0 && gated_n % 256 == 0,
+                    "gated_n must be positive and divisible by 256, got ", gated_n);
+        TORCH_CHECK(TK_padded % SF_TILE_M == 0,
+                    "TK_padded must be divisible by 128, got ", TK_padded);
+        TORCH_CHECK(
+            TK_padded <= std::numeric_limits<int64_t>::max() / gated_n,
+            "gated output shape overflows int64: TK_padded=", TK_padded,
+            ", gated_n=", gated_n);
+
+        auto fp8_options = gated_output_prototype->options();
+        auto preact_options = gated_preact_bf16
+            ? torch::dtype(torch::kBFloat16).device(gated_output_prototype->device())
+            : fp8_options;
+        auto u8_options = torch::dtype(torch::kUInt8).device(
+            gated_output_prototype->device());
+        const int64_t postact_n = gated_n / 2;
+        gated_preact = torch::empty({TK_padded, gated_n}, preact_options);
+        gated_postact = torch::empty({TK_padded, postact_n}, fp8_options);
+        gated_z_scales = gated_allocate_z_scale
+            ? torch::empty({TK_padded, gated_n / SF_VEC_SIZE}, u8_options)
+            : torch::empty({0}, u8_options);
+        gated_postact_scales = torch::empty(
+            {TK_padded / SF_TILE_M, postact_n / SF_TILE_K, SF_TILE_STORAGE},
+            u8_options);
     }
 
     // ── Kernel 2: Scatter + fixup ────────────────────────────────────────────
@@ -918,8 +986,8 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
             block_offset, \
             block_naept_base, \
             expert_offsets.data_ptr<int>(), \
-            seg_starts.data_ptr<int>(), \
-            tokens_per_expert.data_ptr<int>(), \
+            seg_starts, \
+            expert_counts, \
             naept.data_ptr<int>(), \
             x_gather_idx.data_ptr<int>(), \
             s_scatter_idx.data_ptr<int>(), \
@@ -930,15 +998,15 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
             static_cast<int>(topk), static_cast<int>(TK), \
             static_cast<int>(TK_padded), scatter_blocks);
 
-    #define LAUNCH_K2_PACK(TV, RAW_T) \
+    #define LAUNCH_K2_PACK(TV, RAW_T, RAW_PTR) \
         scatter_and_fixup_kernel<TV, RAW_T, true><<<grid2, block2, smem_k2, stream>>>( \
             dispatched_indices.data_ptr<int>(), \
             dispatched_probs.data_ptr<float>(), \
             block_offset, \
             block_naept_base, \
             expert_offsets.data_ptr<int>(), \
-            seg_starts.data_ptr<int>(), \
-            tokens_per_expert.data_ptr<int>(), \
+            seg_starts, \
+            expert_counts, \
             naept.data_ptr<int>(), \
             x_gather_idx.data_ptr<int>(), \
             s_scatter_idx.data_ptr<int>(), \
@@ -948,23 +1016,27 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
             static_cast<int>(N_recv), static_cast<int>(E), \
             static_cast<int>(topk), static_cast<int>(TK), \
             static_cast<int>(TK_padded), scatter_blocks, \
-            raw_scales->data_ptr<RAW_T>(), \
-            packed_scales.data_ptr<uint8_t>(), \
+            RAW_PTR, \
+            packed_scale_output_bytes, \
             scale_cols, stride_row, stride_col, k_tiles);
 
     if (raw_scales != nullptr && pack_scales_in_scatter) {
-        if (raw_dtype == at::ScalarType::Int) {
-            if (topk <= 4) { LAUNCH_K2_PACK(4, int); }
-            else if (topk <= 8) { LAUNCH_K2_PACK(8, int); }
-            else { LAUNCH_K2_PACK(16, int); }
+        if (compact_scale_words) {
+            if (topk <= 4) { LAUNCH_K2_PACK(4, uint8_t, compact_scale_bytes); }
+            else if (topk <= 8) { LAUNCH_K2_PACK(8, uint8_t, compact_scale_bytes); }
+            else { LAUNCH_K2_PACK(16, uint8_t, compact_scale_bytes); }
+        } else if (raw_dtype == at::ScalarType::Int) {
+            if (topk <= 4) { LAUNCH_K2_PACK(4, int, raw_scales->data_ptr<int>()); }
+            else if (topk <= 8) { LAUNCH_K2_PACK(8, int, raw_scales->data_ptr<int>()); }
+            else { LAUNCH_K2_PACK(16, int, raw_scales->data_ptr<int>()); }
         } else if (raw_dtype == at::ScalarType::Byte) {
-            if (topk <= 4) { LAUNCH_K2_PACK(4, uint8_t); }
-            else if (topk <= 8) { LAUNCH_K2_PACK(8, uint8_t); }
-            else { LAUNCH_K2_PACK(16, uint8_t); }
+            if (topk <= 4) { LAUNCH_K2_PACK(4, uint8_t, raw_scales->data_ptr<uint8_t>()); }
+            else if (topk <= 8) { LAUNCH_K2_PACK(8, uint8_t, raw_scales->data_ptr<uint8_t>()); }
+            else { LAUNCH_K2_PACK(16, uint8_t, raw_scales->data_ptr<uint8_t>()); }
         } else {
-            if (topk <= 4) { LAUNCH_K2_PACK(4, int8_t); }
-            else if (topk <= 8) { LAUNCH_K2_PACK(8, int8_t); }
-            else { LAUNCH_K2_PACK(16, int8_t); }
+            if (topk <= 4) { LAUNCH_K2_PACK(4, int8_t, raw_scales->data_ptr<int8_t>()); }
+            else if (topk <= 8) { LAUNCH_K2_PACK(8, int8_t, raw_scales->data_ptr<int8_t>()); }
+            else { LAUNCH_K2_PACK(16, int8_t, raw_scales->data_ptr<int8_t>()); }
         }
     } else {
         if (topk <= 4) { LAUNCH_K2(4); }
@@ -996,50 +1068,68 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
             if (use_rowmajor_pack) {
                 dim3 grid_scale(static_cast<unsigned int>(row_tiles));
                 size_t smem_scale = static_cast<size_t>(SF_TILE_M * scale_cols);
-                if (raw_dtype == at::ScalarType::Int) {
+                if (compact_scale_words) {
+                    pack_raw_scales_rowmajor_kernel<uint8_t><<<grid_scale, block_scale, smem_scale, stream>>>(
+                        compact_scale_bytes,
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scale_output_bytes,
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                } else if (raw_dtype == at::ScalarType::Int) {
                     pack_raw_scales_rowmajor_kernel<int><<<grid_scale, block_scale, smem_scale, stream>>>(
                         raw_scales->data_ptr<int>(),
                         x_gather_idx.data_ptr<int>(),
-                        packed_scales.data_ptr<uint8_t>(),
+                        packed_scale_output_bytes,
                         TK_padded, scale_cols, stride_row, stride_col, k_tiles);
                 } else if (raw_dtype == at::ScalarType::Byte) {
                     pack_raw_scales_rowmajor_kernel<uint8_t><<<grid_scale, block_scale, smem_scale, stream>>>(
                         raw_scales->data_ptr<uint8_t>(),
                         x_gather_idx.data_ptr<int>(),
-                        packed_scales.data_ptr<uint8_t>(),
+                        packed_scale_output_bytes,
                         TK_padded, scale_cols, stride_row, stride_col, k_tiles);
                 } else {
                     pack_raw_scales_rowmajor_kernel<int8_t><<<grid_scale, block_scale, smem_scale, stream>>>(
                         raw_scales->data_ptr<int8_t>(),
                         x_gather_idx.data_ptr<int>(),
-                        packed_scales.data_ptr<uint8_t>(),
+                        packed_scale_output_bytes,
                         TK_padded, scale_cols, stride_row, stride_col, k_tiles);
                 }
             } else {
                 dim3 grid_scale(static_cast<unsigned int>(div_up_i64(row_tiles, SCALE_PACK_WARPS_PER_CTA)),
                                 static_cast<unsigned int>(k_tiles));
-                if (raw_dtype == at::ScalarType::Int) {
+                if (compact_scale_words) {
+                    pack_raw_scales_from_gather_kernel<uint8_t><<<grid_scale, block_scale, 0, stream>>>(
+                        compact_scale_bytes,
+                        x_gather_idx.data_ptr<int>(),
+                        packed_scale_output_bytes,
+                        TK_padded, scale_cols, stride_row, stride_col, k_tiles);
+                } else if (raw_dtype == at::ScalarType::Int) {
                     pack_raw_scales_from_gather_kernel<int><<<grid_scale, block_scale, 0, stream>>>(
                         raw_scales->data_ptr<int>(),
                         x_gather_idx.data_ptr<int>(),
-                        packed_scales.data_ptr<uint8_t>(),
+                        packed_scale_output_bytes,
                         TK_padded, scale_cols, stride_row, stride_col, k_tiles);
                 } else if (raw_dtype == at::ScalarType::Byte) {
                     pack_raw_scales_from_gather_kernel<uint8_t><<<grid_scale, block_scale, 0, stream>>>(
                         raw_scales->data_ptr<uint8_t>(),
                         x_gather_idx.data_ptr<int>(),
-                        packed_scales.data_ptr<uint8_t>(),
+                        packed_scale_output_bytes,
                         TK_padded, scale_cols, stride_row, stride_col, k_tiles);
                 } else {
                     pack_raw_scales_from_gather_kernel<int8_t><<<grid_scale, block_scale, 0, stream>>>(
                         raw_scales->data_ptr<int8_t>(),
                         x_gather_idx.data_ptr<int>(),
-                        packed_scales.data_ptr<uint8_t>(),
+                        packed_scale_output_bytes,
                         TK_padded, scale_cols, stride_row, stride_col, k_tiles);
                 }
             }
         }
         out.push_back(packed_scales);
+    }
+    if (gated_output_prototype != nullptr) {
+        out.push_back(gated_preact);
+        out.push_back(gated_postact);
+        out.push_back(gated_z_scales);
+        out.push_back(gated_postact_scales);
     }
 
     return out;
@@ -1048,7 +1138,6 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_impl(
 std::vector<torch::Tensor> deepep_topk_metadata_cuda(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
-    torch::Tensor& tokens_per_expert,
     int64_t N_recv,
     int64_t E,
     int64_t topk,
@@ -1058,15 +1147,14 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda(
     int64_t stream_ptr)
 {
     return deepep_topk_metadata_cuda_impl(
-        dispatched_indices, dispatched_probs, tokens_per_expert,
+        dispatched_indices, dispatched_probs,
         N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
-        nullptr, 0, false, false);
+        nullptr, 0, false, false, nullptr, 0, false, false);
 }
 
 std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
-    torch::Tensor& tokens_per_expert,
     int64_t N_recv,
     int64_t E,
     int64_t topk,
@@ -1078,15 +1166,39 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales(
     int64_t stream_ptr)
 {
     return deepep_topk_metadata_cuda_impl(
-        dispatched_indices, dispatched_probs, tokens_per_expert,
+        dispatched_indices, dispatched_probs,
         N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
-        &raw_scales, cols, false, false);
+        &raw_scales, cols, false, false, nullptr, 0, false, false);
+}
+
+std::vector<torch::Tensor>
+deepep_topk_metadata_cuda_with_scales_and_gated_outputs(
+    torch::Tensor& dispatched_indices,
+    torch::Tensor& dispatched_probs,
+    int64_t N_recv,
+    int64_t E,
+    int64_t topk,
+    int64_t TK,
+    int64_t TK_padded,
+    int64_t alignment,
+    torch::Tensor& raw_scales,
+    int64_t cols,
+    torch::Tensor& gated_output_prototype,
+    int64_t gated_n,
+    bool gated_preact_bf16,
+    bool gated_allocate_z_scale,
+    int64_t stream_ptr)
+{
+    return deepep_topk_metadata_cuda_impl(
+        dispatched_indices, dispatched_probs,
+        N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
+        &raw_scales, cols, false, false, &gated_output_prototype, gated_n,
+        gated_preact_bf16, gated_allocate_z_scale);
 }
 
 std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales_rowpack(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
-    torch::Tensor& tokens_per_expert,
     int64_t N_recv,
     int64_t E,
     int64_t topk,
@@ -1098,15 +1210,14 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales_rowpack(
     int64_t stream_ptr)
 {
     return deepep_topk_metadata_cuda_impl(
-        dispatched_indices, dispatched_probs, tokens_per_expert,
+        dispatched_indices, dispatched_probs,
         N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
-        &raw_scales, cols, false, true);
+        &raw_scales, cols, false, true, nullptr, 0, false, false);
 }
 
 std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales_scatterpack(
     torch::Tensor& dispatched_indices,
     torch::Tensor& dispatched_probs,
-    torch::Tensor& tokens_per_expert,
     int64_t N_recv,
     int64_t E,
     int64_t topk,
@@ -1118,9 +1229,9 @@ std::vector<torch::Tensor> deepep_topk_metadata_cuda_with_scales_scatterpack(
     int64_t stream_ptr)
 {
     return deepep_topk_metadata_cuda_impl(
-        dispatched_indices, dispatched_probs, tokens_per_expert,
+        dispatched_indices, dispatched_probs,
         N_recv, E, topk, TK, TK_padded, alignment, stream_ptr,
-        &raw_scales, cols, true, false);
+        &raw_scales, cols, true, false, nullptr, 0, false, false);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1129,7 +1240,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "DeepEP topk metadata: allocates + returns metadata tensors (CUDA)",
           py::arg("dispatched_indices"),
           py::arg("dispatched_probs"),
-          py::arg("tokens_per_expert"),
           py::arg("N_recv"),
           py::arg("E"),
           py::arg("topk"),
@@ -1142,7 +1252,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "DeepEP topk metadata: returns metadata tensors plus packed Sonic FP8 scales (CUDA)",
           py::arg("dispatched_indices"),
           py::arg("dispatched_probs"),
-          py::arg("tokens_per_expert"),
           py::arg("N_recv"),
           py::arg("E"),
           py::arg("topk"),
@@ -1152,12 +1261,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("raw_scales"),
           py::arg("cols"),
           py::arg("stream"));
+    m.def("deepep_topk_metadata_cuda_with_scales_and_gated_outputs",
+          &deepep_topk_metadata_cuda_with_scales_and_gated_outputs,
+          "DeepEP metadata + packed scales + preallocated FP8 gated outputs (CUDA)",
+          py::arg("dispatched_indices"),
+          py::arg("dispatched_probs"),
+          py::arg("N_recv"),
+          py::arg("E"),
+          py::arg("topk"),
+          py::arg("TK"),
+          py::arg("TK_padded"),
+          py::arg("alignment"),
+          py::arg("raw_scales"),
+          py::arg("cols"),
+          py::arg("gated_output_prototype"),
+          py::arg("gated_n"),
+          py::arg("gated_preact_bf16"),
+          py::arg("gated_allocate_z_scale"),
+          py::arg("stream"));
     m.def("deepep_topk_metadata_cuda_with_scales_scatterpack",
           &deepep_topk_metadata_cuda_with_scales_scatterpack,
           "DeepEP topk metadata: packs Sonic FP8 scales inside scatter/fixup (CUDA)",
           py::arg("dispatched_indices"),
           py::arg("dispatched_probs"),
-          py::arg("tokens_per_expert"),
           py::arg("N_recv"),
           py::arg("E"),
           py::arg("topk"),
@@ -1172,7 +1298,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "DeepEP topk metadata: row-major-load shared-transpose Sonic FP8 scale pack (CUDA)",
           py::arg("dispatched_indices"),
           py::arg("dispatched_probs"),
-          py::arg("tokens_per_expert"),
           py::arg("N_recv"),
           py::arg("E"),
           py::arg("topk"),

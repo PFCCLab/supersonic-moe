@@ -44,6 +44,7 @@ try:
     from .deepep_topk_metadata_cuda import (
         deepep_topk_metadata_cuda,
         deepep_topk_metadata_cuda_with_scales,
+        deepep_topk_metadata_cuda_with_scales_and_gated_outputs,
         deepep_topk_metadata_cuda_with_scales_rowpack,
         deepep_topk_metadata_cuda_with_scales_scatterpack,
     )
@@ -123,11 +124,14 @@ class _TopkOutputCache:
 
         needed = math.prod(shape) if shape else 1
         t = self._bufs.get(name)
+        # In Paddle compatibility mode Tensor.numel() is a device scalar.  Shape
+        # metadata keeps this allocator path free of accidental GPU->host syncs.
+        capacity = math.prod(t.shape) if t is not None else 0
 
-        if t is not None and t.dtype == dtype and str(t.device) == dev_s and t.numel() >= needed:
+        if t is not None and t.dtype == dtype and str(t.device) == dev_s and capacity >= needed:
             view = t.view(-1)[:needed].view(shape)
         else:
-            alloc = max(needed, int(t.numel() * 1.25) if t is not None else needed)
+            alloc = max(needed, int(capacity * 1.25) if t is not None else needed)
             t = torch.empty(alloc, dtype=dtype, device=device)
             self._bufs[name] = t
             view = t[:needed].view(shape)
@@ -342,12 +346,16 @@ def deepep_topk_to_sonic_metadata_with_scales(
     dispatched_probs: torch.Tensor,     # [N_recv, topk] float32
     tokens_per_expert: Sequence[int] | torch.Tensor,  # [E]
     E: int,
-    raw_scales: torch.Tensor,           # [N_recv, ceil(cols/32)] int32/uint8
+    raw_scales: torch.Tensor,           # raw bytes or compact int32 DeepEP carrier
     cols: int,
     device: str | torch.device = "cuda",
     block: int = 128,
     pack_scales_in_scatter: bool = False,
     pack_scales_rowmajor: bool = False,
+    gated_output_prototype: torch.Tensor | None = None,
+    gated_n: int | None = None,
+    gated_preact_bf16: bool = False,
+    gated_allocate_z_scale: bool = True,
 ):
     """Topk metadata conversion plus optional Sonic FP8 scale packing.
 
@@ -381,11 +389,42 @@ def deepep_topk_to_sonic_metadata_with_scales(
             f"raw_scales row mismatch: expected {N_recv}, got {raw_scales_2d.shape[0]}"
         )
     expected_scale_cols = (int(cols) + 31) // 32
-    if raw_scales_2d.shape[1] != expected_scale_cols:
-        raise ValueError(
-            f"raw_scales col mismatch: expected {expected_scale_cols} for cols={cols}, "
-            f"got {raw_scales_2d.shape[1]}"
+    compact_scale_cols = (
+        expected_scale_cols // 4 if expected_scale_cols % 4 == 0 else None
+    )
+    is_compact_word_carrier = (
+        "int32" in str(raw_scales_2d.dtype)
+        and compact_scale_cols is not None
+        and raw_scales_2d.shape[1] == compact_scale_cols
+    )
+    if (
+        raw_scales_2d.shape[1] != expected_scale_cols
+        and not is_compact_word_carrier
+    ):
+        compact_hint = (
+            f" or compact int32 [{N_recv}, {compact_scale_cols}]"
+            if compact_scale_cols is not None
+            else ""
         )
+        raise ValueError(
+            f"raw_scales shape mismatch: expected [{N_recv}, "
+            f"{expected_scale_cols}]{compact_hint} for cols={cols}, got "
+            f"{tuple(raw_scales_2d.shape)}/{raw_scales_2d.dtype}"
+        )
+    if (gated_output_prototype is None) != (gated_n is None):
+        raise ValueError(
+            "gated_output_prototype and gated_n must be provided together"
+        )
+    if gated_output_prototype is not None:
+        if "float8_e4m3" not in str(gated_output_prototype.dtype):
+            raise ValueError(
+                "gated_output_prototype must use float8_e4m3, got "
+                f"{gated_output_prototype.dtype}"
+            )
+        if int(gated_n) <= 0 or int(gated_n) % 256 != 0:
+            raise ValueError(
+                f"gated_n must be positive and divisible by 256, got {gated_n}"
+            )
 
     if _HAS_TOPK_CUDA_KERNEL and _HAS_TOPK_CUDA_SCALES_KERNEL:
         return _deepep_topk_to_sonic_metadata_cuda(
@@ -399,6 +438,10 @@ def deepep_topk_to_sonic_metadata_with_scales(
             cols=int(cols),
             pack_scales_in_scatter=pack_scales_in_scatter,
             pack_scales_rowmajor=pack_scales_rowmajor,
+            gated_output_prototype=gated_output_prototype,
+            gated_n=gated_n,
+            gated_preact_bf16=bool(gated_preact_bf16),
+            gated_allocate_z_scale=bool(gated_allocate_z_scale),
         )
 
     meta = deepep_topk_to_sonic_metadata(
@@ -538,6 +581,10 @@ def _deepep_topk_to_sonic_metadata_cuda(
     cols: int | None = None,
     pack_scales_in_scatter: bool = False,
     pack_scales_rowmajor: bool = False,
+    gated_output_prototype: torch.Tensor | None = None,
+    gated_n: int | None = None,
+    gated_preact_bf16: bool = False,
+    gated_allocate_z_scale: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
     """CUDA fused topk metadata conversion (warp-ballot, zero argsort).
 
@@ -566,16 +613,13 @@ def _deepep_topk_to_sonic_metadata_cuda(
                 "Each token's topk slots must be unique experts."
             )
 
-    # Compute TK and TK_padded on host (need tokens_per_expert list)
+    # DeepEP already returns the counts on host, so use them only to size the
+    # outputs. The CUDA kernels derive their own expert counts from block_hist;
+    # no redundant pinned H2D copy is needed on the launch-critical path.
     if isinstance(tokens_per_expert, torch.Tensor):
         tpe_list = tokens_per_expert.tolist()
-        tpe_dev = _TOPK_CACHE.get_or_alloc(
-            "tpe_dev", (E,), torch.int32, device, zero=False,
-        )
-        tpe_dev.copy_(tokens_per_expert.to(device=device, dtype=torch.int32))
     else:
         tpe_list = list(tokens_per_expert)
-        tpe_dev = _copy_tpe_h2d_async(tokens_per_expert, device)
 
     TK = sum(tpe_list)
     # Compute TK_padded (padded sum)
@@ -592,6 +636,8 @@ def _deepep_topk_to_sonic_metadata_cuda(
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
         base = (efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None)
         if raw_scales is not None:
+            if gated_output_prototype is not None:
+                return (*base, None, None, None, None, None)
             return (*base, None)
         return base
 
@@ -615,17 +661,35 @@ def _deepep_topk_to_sonic_metadata_cuda(
             if raw_scales_2d.shape[0] != 1:
                 raise ValueError(f"raw_scales: expected batch=1, got shape {tuple(raw_scales_2d.shape)}")
             raw_scales_2d = raw_scales_2d.squeeze(0)
-        raw_scales_2d = raw_scales_2d.contiguous()
-        if pack_scales_in_scatter:
+        if not raw_scales_2d.is_contiguous():
+            raw_scales_2d = raw_scales_2d.contiguous()
+        if gated_output_prototype is not None:
+            if pack_scales_in_scatter or pack_scales_rowmajor:
+                raise ValueError(
+                    "preallocated gated outputs require the default scale packer"
+                )
+            metadata_with_scales = (
+                deepep_topk_metadata_cuda_with_scales_and_gated_outputs
+            )
+        elif pack_scales_in_scatter:
             metadata_with_scales = deepep_topk_metadata_cuda_with_scales_scatterpack
         elif pack_scales_rowmajor:
             metadata_with_scales = deepep_topk_metadata_cuda_with_scales_rowpack
         else:
             metadata_with_scales = deepep_topk_metadata_cuda_with_scales
-        outputs = metadata_with_scales(
-            dispatched_indices.contiguous(),
-            dispatched_probs.contiguous(),
-            tpe_dev,
+        indices_2d = (
+            dispatched_indices
+            if dispatched_indices.is_contiguous()
+            else dispatched_indices.contiguous()
+        )
+        probs_2d = (
+            dispatched_probs
+            if dispatched_probs.is_contiguous()
+            else dispatched_probs.contiguous()
+        )
+        args = [
+            indices_2d,
+            probs_2d,
             N_recv,
             E,
             topk,
@@ -634,13 +698,32 @@ def _deepep_topk_to_sonic_metadata_cuda(
             block,
             raw_scales_2d,
             int(cols),
-            stream,
-        )
+        ]
+        if gated_output_prototype is not None:
+            args.extend(
+                [
+                    gated_output_prototype,
+                    int(gated_n),
+                    bool(gated_preact_bf16),
+                    bool(gated_allocate_z_scale),
+                ]
+            )
+        args.append(stream)
+        outputs = metadata_with_scales(*args)
     else:
+        indices_2d = (
+            dispatched_indices
+            if dispatched_indices.is_contiguous()
+            else dispatched_indices.contiguous()
+        )
+        probs_2d = (
+            dispatched_probs
+            if dispatched_probs.is_contiguous()
+            else dispatched_probs.contiguous()
+        )
         outputs = deepep_topk_metadata_cuda(
-            dispatched_indices.contiguous(),
-            dispatched_probs.contiguous(),
-            tpe_dev,
+            indices_2d,
+            probs_2d,
             N_recv,
             E,
             topk,
@@ -660,6 +743,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         score_src_idx,
     ) = outputs[:7]
     packed_scales = outputs[7] if len(outputs) > 7 else None
+    gated_outputs = tuple(outputs[8:12]) if len(outputs) >= 12 else ()
 
     # topk_scores is TK_padded-sized with zeros at pad positions.
     # For the topk path, _DownProjection uses T=N_recv and _router_forward
@@ -680,7 +764,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         score_src_idx,
     )
     if raw_scales is not None:
-        return (*base, packed_scales)
+        return (*base, packed_scales, *gated_outputs)
     return base
 
 
