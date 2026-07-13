@@ -124,11 +124,14 @@ class _TopkOutputCache:
 
         needed = math.prod(shape) if shape else 1
         t = self._bufs.get(name)
+        # In Paddle compatibility mode Tensor.numel() is a device scalar.  Shape
+        # metadata keeps this allocator path free of accidental GPU->host syncs.
+        capacity = math.prod(t.shape) if t is not None else 0
 
-        if t is not None and t.dtype == dtype and str(t.device) == dev_s and t.numel() >= needed:
+        if t is not None and t.dtype == dtype and str(t.device) == dev_s and capacity >= needed:
             view = t.view(-1)[:needed].view(shape)
         else:
-            alloc = max(needed, int(t.numel() * 1.25) if t is not None else needed)
+            alloc = max(needed, int(capacity * 1.25) if t is not None else needed)
             t = torch.empty(alloc, dtype=dtype, device=device)
             self._bufs[name] = t
             view = t[:needed].view(shape)

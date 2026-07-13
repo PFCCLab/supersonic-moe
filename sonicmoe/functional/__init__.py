@@ -33,6 +33,7 @@ from ..quack_utils import (
 from quack.gemm_interface import gemm
 from ..quack_utils.gemm_dgated import gemm_dgated as gemm_dgated_kernel
 from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
+from ..quack_utils.gemm_gated import try_gemm_gated_tvm_ffi_sonic_prepared
 
 apply_fp8_quack_patch()
 
@@ -75,6 +76,7 @@ from ..quack_utils.blockscaled_fp8_gemm import (
     _run_cutlass_blockscaled_gemm_varlen_k,
     _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
     _run_cutlass_blockscaled_gemm_varlen_k_tma_add,
+    _scatter_router_scores_i32,
     colwise_quantize_and_pack,
     fused_z_save_y1_quant,
     pack_blockscaled_1x32_scales_fast,
@@ -333,7 +335,9 @@ def _fused_blockscaled_gated_forward(
         z_scale_out = (
             gated_output_payload[2]
             if gated_output_payload is not None
-            and gated_output_payload[2].numel() != 0
+            # Paddle's Tensor.numel() returns a device scalar; use shape metadata
+            # here so output selection cannot synchronize the launch stream.
+            and all(dim != 0 for dim in gated_output_payload[2].shape)
             else torch.empty(TK, N // 32, dtype=torch.uint8, device=x.device)
         )
     else:
@@ -401,27 +405,54 @@ def _fused_blockscaled_gated_forward(
                     f"dtype={tensor.dtype}; expected shape={shape}, dtype={dtype}"
                 )
 
-    z, y1 = gemm_gated(
-        x_fp8, w1_fp8,
-        activation="swiglu",
-        preact_out=preact_out,
-        postact_out=postact_out,
-        out_dtype=z_out_dtype,
-        postact_dtype=postact_dtype,
-        cu_seqlens_m=expert_frequency_offset,
-        A_idx=x_gather_idx,
-        a_scales=x_scales_tk_e8m0,
-        b_scales=w1_scales,
-        store_preact=True,
-        dynamic_scheduler=False,
-        tuned=False,
-        z_scale_out=z_scale_out,
-        postact_scale_out=postact_scale_out,
-        swiglu_clamp_value=cfg.swiglu_clamp_value,
-        postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
-        current_stream=current_stream,
-        b_pretransposed=w1_pretransposed,
+    launched_prepared = (
+        w1_pretransposed
+        and preact_out is not None
+        and postact_out is not None
+        and try_gemm_gated_tvm_ffi_sonic_prepared(
+            x_fp8,
+            w1_fp8,
+            preact_out,
+            postact_out,
+            activation="swiglu",
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            a_scales=x_scales_tk_e8m0,
+            b_scales=w1_scales,
+            z_scale_out=z_scale_out,
+            postact_scale_out=postact_scale_out,
+            swiglu_clamp_value=cfg.swiglu_clamp_value,
+            postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
+            current_stream=current_stream,
+        )
     )
+    if launched_prepared:
+        z, y1 = preact_out, postact_out
+    else:
+        # The first call validates and compiles through the generic interface;
+        # subsequent calls reuse only its pointer-stable launch plan.
+        z, y1 = gemm_gated(
+            x_fp8,
+            w1_fp8,
+            activation="swiglu",
+            preact_out=preact_out,
+            postact_out=postact_out,
+            out_dtype=z_out_dtype,
+            postact_dtype=postact_dtype,
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            a_scales=x_scales_tk_e8m0,
+            b_scales=w1_scales,
+            store_preact=True,
+            dynamic_scheduler=False,
+            tuned=False,
+            z_scale_out=z_scale_out,
+            postact_scale_out=postact_scale_out,
+            swiglu_clamp_value=cfg.swiglu_clamp_value,
+            postact_bf16_trunc=cfg.fuse_y1_bf16_trunc,
+            current_stream=current_stream,
+            b_pretransposed=w1_pretransposed,
+        )
     del x_fp8, x_scales_tk_e8m0
 
     if epilogue_quant:
@@ -1858,12 +1889,32 @@ class _DownProjection(torch.autograd.Function):
         fp8_protocol: FP8Protocol | None,
         fp8_combine_grad_handle=None,
         fp8_config: _FP8Config | None = None,
+        router_score_source: torch.Tensor | None = None,
+        router_score_src_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # w2 = w2_original.permute([1, 2, 0])
         # w2.fp8 = getattr(w2_original, "fp8", None)
         # w2.transposed_fp8 = getattr(w2_original, "transposed_fp8", None)
         TK = y1.size(0)
         E, H, I = w2.shape
+
+        if (router_score_source is None) != (router_score_src_idx is None):
+            raise ValueError("router_score_source and router_score_src_idx must be provided together")
+        has_router_score_source = router_score_source is not None
+        if has_router_score_source:
+            if router_score_source.ndim != 2:
+                raise ValueError("router_score_source must be rank-2, got " f"shape={router_score_source.shape}")
+            if router_score_src_idx.ndim != 1 or str(router_score_src_idx.dtype) not in (
+                "torch.int32",
+                "paddle.int32",
+                "int32",
+            ):
+                raise ValueError(
+                    "router_score_src_idx must be rank-1 int32, got "
+                    f"shape={router_score_src_idx.shape}, dtype={router_score_src_idx.dtype}"
+                )
+            if router_score_src_idx.shape[0] > topk_scores.shape[0]:
+                raise ValueError("router_score_src_idx cannot exceed the metadata score buffer")
 
         use_quack_gemm = is_using_quack_gemm()
 
@@ -2001,6 +2052,12 @@ class _DownProjection(torch.autograd.Function):
         ctx._has_b2 = b2 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
         ctx._fp8_combine_grad_handle = fp8_combine_grad_handle
+        ctx._has_router_score_source = has_router_score_source
+        if ctx._has_router_score_source:
+            # The source tensor is an autograd edge only.  Forward keeps reading the
+            # compact metadata scores; backward scatters ds to this original shape.
+            ctx._router_score_source_shape = tuple(router_score_source.shape)
+            ctx._router_score_source_numel = int(router_score_source.shape[0]) * int(router_score_source.shape[1])
         ctx._w2_original = w2
         ctx._wgrad_w2_accumulator = _main_grad_accumulator(w2)
         # Always compute ds (topk_scores gradient) — needed for router training.
@@ -2097,6 +2154,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 )
             else:
                 ctx.save_for_backward(
@@ -2109,6 +2167,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 )
         else:
             if _w2_decouple:
@@ -2126,6 +2185,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 )
             else:
                 ctx.save_for_backward(
@@ -2137,6 +2197,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 )
 
         # Keep w2 FP8 cache — backward hits cache (~38µs savings) at ~37MB memory cost.
@@ -2169,6 +2230,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 ) = ctx.saved_tensor()
                 w2_shape = ctx._w2_shape   # (H, I, E)
                 w2_dtype = ctx._w2_dtype
@@ -2184,6 +2246,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 ) = ctx.saved_tensor()
                 w2_shape = w2.shape
                 w2_dtype = w2.dtype
@@ -2206,6 +2269,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 ) = ctx.saved_tensor()
                 w2_shape = ctx._w2_shape
                 w2_dtype = ctx._w2_dtype
@@ -2220,6 +2284,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
+                    router_score_src_idx,
                 ) = ctx.saved_tensor()
                 w2_shape = w2.shape
                 w2_dtype = w2.dtype
@@ -2699,6 +2764,17 @@ class _DownProjection(torch.autograd.Function):
         elif not is_varlen_K:
             ds = ds.view(T, K)
 
+        router_score_source_grad = None
+        if ctx._has_router_score_source:
+            # score_src_idx covers only real routes; the metadata score buffer may
+            # include aligned padding.  The scatter helper zero-fills source slots
+            # not represented by a received route, matching the former carrier.
+            router_score_source_grad = _scatter_router_scores_i32(
+                ds.contiguous(),
+                router_score_src_idx,
+                ctx._router_score_source_numel,
+            ).reshape(ctx._router_score_source_shape)
+
         if fp8_combine_grad_handle is not None:
             fp8_combine_grad_handle.pop("data", None)
             fp8_combine_grad_handle.pop("scale", None)
@@ -2712,10 +2788,15 @@ class _DownProjection(torch.autograd.Function):
             grads.append(None)
         if ctx._has_b2:
             grads.append(db2)
-        grads.extend([ds if ctx._topk_scores_needs_grad else None, None, None])  # topk_scores, selected_experts, expert_frequency_offset
+        topk_scores_grad = None if ctx._has_router_score_source else ds if ctx._topk_scores_needs_grad else None
+        grads.extend([topk_scores_grad, None, None])  # topk_scores, selected_experts, expert_frequency_offset
         grads.extend([None, None, None])  # x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
         if ctx._has_num_activated:
             grads.append(None)
+        if ctx._has_router_score_source:
+            # Optional tensor inputs are returned only when present; fp8_config is
+            # non-tensor and therefore has no corresponding Paddle PyLayer slot.
+            grads.extend([router_score_source_grad, None])
         if ctx._wgrad_w2_accumulator is not None:
             _apply_weight_backward_hook(ctx._w2_original)
         return tuple(grads)

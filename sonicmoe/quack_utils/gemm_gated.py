@@ -94,6 +94,23 @@ def _stream_matches_current(stream) -> bool:
 
 
 _GATED_FFI_B_VIEW_ATTR = "_sonic_gated_tvm_ffi_b_view"
+_GATED_FFI_LAST_PLAN_ATTR = "_sonic_gated_tvm_ffi_last_plan"
+
+
+class _PreparedGatedTvmFfiPlan(NamedTuple):
+    """Pointer-stable weight state for the Sonic gated FFI launch."""
+
+    b_view: Tensor
+    b_data_ptr: int
+    b_view_data_ptr: int
+    compiled_fn: Callable
+    gemm_cls: type
+    scheduler_args: object
+    activation: str
+    epilogue_quant: bool
+    postact_quant: bool
+    swiglu_clamp_value: float
+    postact_bf16_trunc: bool
 
 
 def prepare_gated_tvm_ffi_weight(B: Tensor) -> Tensor:
@@ -398,6 +415,119 @@ def _static_gated_scheduler_args(
     return make_scheduler_args(max_active_clusters, max_swizzle_size, None)
 
 
+def _launch_prepared_gated_tvm_ffi(
+    plan: _PreparedGatedTvmFfiPlan,
+    A: Tensor,
+    D: Tensor,
+    PostAct: Tensor,
+    cu_seqlens_m: Tensor,
+    A_idx: Tensor,
+    a_scales: Tensor,
+    b_scales: Tensor,
+    z_scale_out: Optional[Tensor],
+    postact_scale_out: Tensor,
+) -> None:
+    """Build only pointer-bearing arguments, then issue one prepared FFI call."""
+    epi_kwargs = {"mPostActScaleIsa": postact_scale_out}
+    if plan.epilogue_quant:
+        epi_kwargs["mZScale"] = z_scale_out
+    epilogue_args = plan.gemm_cls.EpilogueArguments(
+        PostAct,
+        None,
+        swiglu_clamp_value=None,
+        postact_bf16_trunc=None,
+        mRowVecBroadcast=None,
+        mColVecBroadcast=None,
+        rounding_mode=None,
+        sr_seed=None,
+        **epi_kwargs,
+    )
+    # These structures contain current-microbatch pointers and must not be
+    # cached across PP/VPP contexts.
+    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
+    plan.compiled_fn(
+        A,
+        plan.b_view,
+        D,
+        None,
+        epilogue_args,
+        plan.scheduler_args,
+        varlen_args,
+        a_scales,
+        b_scales,
+    )
+
+
+def try_gemm_gated_tvm_ffi_sonic_prepared(
+    A: Tensor,
+    B: Tensor,
+    D: Optional[Tensor],
+    PostAct: Optional[Tensor],
+    *,
+    activation: str,
+    cu_seqlens_m: Optional[Tensor],
+    A_idx: Optional[Tensor],
+    a_scales: Optional[Tensor],
+    b_scales: Optional[Tensor],
+    z_scale_out: Optional[Tensor],
+    postact_scale_out: Optional[Tensor],
+    swiglu_clamp_value: float,
+    postact_bf16_trunc: bool,
+    current_stream=None,
+) -> bool:
+    """Issue a previously validated plan from Sonic's preallocated fast path.
+
+    The caller has already validated dynamic output shapes and dtypes. The plan
+    owns only the persistent quantized-weight view and pointer-free compiled
+    state; all microbatch-dependent pointer structures are rebuilt above.
+    """
+    if os.getenv("SONIC_MOE_DISABLE_GATED_TVM_FFI", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return False
+    plan = getattr(B, _GATED_FFI_LAST_PLAN_ATTR, None)
+    if not isinstance(plan, _PreparedGatedTvmFfiPlan):
+        return False
+    epilogue_quant = z_scale_out is not None
+    if (
+        D is None
+        or PostAct is None
+        or cu_seqlens_m is None
+        or A_idx is None
+        or a_scales is None
+        or b_scales is None
+        or postact_scale_out is None
+        or plan.activation != activation
+        or plan.epilogue_quant != epilogue_quant
+        or not plan.postact_quant
+        or plan.swiglu_clamp_value != float(swiglu_clamp_value)
+        or plan.postact_bf16_trunc != bool(postact_bf16_trunc)
+        or not _stream_matches_current(current_stream)
+    ):
+        return False
+    # Quantization normally replaces B wholesale. Detect uncommon in-place
+    # storage rebinding so a stale prepared view can never launch.
+    if int(B.data_ptr()) != plan.b_data_ptr or int(plan.b_view.data_ptr()) != plan.b_view_data_ptr:
+        setattr(B, _GATED_FFI_LAST_PLAN_ATTR, None)
+        return False
+    _launch_prepared_gated_tvm_ffi(
+        plan,
+        A,
+        D,
+        PostAct,
+        cu_seqlens_m,
+        A_idx,
+        a_scales,
+        b_scales,
+        z_scale_out,
+        postact_scale_out,
+    )
+    return True
+
+
 def try_gemm_gated_tvm_ffi_sonic_fast(
     A: Tensor,
     B: Tensor,
@@ -470,6 +600,7 @@ def try_gemm_gated_tvm_ffi_sonic_fast(
     E, N, K = B.shape
     total_m = A_idx.shape[0]
     epilogue_quant = z_scale_out is not None
+    postact_quant = postact_scale_out is not None
     expected_d_dtype = (
         torch.float8_e4m3fn if epilogue_quant else torch.bfloat16
     )
@@ -563,37 +694,37 @@ def try_gemm_gated_tvm_ffi_sonic_fast(
     if _COMPILE_ONLY:
         return True
 
-    epi_kwargs = {"mPostActScaleIsa": postact_scale_out}
-    if epilogue_quant:
-        epi_kwargs["mZScale"] = z_scale_out
-    epilogue_args = GemmCls.EpilogueArguments(
-        PostAct,
-        None,
-        swiglu_clamp_value=None,
-        postact_bf16_trunc=None,
-        mRowVecBroadcast=None,
-        mColVecBroadcast=None,
-        rounding_mode=None,
-        sr_seed=None,
-        **epi_kwargs,
-    )
     scheduler_args = _static_gated_scheduler_args(
         cluster_M,
         cluster_N,
         max_swizzle_size,
         int(torch.cuda.current_device()),
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, None, A_idx)
-    compiled_fn(
+    plan = _PreparedGatedTvmFfiPlan(
+        b_view=B_ffi,
+        b_data_ptr=int(B.data_ptr()),
+        b_view_data_ptr=int(B_ffi.data_ptr()),
+        compiled_fn=compiled_fn,
+        gemm_cls=GemmCls,
+        scheduler_args=scheduler_args,
+        activation=activation,
+        epilogue_quant=epilogue_quant,
+        postact_quant=postact_quant,
+        swiglu_clamp_value=float(swiglu_clamp_value),
+        postact_bf16_trunc=bool(postact_bf16_trunc),
+    )
+    setattr(B, _GATED_FFI_LAST_PLAN_ATTR, plan)
+    _launch_prepared_gated_tvm_ffi(
+        plan,
         A,
-        B_ffi,
         D,
-        None,
-        epilogue_args,
-        scheduler_args,
-        varlen_args,
+        PostAct,
+        cu_seqlens_m,
+        A_idx,
         a_scales,
         b_scales,
+        z_scale_out,
+        postact_scale_out,
     )
     return True
 

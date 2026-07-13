@@ -182,6 +182,124 @@ def test_gemm_gated_tvm_ffi_matches_executor_quantized_postact(
         _assert_byte_exact(lhs, rhs, label)
 
 
+@pytest.mark.parametrize("epilogue_mode", ["postact", "combined"], ids=["postact", "combined"])
+def test_gemm_gated_prepared_plan_rebuilds_microbatch_pointers(epilogue_mode):
+    """A prepared plan never retains activation, routing, scale, or output pointers."""
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+        precompute_weight_fp8_for_fused_gated,
+        quantize_and_pack_activation,
+    )
+    from sonicmoe.quack_utils.gemm_gated import prepare_gated_tvm_ffi_weight, try_gemm_gated_tvm_ffi_sonic_prepared
+    from sonicmoe.quack_utils.gemm_interface import gemm_gated
+
+    T, H, I, E, topk = _SHAPE
+    TK = T * topk // E
+    total_m = TK * E
+    rng = np.random.RandomState(314159)
+    w1 = torch.from_numpy((rng.randn(2 * I, H, E).astype(np.float32) * 0.02)).to("cuda", dtype=torch.bfloat16)
+    w_fp8, b_scales = precompute_weight_fp8_for_fused_gated(w1)
+    b = prepare_gated_tvm_ffi_weight(w_fp8.mT)
+
+    def make_inputs(seed):
+        local_rng = np.random.RandomState(seed)
+        x = torch.from_numpy((local_rng.randn(total_m, H).astype(np.float32) * 0.02)).to("cuda", dtype=torch.bfloat16)
+        x_fp8, a_scales = quantize_and_pack_activation(x)
+        a_idx = torch.arange(total_m - 1, -1, -1, dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.arange(0, (E + 1) * TK, TK, dtype=torch.int32, device="cuda")
+        return x_fp8, a_scales, a_idx, cu_seqlens
+
+    def allocate_outputs():
+        z_scale = (
+            torch.empty((total_m, 2 * I // 32), dtype=torch.uint8, device="cuda")
+            if epilogue_mode == "combined"
+            else None
+        )
+        return (
+            torch.empty(
+                (total_m, 2 * I),
+                dtype=(torch.float8_e4m3fn if epilogue_mode == "combined" else torch.bfloat16),
+                device="cuda",
+            ),
+            torch.empty((total_m, I), dtype=torch.float8_e4m3fn, device="cuda"),
+            z_scale,
+            torch.empty(
+                (total_m // 128, I // 128, 512),
+                dtype=torch.uint8,
+                device="cuda",
+            ),
+        )
+
+    # Populate the static plan through the fully validated path.
+    x1, scales1, idx1, offsets1 = make_inputs(1)
+    z1, y1, z_scale1, y1_scale1 = allocate_outputs()
+    gemm_gated(
+        x1,
+        b,
+        activation="swiglu",
+        preact_out=z1,
+        postact_out=y1,
+        out_dtype=z1.dtype,
+        postact_dtype=y1.dtype,
+        cu_seqlens_m=offsets1,
+        A_idx=idx1,
+        a_scales=scales1,
+        b_scales=b_scales,
+        z_scale_out=z_scale1,
+        postact_scale_out=y1_scale1,
+        tuned=False,
+        current_stream=_current_raw_stream(),
+        b_pretransposed=True,
+    )
+    torch.cuda.synchronize()
+
+    # Use distinct tensors for every dynamic argument. The executor provides
+    # the expected bytes; the prepared launch must write only the new outputs.
+    x2, scales2, idx2, offsets2 = make_inputs(2)
+    expected = allocate_outputs()
+    with _disable_gated_tvm_ffi():
+        gemm_gated(
+            x2,
+            b,
+            activation="swiglu",
+            preact_out=expected[0],
+            postact_out=expected[1],
+            out_dtype=expected[0].dtype,
+            postact_dtype=expected[1].dtype,
+            cu_seqlens_m=offsets2,
+            A_idx=idx2,
+            a_scales=scales2,
+            b_scales=b_scales,
+            z_scale_out=expected[2],
+            postact_scale_out=expected[3],
+            tuned=False,
+            current_stream=_current_raw_stream(),
+            b_pretransposed=True,
+        )
+    actual = allocate_outputs()
+    launched = try_gemm_gated_tvm_ffi_sonic_prepared(
+        x2,
+        b,
+        actual[0],
+        actual[1],
+        activation="swiglu",
+        cu_seqlens_m=offsets2,
+        A_idx=idx2,
+        a_scales=scales2,
+        b_scales=b_scales,
+        z_scale_out=actual[2],
+        postact_scale_out=actual[3],
+        swiglu_clamp_value=0.0,
+        postact_bf16_trunc=False,
+        current_stream=_current_raw_stream(),
+    )
+    assert launched
+    torch.cuda.synchronize()
+    labels = ("z", "y1", "z_scale", "y1_scale")
+    for label, lhs, rhs in zip(labels, actual, expected):
+        if lhs is not None:
+            _assert_byte_exact(lhs, rhs, label)
+
+
 def test_gemm_dgated_tvm_ffi_matches_executor_fp8_preact_reduce():
     from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
         precompute_weight_fp8_for_direct_fused_dgated,

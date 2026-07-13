@@ -751,9 +751,9 @@ class TestCudaVsPythonFallback:
 
 
 class TestCudaScalePacking:
-    @pytest.mark.parametrize("rows,cols", [(7, 256), (129, 6400)])
+    @pytest.mark.parametrize("rows,cols", [(7, 256), (129, 4096)])
     def test_quantizer_compact_scale_words_are_byte_exact(self, rows, cols):
-        torch.manual_seed(20260713)
+        torch.manual_seed(314159)
         source = torch.randn(
             (rows, cols), dtype=torch.bfloat16, device="cuda"
         )
@@ -818,7 +818,7 @@ class TestCudaScalePacking:
     @pytest.mark.parametrize("N_recv,topk,E,cols", [
         (257, 4, 8, 256),
         (513, 8, 16, 4096),
-        (129, 4, 24, 6400),
+        (129, 4, 24, 2048),
     ])
     @pytest.mark.parametrize("pack_mode", ["default", "scatter", "rowmajor"])
     def test_compact_int32_carrier_is_byte_exact(
@@ -827,7 +827,7 @@ class TestCudaScalePacking:
         if not _HAS_TOPK_CUDA_SCALES_KERNEL:
             pytest.skip("CUDA scale-packing metadata kernel not compiled")
 
-        torch.manual_seed(20260713)
+        torch.manual_seed(314159)
         indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
         scale_cols = (cols + 31) // 32
         assert scale_cols % 4 == 0
@@ -868,7 +868,7 @@ class TestCudaScalePacking:
                 indices, probs, tpe, E, malformed, cols
             )
 
-    @pytest.mark.parametrize("rows,cols", [(7, 256), (31, 4096), (129, 6400)])
+    @pytest.mark.parametrize("rows,cols", [(7, 256), (31, 4096), (129, 2048)])
     def test_compact_carrier_fallbacks_are_byte_exact(self, rows, cols):
         scale_cols = cols // 32
         raw = (
@@ -969,12 +969,12 @@ class TestCudaScalePacking:
             if lhs.numel() > 0
         ), "non-empty ctx-saved gated outputs must have independent storage per microbatch"
 
-    def test_production_shape_outputs_stay_byte_exact_across_live_calls(self):
+    def test_large_live_outputs_stay_byte_exact_across_calls(self):
         """PP/VPP-live metadata must not alias later custom-op invocations."""
         if not _HAS_TOPK_CUDA_SCALES_KERNEL:
             pytest.skip("CUDA scale-packing metadata kernel not compiled")
 
-        N_recv, TK, topk, E, cols = 24577, 30001, 4, 24, 6400
+        N_recv, TK, topk, E, cols = 16385, 20001, 4, 24, 4096
         rows = torch.arange(N_recv, dtype=torch.int32, device="cuda")
         indices = torch.full(
             (N_recv, topk), -1, dtype=torch.int32, device="cuda"

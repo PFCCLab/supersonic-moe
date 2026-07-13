@@ -1391,6 +1391,157 @@ def test_sonicmoe_bf16_backward_vs_gold(T, H, I, E, K, seed):
     assert r_dw2 < BF16_DW_RRMSE, f"dw2 RRMSE {r_dw2:.6f} >= {BF16_DW_RRMSE}"
 
 
+def test_down_projection_router_score_bridge_bit_exact():
+    """The fused DeepEP score edge matches the standalone carrier exactly."""
+    from sonicmoe.enums import ActivationType
+    from sonicmoe.functional import _DownProjection, _UpProjection
+    from sonicmoe.functional import utils as _fp8_utils
+    from sonicmoe.functional.triton_kernels import TC_topk_router_metadata_triton
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import _gather_router_scores_i32, _scatter_router_scores_i32
+
+    T, H, I, E, K = 256, 768, 384, 8, 2
+    TK = T * K
+    N_PAD = 128
+    x, w1_split, w2, topk_indices, source_values = _make_test_data(T, H, I, E, K, seed=314159)
+    w1_param, w2_param = _convert_weights_for_sonicmoe(w1_split, w2)
+    # The current functional API receives expert-major Sonic weights directly.
+    w1_func = w1_param
+    w2_func = w2_param
+    w2_func.stop_gradient = False
+
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device="cuda")
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device="cuda")
+    expert_frequency = torch.empty(E, dtype=torch.int32, device="cuda")
+    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device="cuda")
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device="cuda")
+    TC_topk_router_metadata_triton(
+        topk_indices,
+        E,
+        expert_frequency,
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+    )
+    token_offsets = torch.arange(0, TK + 1, K, dtype=torch.int32, device="cuda")
+
+    old_env = os.environ.get("SONIC_MOE_FP8_MODE")
+    old_fp8_active = _fp8_utils._IS_FP8_ACTIVE
+    os.environ["SONIC_MOE_FP8_MODE"] = "off"
+    _fp8_utils._IS_FP8_ACTIVE = False
+    try:
+        y1, z = _UpProjection.apply(
+            x,
+            w1_func,
+            None,
+            expert_frequency_offset,
+            TK,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            None,
+            False,
+            ActivationType.SWIGLU,
+            False,
+            False,
+        )
+        y1 = y1.detach()
+        z = z.detach()
+        z.stop_gradient = False
+
+        # DeepEP may reorder received rows.  Reverse order makes an accidental
+        # identity mapping visible while keeping every source index unique.
+        score_src_idx = torch.arange(TK - 1, -1, -1, dtype=torch.int32, device="cuda")
+        metadata_values = _gather_router_scores_i32(source_values.detach().reshape([-1]), score_src_idx)
+        # Real DeepEP metadata is block-aligned and can contain score padding.
+        # Keep source indices route-sized while exercising a larger score buffer.
+        metadata_values = torch.cat(
+            [
+                metadata_values,
+                torch.zeros(N_PAD, dtype=metadata_values.dtype, device="cuda"),
+            ]
+        )
+        grad_out = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
+
+        metadata_reference = metadata_values.detach().clone()
+        metadata_reference.stop_gradient = False
+        z_reference = z.detach().clone()
+        z_reference.stop_gradient = False
+        w2_reference = w2_func.detach().clone()
+        w2_reference.stop_gradient = False
+        out_reference = _DownProjection.apply(
+            y1,
+            z_reference,
+            w2_reference,
+            None,
+            metadata_reference,
+            s_scatter_idx,
+            expert_frequency_offset,
+            T,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            token_offsets,
+            True,
+            ActivationType.SWIGLU,
+            None,
+        )
+        out_reference.backward(grad_out)
+        expected_source_grad = _scatter_router_scores_i32(
+            metadata_reference.grad.contiguous(), score_src_idx, TK
+        ).reshape([T, K])
+        expected_z_grad = z_reference.grad.detach().clone()
+        expected_w2_grad = w2_reference.grad.detach().clone()
+
+        source_fused = source_values.detach().clone()
+        source_fused.stop_gradient = False
+        metadata_fused = metadata_values.detach().clone()
+        z_fused = z.detach().clone()
+        z_fused.stop_gradient = False
+        w2_fused = w2_func.detach().clone()
+        w2_fused.stop_gradient = False
+        out_fused = _DownProjection.apply(
+            y1,
+            z_fused,
+            w2_fused,
+            None,
+            metadata_fused,
+            s_scatter_idx,
+            expert_frequency_offset,
+            T,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            token_offsets,
+            True,
+            ActivationType.SWIGLU,
+            None,
+            None,
+            None,
+            source_fused,
+            score_src_idx,
+        )
+        out_fused.backward(grad_out)
+
+        assert bool(torch.all(out_fused.view(torch.uint8) == out_reference.view(torch.uint8)).item())
+        assert bool(torch.all(source_fused.grad.view(torch.uint8) == expected_source_grad.view(torch.uint8)).item())
+        assert bool(torch.all(z_fused.grad.view(torch.uint8) == expected_z_grad.view(torch.uint8)).item())
+        assert bool(torch.all(w2_fused.grad.view(torch.uint8) == expected_w2_grad.view(torch.uint8)).item())
+        assert metadata_fused.grad is None
+    finally:
+        _fp8_utils._IS_FP8_ACTIVE = old_fp8_active
+        if old_env is None:
+            os.environ.pop("SONIC_MOE_FP8_MODE", None)
+        else:
+            os.environ["SONIC_MOE_FP8_MODE"] = old_env
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Test 14: Gold reference handles all-same-expert routing
 # ═══════════════════════════════════════════════════════════════════════════
