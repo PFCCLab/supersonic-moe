@@ -1533,6 +1533,8 @@ def test_down_projection_router_score_bridge_bit_exact():
         assert bool(torch.all(source_fused.grad.view(torch.uint8) == expected_source_grad.view(torch.uint8)).item())
         assert bool(torch.all(z_fused.grad.view(torch.uint8) == expected_z_grad.view(torch.uint8)).item())
         assert bool(torch.all(w2_fused.grad.view(torch.uint8) == expected_w2_grad.view(torch.uint8)).item())
+        assert source_fused.stop_gradient is False
+        assert metadata_fused.stop_gradient is True
         assert metadata_fused.grad is None
     finally:
         _fp8_utils._IS_FP8_ACTIVE = old_fp8_active

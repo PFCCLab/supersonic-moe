@@ -320,6 +320,63 @@ def test_bf16_wgrad_default_correctness_and_determinism(
     torch.testing.assert_close(first.float(), _gold(case).float(), atol=3e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("variant", ["beta", "tma_add"])
+def test_bf16_wgrad_rejects_transposed_w2_main_grad(variant: str) -> None:
+    """Down-projection main_grad is already Sonic [E,H,I], not [E,I,H]."""
+    from sonicmoe.quack_utils.bf16_wgrad_gemm import (
+        bf16_wgrad_gemm_varlen_k_accumulate,
+        bf16_wgrad_gemm_varlen_k_tma_add,
+    )
+
+    case = _make_case(
+        M=256,
+        N=128,
+        E=2,
+        tokens_per_expert=128,
+        source_tokens=256,
+        layout="contiguous",
+    )
+    fn = (
+        bf16_wgrad_gemm_varlen_k_accumulate
+        if variant == "beta"
+        else bf16_wgrad_gemm_varlen_k_tma_add
+    )
+    main_grad = torch.zeros(
+        (case["E"], case["M"], case["N"]),
+        dtype=torch.float32,
+        device=case["device"],
+    )
+
+    fn(
+        case["A"],
+        case["B"],
+        case["cu"],
+        case["A_idx"],
+        accumulator=main_grad,
+        M=case["M"],
+        N=case["N"],
+        total_K=case["total_K"],
+        num_experts=case["E"],
+        device=case["device"],
+    )
+    torch.cuda.synchronize()
+    assert float(main_grad.norm()) > 0.0
+
+    with pytest.raises(ValueError, match="output shape mismatch"):
+        fn(
+            case["A"],
+            case["B"],
+            case["cu"],
+            case["A_idx"],
+            accumulator=main_grad.permute(0, 2, 1),
+            M=case["M"],
+            N=case["N"],
+            total_K=case["total_K"],
+            num_experts=case["E"],
+            device=case["device"],
+        )
+
+
 def test_bf16_wgrad_auto_large_shape_matches_reference_config() -> None:
     case = _make_case(
         M=4096,
