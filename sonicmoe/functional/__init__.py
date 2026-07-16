@@ -2534,10 +2534,8 @@ class _DownProjection(torch.autograd.Function):
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
                         if _wgrad_accum_w2 is not None:
                             # BF16 wgrad + fp32 accumulate.
-                            # Fleet converts both w2 and main_grad to Sonic layout
-                            # [E, H, I] before forward. The GEMM output has that same
-                            # logical shape, so writing through a transposed view would
-                            # silently corrupt the persistent optimizer buffer.
+                            # Fleet keeps w2 main_grad in grouped layout [E, I, H].
+                            # Present a Sonic-layout [E, H, I] view to the wgrad kernel.
                             y1s_wgrad = (
                                 y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
                             )
@@ -2547,7 +2545,7 @@ class _DownProjection(torch.autograd.Function):
                                     y1s_wgrad,
                                     expert_frequency_offset,
                                     x_gather_idx,
-                                    accumulator=_wgrad_accum_w2,
+                                    accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                                     M=dout.shape[1],
                                     N=w2_shape[2],
                                     total_K=TK_wgrad,
@@ -2560,7 +2558,7 @@ class _DownProjection(torch.autograd.Function):
                                     y1s_wgrad,
                                     expert_frequency_offset,
                                     x_gather_idx,
-                                    accumulator=_wgrad_accum_w2,
+                                    accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                                     M=dout.shape[1],
                                     N=w2_shape[2],
                                     total_K=TK_wgrad,
@@ -2710,7 +2708,7 @@ class _DownProjection(torch.autograd.Function):
                             y1s_wgrad,
                             expert_frequency_offset,
                             x_gather_idx,
-                            accumulator=_wgrad_accum_w2,
+                            accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                             M=dout.shape[1],
                             N=w2.shape[2],
                             total_K=x_gather_idx.shape[0],
@@ -2723,7 +2721,7 @@ class _DownProjection(torch.autograd.Function):
                             y1s_wgrad,
                             expert_frequency_offset,
                             x_gather_idx,
-                            accumulator=_wgrad_accum_w2,
+                            accumulator=_wgrad_accum_w2.permute(0, 2, 1),
                             M=dout.shape[1],
                             N=w2.shape[2],
                             total_K=x_gather_idx.shape[0],
