@@ -378,8 +378,9 @@ def gemm_gated(
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    if z_scale_out is not None or postact_scale_out is not None:
-        # Epilogue quant (z or postact/y1): bypass custom_op, call tuned fn directly (untuned for blockscaled).
+    if z_scale_out is not None or postact_scale_out is not None or b_pretransposed:
+        # Epilogue quant and pretransposed weights bypass the custom op so the
+        # tuned implementation receives the output-scale and layout metadata.
         gemm_gated_tuned.fn(
             A,
             B,
