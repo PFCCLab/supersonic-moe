@@ -3782,7 +3782,11 @@ def iso32_dual_quantize_weight_3d(
     )
     src_2d = src_enk.reshape(E * N, K).contiguous()
     fp8_2d, row_scales, col_scales = iso32_dual_quantize_varlen(src_2d, E * N, K)
-    return fp8_2d.reshape(E, N, K), row_scales, col_scales
+    fp8_enk = fp8_2d.reshape(E, N, K)
+    # Match the 1x32 path: cache the metadata-only descriptor used by the
+    # specialized/prepared gated TVM-FFI schedule.
+    setattr(fp8_enk, _GATED_FFI_B_VIEW_ATTR, fp8_enk.permute(1, 2, 0))
+    return fp8_enk, row_scales, col_scales
 
 
 def _cache_iso32_w1(w1: torch.Tensor) -> None:

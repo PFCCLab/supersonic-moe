@@ -1417,13 +1417,13 @@ class _UpProjection(torch.autograd.Function):
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
             )
 
-        _log_stage_memory(
-            f"In forward, after up-gate gemm, up_gate_output shape:{z.shape}, dtype: {z.dtype}"
-        )
+        # _log_stage_memory(
+        #     f"In forward, after up-gate gemm, up_gate_output shape:{z.shape}, dtype: {z.dtype}"
+        # )
         swiglu_output = y1_fp8_fused if y1_fp8_fused is not None else y1
-        _log_stage_memory(
-            f"In forward, after swiglu, swiglu_output:{swiglu_output.shape}, dtype: {swiglu_output.dtype}"
-        )
+        # _log_stage_memory(
+        #     f"In forward, after swiglu, swiglu_output:{swiglu_output.shape}, dtype: {swiglu_output.dtype}"
+        # )
 
         ctx.T = T
         ctx.TK = TK
@@ -1745,7 +1745,7 @@ class _UpProjection(torch.autograd.Function):
 
                 # Phase 2: Free dz bf16 storage (~384 MiB at reference shape).
                 # FP8 wgrad already freed it in step 2 above; BF16 path frees here.
-                _log_stage_memory("In backward, after w1 grad")
+                # _log_stage_memory("In backward, after w1 grad")
 
                 if not ctx._fp8_cfg.fp8_wgrad:
                     # dz.untyped_storage().resize_(0)
@@ -1841,7 +1841,7 @@ class _UpProjection(torch.autograd.Function):
                     cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
                     tuned=False,
                 )
-                _log_stage_memory("In backward, after w1 grad")
+                # _log_stage_memory("In backward, after w1 grad")
         else:
             raise RuntimeError(
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
@@ -1858,10 +1858,10 @@ class _UpProjection(torch.autograd.Function):
             H=H,
             is_varlen_K=is_varlen_K,
         )
-        _log_stage_memory(
-            f"In backward, after up_gate gemm bwd, d_up_gate_input shape: {dx_reduced.shape}, dtype:{dx_reduced.dtype}"
-        )
-        _log_stage_memory("MoE expert compute backward end")
+        # _log_stage_memory(
+        #     f"In backward, after up_gate gemm bwd, d_up_gate_input shape: {dx_reduced.shape}, dtype:{dx_reduced.dtype}"
+        # )
+        # _log_stage_memory("MoE expert compute backward end")
 
         # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum)
         grads = [dx_reduced]
@@ -2037,9 +2037,9 @@ class _DownProjection(torch.autograd.Function):
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
             )
 
-        _log_stage_memory(
-            f"In forward, after down gemm, down_output shape: {y2_for_router.shape}, dtype: {y2_for_router.dtype}"
-        )
+        # _log_stage_memory(
+        #     f"In forward, after down gemm, down_output shape: {y2_for_router.shape}, dtype: {y2_for_router.dtype}"
+        # )
 
         # Output must always be bf16 (z may be fp8 when epilogue_quant is active).
         o = torch.empty(T, H, device=z.device, dtype=torch.bfloat16)
@@ -2057,9 +2057,9 @@ class _DownProjection(torch.autograd.Function):
         )
         del y2_for_router
         del y2
-        _log_stage_memory(
-            f"In forward, after local combine, expert_out shape:{o.shape}, dtype: {o.dtype}"
-        )
+        # _log_stage_memory(
+        #     f"In forward, after local combine, expert_out shape:{o.shape}, dtype: {o.dtype}"
+        # )
 
         ctx.T = T
         ctx.K = K
@@ -2232,7 +2232,7 @@ class _DownProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout: torch.Tensor):
-        _log_stage_memory("MoE expert compute backward start")
+        # _log_stage_memory("MoE expert compute backward start")
         T = ctx.T
         K = ctx.K
         stream_id = ctx.stream_id
@@ -2465,10 +2465,10 @@ class _DownProjection(torch.autograd.Function):
                         preact_scales=z_raw_scales_u8 if use_fp8_preact else None,
                         swiglu_clamp_value=ctx._fp8_cfg.swiglu_clamp_value,
                     )
-                    _log_stage_memory(
-                        "In backward, after down gemm bwd + swiglu bwd, "
-                        f"d_swiglu_input shape:{dz.shape}, dtype:{dz.dtype}"
-                    )
+                    # _log_stage_memory(
+                    #     "In backward, after down gemm bwd + swiglu bwd, "
+                    #     f"d_swiglu_input shape:{dz.shape}, dtype:{dz.dtype}"
+                    # )
                     ds = colvec_reduce_partial.sum(dim=-1)
                     del dout_fp8, dout_scales, z, colvec_reduce_partial
                     # Release FP8 preact tensors from ctx (z_fp8 ~192 MiB + scales ~6 MiB).
@@ -2623,7 +2623,7 @@ class _DownProjection(torch.autograd.Function):
                     if not ctx._fp8_cfg.fp8_wgrad:
                         dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
-                    _log_stage_memory("In backward, after w2 grad")
+                    # _log_stage_memory("In backward, after w2 grad")
                     ds = ds[s_reverse_scatter_idx]
                 else:
                     # w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
@@ -2639,9 +2639,9 @@ class _DownProjection(torch.autograd.Function):
                         out_dtype=torch.bfloat16,
                         assume_aligned=ctx._alignment_assumed_flag,
                     )
-                    _log_stage_memory(
-                        f"In backward, after down gemm bwd, d_swiglu_output shape:{dy1.shape}, dtype:{dy1.dtype}"
-                    )
+                    # _log_stage_memory(
+                    #     f"In backward, after down gemm bwd, d_swiglu_output shape:{dy1.shape}, dtype:{dy1.dtype}"
+                    # )
                     del dout_fp8, dout_scales
                     # Eagerly release w2 FP8 cache (~37 MiB) — actgrad GEMM done.
                     del w2_fp8, w2_scales
@@ -2683,9 +2683,9 @@ class _DownProjection(torch.autograd.Function):
                             )
                         else:
                             dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
-                    _log_stage_memory(
-                        f"In backward, after swiglu bwd, d_swiglu_input shape:{dz.shape}, dtype:{dz.dtype}"
-                    )
+                    # _log_stage_memory(
+                    #     f"In backward, after swiglu bwd, d_swiglu_input shape:{dz.shape}, dtype:{dz.dtype}"
+                    # )
                     del dy1
 
 
@@ -2706,7 +2706,7 @@ class _DownProjection(torch.autograd.Function):
                         device=dout.device,
                     )
                     del y1s_wgrad
-                    _log_stage_memory("In backward, after w2 grad")
+                    # _log_stage_memory("In backward, after w2 grad")
                     ds = ds[s_reverse_scatter_idx]
             elif ctx._fp8_enabled_flag and not ctx._alignment_assumed_flag:
                 # FP8 enabled but non-aligned: unreachable in production
@@ -2736,10 +2736,10 @@ class _DownProjection(torch.autograd.Function):
                     tuned=False,
                     swiglu_clamp_value=ctx._fp8_cfg.swiglu_clamp_value,
                 )
-                _log_stage_memory(
-                    "In backward, after down gemm bwd + swiglu bwd, "
-                    f"d_swiglu_input shape:{dz.shape}, dtype:{dz.dtype}"
-                )
+                # _log_stage_memory(
+                #     "In backward, after down gemm bwd + swiglu bwd, "
+                #     f"d_swiglu_input shape:{dz.shape}, dtype:{dz.dtype}"
+                # )
 
                 y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
                 _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
@@ -2786,7 +2786,7 @@ class _DownProjection(torch.autograd.Function):
                         num_experts=w2.shape[0],
                         device=dout.device,
                     )
-                _log_stage_memory("In backward, after w2 grad")
+                # _log_stage_memory("In backward, after w2 grad")
                 ds = ds[s_reverse_scatter_idx]
         else:
             raise RuntimeError(
@@ -2879,7 +2879,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
         TC_topk_router_metadata_triton(
             topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
         )
-        _log_stage_memory("forward:router-metadata")
+        # _log_stage_memory("forward:router-metadata")
 
         needs_preact = fp8_protocol is not None and _upproj_epilogue_precision() == "fp8"
         # Inference routing is independent of training: always do a real
@@ -2934,7 +2934,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
                 dynamic_scheduler=False,
                 swiglu_clamp_value=_get_fp8_config().swiglu_clamp_value,
             )
-        _log_stage_memory("forward:up-proj")
+        # _log_stage_memory("forward:up-proj")
 
         # In full-pipeline FP8, y1 stays fp8 for down-proj.
         if _fp8_enabled() and not needs_preact:
@@ -2968,7 +2968,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
                     restored_out=restored_out,
                     output_dtype=x.dtype,
                 )
-            _log_stage_memory("forward:fp8-boundary")
+            # _log_stage_memory("forward:fp8-boundary")
 
         del z
         _reset_stage_memory_probe()
@@ -3021,7 +3021,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             H=H,
             is_varlen_K=False,
         )
-        _log_stage_memory("forward:down-proj-router")
+        # _log_stage_memory("forward:down-proj-router")
 
     return o, router_logits, expert_frequency
 
@@ -3082,7 +3082,7 @@ def moe_TC_softmax_topk_layer(
     TC_topk_router_metadata_triton(
         topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
     )
-    _log_stage_memory("forward:router-metadata")
+    # _log_stage_memory("forward:router-metadata")
 
     T = x.size(0)
 
@@ -3119,7 +3119,7 @@ def moe_TC_softmax_topk_layer(
         use_low_precision_postact_buffer,
         fp8_config=fp8_config,
     )
-    _log_stage_memory("forward:up-proj")
+    # _log_stage_memory("forward:up-proj")
 
     if fp8_protocol is not None and _upproj_epilogue_precision() == "fp8":
         _reset_stage_memory_probe()
@@ -3164,7 +3164,7 @@ def moe_TC_softmax_topk_layer(
                 return_scales=False,
                 use_ste=not is_inference_mode_enabled,
             )
-        _log_stage_memory("forward:fp8-boundary")
+        # _log_stage_memory("forward:fp8-boundary")
 
     _reset_stage_memory_probe()
     o = _DownProjection.apply(
@@ -3187,7 +3187,7 @@ def moe_TC_softmax_topk_layer(
         fp8_protocol,
         fp8_config=fp8_config,
     )
-    _log_stage_memory("forward:down-proj-router")
+    # _log_stage_memory("forward:down-proj-router")
 
     return o, router_logits, expert_frequency
 

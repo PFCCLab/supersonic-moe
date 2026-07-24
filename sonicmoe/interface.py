@@ -26,6 +26,7 @@ from .ernie_compat.mlp_node_v2 import (
 from .functional import (
     _DownProjection,
     _UpProjection,
+    attach_preallocated_gated_outputs,
 )
 from .functional.utils import enable_fp8
 
@@ -49,6 +50,17 @@ def _log_stage_memory(stage: str) -> None:
         f"peak_alloc_mib={paddle.cuda.max_memory_allocated() / mib:.2f}, "
         f"peak_reserved_mib={paddle.cuda.max_memory_reserved() / mib:.2f}"
     )
+
+
+def _resolve_sonic_config_bool(config, name):
+    if config is None:
+        return False
+    value = getattr(config, name, None)
+    if value is not None:
+        return bool(value)
+    resolver = getattr(config, f"resolve_{name}", None)
+    return bool(resolver()) if resolver is not None else False
+
 
 class _SonicRouterScoresFromMetadata(paddle.autograd.PyLayer):
     @staticmethod
@@ -115,9 +127,13 @@ def run_sonic_moe(
     fp8_config=None,
     release_fp8_weights=False,
 ):
-    _log_stage_memory("MoE expert compute forward start")
     T = hidden_states.shape[0]
     stream_id = paddle.device.current_stream()
+    topk_indices_i32 = (
+        topk_indices
+        if topk_indices.dtype == paddle.int32
+        else topk_indices.cast(paddle.int32)
+    )
 
     if tokens_per_expert is None:
         valid = topk_indices >= 0
@@ -127,7 +143,46 @@ def run_sonic_moe(
         )
 
     fp8_scale_packed = None
-    if fp8 and fp8_scale is not None:
+    gated_outputs = ()
+    if (
+        fp8
+        and fp8_scale is not None
+        and deepep_topk_to_sonic_metadata_with_scales is not None
+    ):
+        gated_n = int(w1.shape[1])
+        gated_z_quant = _resolve_sonic_config_bool(
+            fp8_config, "epilogue_quant"
+        ) and _resolve_sonic_config_bool(fp8_config, "save_z_fp8")
+        preallocate_gated_outputs = (
+            hidden_states.dtype == paddle.float8_e4m3fn
+            and gated_n % 256 == 0
+            and _resolve_sonic_config_bool(fp8_config, "fused_gated")
+            and _resolve_sonic_config_bool(fp8_config, "fuse_y1_quant")
+        )
+        if preallocate_gated_outputs:
+            metadata_result = deepep_topk_to_sonic_metadata_with_scales(
+                topk_indices_i32,
+                topk_scores,
+                tokens_per_expert,
+                E,
+                fp8_scale,
+                int(hidden_states.shape[1]),
+                block=128,
+                gated_output_prototype=hidden_states,
+                gated_n=gated_n,
+                gated_preact_bf16=not gated_z_quant,
+                gated_allocate_z_scale=gated_z_quant,
+            )
+        else:
+            metadata_result = deepep_topk_to_sonic_metadata_with_scales(
+                topk_indices_i32,
+                topk_scores,
+                tokens_per_expert,
+                E,
+                fp8_scale,
+                int(hidden_states.shape[1]),
+                block=128,
+            )
         (
             expert_frequency_offset,
             x_gather_idx,
@@ -140,15 +195,8 @@ def run_sonic_moe(
             _N_recv,
             _score_src_idx,
             fp8_scale_packed,
-        ) = deepep_topk_to_sonic_metadata_with_scales(
-            topk_indices.cast(paddle.int32),
-            topk_scores,
-            tokens_per_expert,
-            E,
-            fp8_scale,
-            int(hidden_states.shape[1]),
-            block=128,
-        )
+        ) = metadata_result[:11]
+        gated_outputs = tuple(metadata_result[11:])
     else:
         (
             expert_frequency_offset,
@@ -162,7 +210,7 @@ def run_sonic_moe(
             _N_recv,
             _score_src_idx,
         ) = deepep_topk_to_sonic_metadata(
-            topk_indices.cast(paddle.int32),
+            topk_indices_i32,
             topk_scores,
             tokens_per_expert,
             E,
@@ -173,7 +221,24 @@ def run_sonic_moe(
     activation_type = ActivationType("swiglu")
 
     total_expert_freq = TK_padded
-    if _score_src_idx is not None and _scatter_router_scores_i32 is not None:
+    router_score_source = None
+    router_score_src_idx = None
+    router_scores_need_grad = (
+        hasattr(topk_scores, "stop_gradient") and not topk_scores.stop_gradient
+    )
+    if not router_scores_need_grad:
+        # Read stop_gradient before entering a PyLayer. Paddle detaches tensor
+        # inputs inside .apply(), so the original caller intent is unavailable
+        # to _DownProjection.forward. Metadata scores are forward-only here.
+        _router_scores.stop_gradient = True
+        scores_for_down = _router_scores
+    elif _score_src_idx is not None:
+        # DownProjection already computes metadata-order ds. Attach the source
+        # edge there instead of scheduling a separate per-microbatch carrier.
+        scores_for_down = _router_scores
+        router_score_source = topk_scores
+        router_score_src_idx = _score_src_idx
+    elif _score_src_idx is not None and _scatter_router_scores_i32 is not None:
         scores_for_down = _SonicRouterScoresFromMetadata.apply(
             topk_scores, _router_scores, _score_src_idx
         )
@@ -190,11 +255,14 @@ def run_sonic_moe(
 
     fp8_hidden_states = None
     if fp8_scale is not None:
-        fp8_hidden_states = (
-            (hidden_states, fp8_scale, fp8_scale_packed)
-            if fp8_scale_packed is not None
-            else (hidden_states, fp8_scale)
-        )
+        if fp8_scale_packed is not None:
+            if gated_outputs:
+                attach_preallocated_gated_outputs(
+                    fp8_scale_packed, gated_outputs
+                )
+            fp8_hidden_states = (hidden_states, fp8_scale, fp8_scale_packed)
+        else:
+            fp8_hidden_states = (hidden_states, fp8_scale)
 
     # if fp8:
     #     w1_sonic = _make_sonic_fp8_weight_carrier(w1)
@@ -225,10 +293,15 @@ def run_sonic_moe(
             fp8_config=fp8_config,
         )
         if release_fp8_weights and not fp8_config.recompute_z:
-            w1.fp8[0]._clear_to_zero_allocation()
+            transposed_fp8 = getattr(w1, "transposed_fp8", None)
+            if (
+                transposed_fp8 is None
+                or w1.fp8[0].data_ptr() != transposed_fp8[0].data_ptr()
+            ):
+                w1.fp8[0]._clear_to_zero_allocation()
             w1.fp8[1]._clear_to_zero_allocation()
 
-        hidden_states = _DownProjection.apply(
+        down_args = (
             y1,
             z,
             w2,
@@ -247,12 +320,27 @@ def run_sonic_moe(
             activation_type,
             None,
             fp8_combine_grad_handle,
-            fp8_config=fp8_config,
         )
+        if router_score_source is not None:
+            hidden_states = _DownProjection.apply(
+                *down_args,
+                fp8_config,
+                router_score_source,
+                router_score_src_idx,
+            )
+        else:
+            hidden_states = _DownProjection.apply(
+                *down_args, fp8_config=fp8_config
+            )
         if release_fp8_weights:
-            w2.fp8[0]._clear_to_zero_allocation()
+            transposed_fp8 = getattr(w2, "transposed_fp8", None)
+            if (
+                transposed_fp8 is None
+                or w2.fp8[0].data_ptr() != transposed_fp8[0].data_ptr()
+            ):
+                w2.fp8[0]._clear_to_zero_allocation()
             w2.fp8[1]._clear_to_zero_allocation()
 
-    _log_stage_memory("MoE expert compute forward end")
+    # _log_stage_memory("MoE expert compute forward end")
 
     return hidden_states
