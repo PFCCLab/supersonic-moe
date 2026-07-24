@@ -29,7 +29,6 @@ from ...jit import cpp_jit
 def deepep_topk_metadata_cuda(
     dispatched_indices: torch.Tensor,
     dispatched_probs: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
     N_recv: int,
     E: int,
     topk: int,
@@ -48,7 +47,6 @@ def deepep_topk_metadata_cuda(
 def deepep_topk_metadata_cuda_with_scales(
     dispatched_indices: torch.Tensor,
     dispatched_probs: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
     N_recv: int,
     E: int,
     topk: int,
@@ -62,6 +60,30 @@ def deepep_topk_metadata_cuda_with_scales(
 
 
 @torch.library.custom_op(
+    f"{LIBRARY_NAME}::deepep_topk_metadata_cuda_with_scales_and_gated_outputs",
+    mutates_args=(),
+)
+@cpp_jit()
+def deepep_topk_metadata_cuda_with_scales_and_gated_outputs(
+    dispatched_indices: torch.Tensor,
+    dispatched_probs: torch.Tensor,
+    N_recv: int,
+    E: int,
+    topk: int,
+    TK: int,
+    TK_padded: int,
+    alignment: int,
+    raw_scales: torch.Tensor,
+    cols: int,
+    gated_output_prototype: torch.Tensor,
+    gated_n: int,
+    gated_preact_bf16: bool,
+    gated_allocate_z_scale: bool,
+    stream: int,
+) -> list[torch.Tensor]: ...
+
+
+@torch.library.custom_op(
     f"{LIBRARY_NAME}::deepep_topk_metadata_cuda_with_scales_scatterpack",
     mutates_args=(),
 )
@@ -69,7 +91,6 @@ def deepep_topk_metadata_cuda_with_scales(
 def deepep_topk_metadata_cuda_with_scales_scatterpack(
     dispatched_indices: torch.Tensor,
     dispatched_probs: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
     N_recv: int,
     E: int,
     topk: int,
@@ -90,7 +111,6 @@ def deepep_topk_metadata_cuda_with_scales_scatterpack(
 def deepep_topk_metadata_cuda_with_scales_rowpack(
     dispatched_indices: torch.Tensor,
     dispatched_probs: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
     N_recv: int,
     E: int,
     topk: int,

@@ -33,7 +33,10 @@ def _register_fake_safe(name):
     return decorator
 
 from .gemm_dgated import gemm_dgated as gemm_dgated_sm90_sm100
-from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
+from .gemm_gated import (
+    gemm_gated as gemm_gated_sm90_sm100,
+    try_gemm_gated_tvm_ffi_sonic_fast,
+)
 
 
 default_device_capacity = get_device_capacity(paddle.device("cuda"))
@@ -154,6 +157,32 @@ def gemm_gated_tuned(
     varlen_m = cu_seqlens_m is not None
     if varlen_m:
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
+    if b_pretransposed and try_gemm_gated_tvm_ffi_sonic_fast(
+        A,
+        B,
+        preact_out,
+        C,
+        postact_out,
+        activation=activation,
+        tile_M=config.tile_m,
+        tile_N=config.tile_n,
+        cluster_M=config.cluster_m,
+        cluster_N=config.cluster_n,
+        pingpong=config.pingpong,
+        max_swizzle_size=config.max_swizzle_size,
+        bias=bias,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        dynamic_scheduler=dynamic_scheduler,
+        a_scales=a_scales,
+        b_scales=b_scales,
+        z_scale_out=z_scale_out,
+        postact_scale_out=postact_scale_out,
+        swiglu_clamp_value=swiglu_clamp_value,
+        postact_bf16_trunc=postact_bf16_trunc,
+        current_stream=current_stream,
+    ):
+        return
     if A.ndim == 2 and not varlen_m:
         A = A.unsqueeze(0)  # (1, M, K)
     if not b_pretransposed:
@@ -349,8 +378,9 @@ def gemm_gated(
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    if z_scale_out is not None or postact_scale_out is not None:
-        # Epilogue quant (z or postact/y1): bypass custom_op, call tuned fn directly (untuned for blockscaled).
+    if z_scale_out is not None or postact_scale_out is not None or b_pretransposed:
+        # Epilogue quant and pretransposed weights bypass the custom op so the
+        # tuned implementation receives the output-scale and layout metadata.
         gemm_gated_tuned.fn(
             A,
             B,

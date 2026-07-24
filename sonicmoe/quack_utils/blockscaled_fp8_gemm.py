@@ -16,6 +16,7 @@ import cutlass.utils.blockscaled_layout as _upstream_blockscaled_utils
 import torch
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+_GATED_FFI_B_VIEW_ATTR = "_sonic_gated_tvm_ffi_b_view"
 
 import triton
 import triton.language as tl
@@ -455,6 +456,7 @@ def _quantize_flat_v2_kernel(
     TILE_ROWS: tl.constexpr,        # 128
     TILE_COLS: tl.constexpr,        # 256
     SCALE_OUT_INT32: tl.constexpr = False,
+    SCALE_PACKED_WORDS: tl.constexpr = False,
     SAFE_INT64: tl.constexpr = False,
 ):
     """High-BW blockscaled quantize: large tiles, vectorized, pipelined.
@@ -506,10 +508,15 @@ def _quantize_flat_v2_kernel(
         tl.store(dst_ptrs, quantized, mask=mask)
 
         group_id = (col_base // GROUP_SIZE) + g
-        scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
-        if SCALE_OUT_INT32:
+        if SCALE_PACKED_WORDS:
+            scale_byte_ptr = dst_scale_ptr.to(tl.pointer_type(tl.uint8))
+            scale_ptrs = scale_byte_ptr + row_offs * scale_stride_row + group_id
+            tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
+        elif SCALE_OUT_INT32:
+            scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
             tl.store(scale_ptrs, e8m0_byte.to(tl.int32), mask=row_mask)
         else:
+            scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
             tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
 
 
@@ -517,6 +524,7 @@ def quantize_activation_blockscaled_fast(
     x: torch.Tensor,
     group_size: int = 32,
     scale_dtype=None,
+    pack_scale_words: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fast fused 1×group_size blockscaled quantization using a single Triton kernel.
 
@@ -529,7 +537,31 @@ def quantize_activation_blockscaled_fast(
 
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     scale_out_int32 = str(scale_dtype) in ("torch.int32", "paddle.int32", "int32")
-    scale_out = torch.empty(M, num_groups, dtype=(torch.int32 if scale_out_int32 else torch.uint8), device=x.device)
+    if pack_scale_words:
+        if scale_out_int32:
+            raise ValueError(
+                "pack_scale_words and an explicit int32 scale_dtype are mutually exclusive"
+            )
+        if num_groups % 4 != 0:
+            raise ValueError(
+                "pack_scale_words requires the number of 1x32 groups to be "
+                f"divisible by 4, got {num_groups} for K={K}"
+            )
+        # DeepEP transports int32 words as four opaque E8M0 scale bytes.
+        scale_out = torch.empty(
+            M, num_groups // 4, dtype=torch.int32, device=x.device
+        )
+        scale_stride_row = scale_out.stride(0) * 4
+        scale_stride_col = 1
+    else:
+        scale_out = torch.empty(
+            M,
+            num_groups,
+            dtype=(torch.int32 if scale_out_int32 else torch.uint8),
+            device=x.device,
+        )
+        scale_stride_row = scale_out.stride(0)
+        scale_stride_col = scale_out.stride(1)
 
     TILE_ROWS = 128  # Larger tile: fewer CTAs, better wave occupancy
     TILE_COLS = min(K, 256)
@@ -547,13 +579,14 @@ def quantize_activation_blockscaled_fast(
         x.stride(1),
         fp8_out.stride(0),
         fp8_out.stride(1),
-        scale_out.stride(0),
-        scale_out.stride(1),
+        scale_stride_row,
+        scale_stride_col,
         fp8_max=_FP8_E4M3_MAX,
         GROUP_SIZE=group_size,
         TILE_ROWS=TILE_ROWS,
         TILE_COLS=TILE_COLS,
         SCALE_OUT_INT32=scale_out_int32,
+        SCALE_PACKED_WORDS=pack_scale_words,
         SAFE_INT64=_needs_int64,
     )
     return fp8_out, scale_out
@@ -3749,7 +3782,11 @@ def iso32_dual_quantize_weight_3d(
     )
     src_2d = src_enk.reshape(E * N, K).contiguous()
     fp8_2d, row_scales, col_scales = iso32_dual_quantize_varlen(src_2d, E * N, K)
-    return fp8_2d.reshape(E, N, K), row_scales, col_scales
+    fp8_enk = fp8_2d.reshape(E, N, K)
+    # Match the 1x32 path: cache the metadata-only descriptor used by the
+    # specialized/prepared gated TVM-FFI schedule.
+    setattr(fp8_enk, _GATED_FFI_B_VIEW_ATTR, fp8_enk.permute(1, 2, 0))
+    return fp8_enk, row_scales, col_scales
 
 
 def _cache_iso32_w1(w1: torch.Tensor) -> None:
@@ -4233,6 +4270,9 @@ def _quantize_weight_pair_3d_triton(
     # block.  Reshape (E, per_batch) → (1, E*per_batch) view-only.
     A_scales_flat = A_scales.view(1, E * A_per_batch)
     B_scales_flat = B_scales.view(1, E * B_per_batch)
+    # Cache the metadata-only TVM-FFI descriptor while the weight is prepared.
+    # Rebuilding this permute view on every microbatch is pure host overhead.
+    setattr(A_fp8, _GATED_FFI_B_VIEW_ATTR, A_fp8.permute(1, 2, 0))
     return A_fp8, A_scales_flat.view(_E8M0_DTYPE), B_fp8, B_scales_flat.view(_E8M0_DTYPE)
 
 
