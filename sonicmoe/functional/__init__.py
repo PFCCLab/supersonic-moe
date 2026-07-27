@@ -766,11 +766,18 @@ def _use_wgrad_beta_accum() -> bool:
     return os.getenv("SONIC_MOE_FP8_WGRAD_TMA_ADD", "1").lower() in {"1", "true", "yes", "on"}
 
 
-def _main_grad_accumulator(weight):
+def _main_grad_accumulator(weight, shape=None):
     if weight is None or not hasattr(weight, "main_grad"):
         return None
     if weight.main_grad is None:
-        weight.main_grad = paddle.zeros_like(weight, dtype=paddle.float32)
+        if shape is None:
+            weight.main_grad = paddle.zeros_like(weight, dtype=paddle.float32)
+        else:
+            weight.main_grad = paddle.zeros(
+                shape=shape, dtype=paddle.float32, device=weight.place
+            )
+    elif shape is not None and list(weight.main_grad.shape) != list(shape):
+        weight.main_grad.reshape_(shape)
     return weight.main_grad
 
 
@@ -2084,7 +2091,11 @@ class _DownProjection(torch.autograd.Function):
             ctx._router_score_source_shape = tuple(router_score_source.shape)
             ctx._router_score_source_numel = int(router_score_source.shape[0]) * int(router_score_source.shape[1])
         ctx._w2_original = w2
-        ctx._wgrad_w2_accumulator = _main_grad_accumulator(w2)
+        # weight2 is Sonic-layout [E, H, I] here, while Fleet keeps its
+        # main_grad in grouped layout [E, I, H].
+        ctx._wgrad_w2_accumulator = _main_grad_accumulator(
+            w2, shape=[w2.shape[0], w2.shape[2], w2.shape[1]]
+        )
         # Always compute ds (topk_scores gradient) — needed for router training.
         # NOTE: topk_scores.stop_gradient is unreliable inside .apply() because
         # Paddle's torch-proxy resets stop_gradient=True on inputs (mirroring
