@@ -3780,9 +3780,35 @@ def iso32_dual_quantize_weight_3d(
     assert N % _SF_VEC_SIZE == 0 and K % _SF_VEC_SIZE == 0, (
         f"iso32 weight quant requires N({N}) and K({K}) divisible by {_SF_VEC_SIZE}"
     )
-    src_2d = src_enk.reshape(E * N, K).contiguous()
-    fp8_2d, row_scales, col_scales = iso32_dual_quantize_varlen(src_2d, E * N, K)
-    fp8_enk = fp8_2d.reshape(E, N, K)
+    if N % _SF_TILE_M == 0:
+        src_2d = src_enk.reshape(E * N, K).contiguous()
+        fp8_2d, row_scales, col_scales = iso32_dual_quantize_varlen(src_2d, E * N, K)
+        fp8_enk = fp8_2d.reshape(E, N, K)
+
+        # Varlen col-ISA packing is [K_tile, E, N_tile, storage]. Grouped
+        # backward consumes expert-major [E, K_tile, N_tile, storage].
+        k_tiles = _div_up(K, _SF_TILE_K)
+        n_tiles = _div_up(N, _SF_TILE_M)
+        col_scales = (
+            col_scales.view(torch.uint8)
+            .reshape(k_tiles, E, n_tiles, _SF_TILE_STORAGE)
+            .permute(1, 0, 2, 3)
+            .contiguous()
+            .reshape(1, -1)
+            .view(_E8M0_DTYPE)
+        )
+    else:
+        fp8_slices = []
+        row_scale_slices = []
+        col_scale_slices = []
+        for expert in src_enk:
+            fp8_e, row_e, col_e = iso32_dual_quantize_varlen(expert, N, K)
+            fp8_slices.append(fp8_e)
+            row_scale_slices.append(row_e)
+            col_scale_slices.append(col_e)
+        fp8_enk = torch.stack(fp8_slices)
+        row_scales = torch.cat(row_scale_slices, dim=-1)
+        col_scales = torch.cat(col_scale_slices, dim=-1)
     # Match the 1x32 path: cache the metadata-only descriptor used by the
     # specialized/prepared gated TVM-FFI schedule.
     setattr(fp8_enk, _GATED_FFI_B_VIEW_ATTR, fp8_enk.permute(1, 2, 0))

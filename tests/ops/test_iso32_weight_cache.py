@@ -39,6 +39,12 @@ WEIGHT_SHAPES = [
     pytest.param(32, 3072, 1536, id="large-E"),
 ]
 
+EXPERT_LAYOUT_SHAPES = [
+    pytest.param(32, 128, 128, id="32-experts"),
+    pytest.param(4, 128, 160, id="K-tail"),
+    pytest.param(3, 96, 160, id="N-and-K-tail"),
+]
+
 
 @pytest.fixture(params=SEEDS)
 def seed(request):
@@ -64,6 +70,28 @@ class TestIso32WeightCache:
         assert fp8_transposed_view.shape == (E, K, N)
         assert not fp8_transposed_view.is_contiguous()
         assert fp8_transposed_view.data_ptr() == fp8_enk.data_ptr()
+
+    @pytest.mark.parametrize("E,N,K", EXPERT_LAYOUT_SHAPES)
+    def test_expert_major_packed_layout(self, E, N, K, seed):
+        """Batched quantization matches independently packed expert buffers byte-for-byte."""
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            iso32_dual_quantize_varlen,
+            iso32_dual_quantize_weight_3d,
+        )
+
+        w = torch.randn(E, N, K, dtype=torch.bfloat16, device="cuda")
+        fp8_enk, row_scales, col_scales = iso32_dual_quantize_weight_3d(w)
+
+        expert_results = [
+            iso32_dual_quantize_varlen(w[e], N, K) for e in range(E)
+        ]
+        fp8_ref = torch.stack([result[0] for result in expert_results])
+        row_scales_ref = torch.cat([result[1] for result in expert_results], dim=-1)
+        col_scales_ref = torch.cat([result[2] for result in expert_results], dim=-1)
+
+        assert torch.equal(fp8_enk.view(torch.uint8), fp8_ref.view(torch.uint8))
+        assert torch.equal(row_scales.view(torch.uint8), row_scales_ref.view(torch.uint8))
+        assert torch.equal(col_scales.view(torch.uint8), col_scales_ref.view(torch.uint8))
 
     @pytest.mark.parametrize("E,N,K", WEIGHT_SHAPES)
     def test_dual_scales_vs_gold(self, E, N, K, seed):
