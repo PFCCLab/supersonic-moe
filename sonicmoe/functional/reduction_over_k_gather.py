@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 
 from ..utils import get_powers_of_2
-from ..triton_utils import deterministic_autotune_enabled, wrap_triton_kernel
+from ..triton_utils import wrap_triton_kernel
 
 
 ### This triton impl is equivalent as the cute-dsl impl shown above,
@@ -27,20 +27,6 @@ def _get_triton_autotune_configs() -> list[triton.Config]:
     return configs
 
 
-def _deterministic_config(configs: list[triton.Config]) -> triton.Config:
-    """Pick one config without benchmarking, so the result is bit-reproducible.
-
-    BLOCK_H is maximised because ``x`` is re-read once per h-tile, and BLOCK_K
-    is minimised so K is accumulated strictly sequentially. On B300 with the
-    production shapes (T=4096, MAX_K=10, H in {1024, 2048}) this lands within
-    8% of the autotuned winner.
-    """
-    return min(
-        configs,
-        key=lambda c: (-c.kwargs["BLOCK_H"], c.kwargs["BLOCK_K"], c.num_warps, c.num_stages),
-    )
-
-
 def _prune_triton_autotune_config(configs, nargs, **kw):
     pruned_configs = []
     for c in configs:
@@ -56,11 +42,9 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
             pruned_configs.append(c)
 
     if len(pruned_configs) == 0:
-        pruned_configs = configs
-
-    if deterministic_autotune_enabled():
-        return [_deterministic_config(pruned_configs)]
-    return pruned_configs
+        return configs
+    else:
+        return pruned_configs
 
 
 @wrap_triton_kernel

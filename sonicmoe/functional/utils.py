@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from ..config import get_active_config
 
 
-_IS_USING_QUACK_GEMM = os.getenv("USE_QUACK_GEMM", "1") == "1"
+_IS_USING_QUACK_GEMM = os.getenv("USE_QUACK_GEMM", "0") == "1"
 
 
 @contextmanager
