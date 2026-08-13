@@ -1,6 +1,27 @@
+import os
 import sys
 
 import paddle
+
+
+def deterministic_autotune_enabled() -> bool:
+    """Whether Triton autotuning must be replaced by a fixed config choice.
+
+    ``@triton.autotune`` keeps the config with the lowest *measured* time, and
+    for the reduction kernels the winning margin is often well below timing
+    noise on a busy GPU. Different tile shapes give a different float32
+    accumulation order, hence different output bits, so two processes running
+    the same math can disagree in the low bits. That breaks bit-exact
+    reproducibility across runs (e.g. the sharding-reshard CI case, which
+    compares losses digit for digit).
+
+    Opt in explicitly with ``SONIC_MOE_DETERMINISTIC_AUTOTUNE=1``; otherwise
+    follow Paddle's global determinism switch.
+    """
+    value = os.environ.get("SONIC_MOE_DETERMINISTIC_AUTOTUNE")
+    if value is not None:
+        return value.lower() not in ("", "0", "false")
+    return os.environ.get("FLAGS_cudnn_deterministic", "0").lower() in ("1", "true")
 
 original_paddle_empty = paddle.empty
 
