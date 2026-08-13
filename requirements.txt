@@ -3,7 +3,7 @@
 # ********************************************************************************
 
 torch>=2.7.1,<=2.9.1
-nvidia-cutlass-dsl>=4.4.0,<=4.5.0
+nvidia-cutlass-dsl==4.4.0
 quack-kernels==0.2.5
 pytest
 parameterized
