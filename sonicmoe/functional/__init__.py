@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import collections
 import os
+from functools import partial
 
 import paddle
 import torch
@@ -764,6 +765,34 @@ def _padded_blockscaled_gated_forward(
 
 def _use_wgrad_beta_accum() -> bool:
     return os.getenv("SONIC_MOE_FP8_WGRAD_TMA_ADD", "1").lower() in {"1", "true", "yes", "on"}
+
+
+# Optional hook letting the host framework take over the expert weight-grad
+# GEMM instead of running it inline, so it can be replayed later to cover
+# pipeline-parallel p2p transfers.  Installed by
+# ``paddlefleet.transformer.dw_overlap``; ``None`` means "run inline".
+#
+#   hook(point: str, weight, run_wgrad: Callable[[], None]) -> bool
+#
+# Returning True means the hook owns ``run_wgrad`` and is also responsible for
+# calling ``_apply_weight_backward_hook(weight)`` after it runs — the grad is
+# not complete until then, and sharding uses that hook to start its reduce.
+# The hook keeps ``run_wgrad`` alive, which keeps the quantized activations it
+# closed over alive too; that is the memory cost of deferring.
+_WGRAD_DEFERRAL_HOOK = None
+
+
+def set_wgrad_deferral_hook(hook) -> None:
+    """Install (or clear, with ``None``) the expert weight-grad deferral hook."""
+    global _WGRAD_DEFERRAL_HOOK
+    _WGRAD_DEFERRAL_HOOK = hook
+
+
+def _defer_wgrad(point, weight, run_wgrad) -> bool:
+    hook = _WGRAD_DEFERRAL_HOOK
+    if hook is None:
+        return False
+    return bool(hook(point, weight, run_wgrad))
 
 
 def _main_grad_accumulator(weight, shape=None):
@@ -1655,24 +1684,29 @@ class _UpProjection(torch.autograd.Function):
                     # use TMA hardware reduce-add (default) or fused beta=1.0 epilogue.
                     _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
                     if _wgrad_accum is not None:
-                        if _use_wgrad_beta_accum():
-                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
-                                dz_col_fp8, dz_col_scales,
-                                x_col_fp8, x_col_scales,
-                                expert_frequency_offset,
-                                M=w1_shape[1], N=H, total_K=TK,
-                                num_experts=E, device=x.device,
-                                accumulator=_wgrad_accum,
-                            )
-                        else:
-                            _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
-                                dz_col_fp8, dz_col_scales,
-                                x_col_fp8, x_col_scales,
-                                expert_frequency_offset,
-                                M=w1_shape[1], N=H, total_K=TK,
-                                num_experts=E, device=x.device,
-                                accumulator=_wgrad_accum,
-                            )
+                        _wgrad_gemm = (
+                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate
+                            if _use_wgrad_beta_accum()
+                            else _run_cutlass_blockscaled_gemm_varlen_k_tma_add
+                        )
+                        # partial() pins the quantized activations, so they outlive
+                        # the ``del`` below when the host defers the GEMM.
+                        _run_wgrad: partial[None] = partial(
+                            _wgrad_gemm,
+                            dz_col_fp8, dz_col_scales,
+                            x_col_fp8, x_col_scales,
+                            expert_frequency_offset,
+                            M=w1_shape[1], N=H, total_K=TK,
+                            num_experts=E, device=x.device,
+                            accumulator=_wgrad_accum,
+                        )
+                        ctx._wgrad_w1_deferred = _defer_wgrad(
+                            "moe_sonic_expert_up_gate_proj",
+                            ctx._w1_original,
+                            _run_wgrad,
+                        )
+                        if ctx._wgrad_w1_deferred is False:
+                            _run_wgrad()
                         dw1_base = None
                         dw1 = None
                     else:
@@ -1706,32 +1740,33 @@ class _UpProjection(torch.autograd.Function):
                         # permute(0,2,1) gives [E,H,2I] non-contiguous view —
                         # CuTe handles via stride.
                         accum_view = _wgrad_accum.permute(0, 2, 1)  # [E, H, 2I]
-                        if _use_wgrad_beta_accum():
-                            bf16_wgrad_gemm_varlen_k_accumulate(
-                                x_bf16.T,
-                                dz_bf16,
-                                expert_frequency_offset,
-                                x_gather_idx,
-                                accumulator=accum_view,
-                                M=H,
-                                N=w1_shape[1],
-                                total_K=TK,
-                                num_experts=E,
-                                device=x.device,
-                            )
-                        else:
-                            bf16_wgrad_gemm_varlen_k_tma_add(
-                                x_bf16.T,
-                                dz_bf16,
-                                expert_frequency_offset,
-                                x_gather_idx,
-                                accumulator=accum_view,
-                                M=H,
-                                N=w1_shape[1],
-                                total_K=TK,
-                                num_experts=E,
-                                device=x.device,
-                            )
+                        _wgrad_gemm = (
+                            bf16_wgrad_gemm_varlen_k_accumulate
+                            if _use_wgrad_beta_accum()
+                            else bf16_wgrad_gemm_varlen_k_tma_add
+                        )
+                        # partial() pins x_bf16 / dz_bf16, so they outlive the
+                        # ``del dz_bf16`` below when the host defers the GEMM.
+                        _run_wgrad = partial(
+                            _wgrad_gemm,
+                            x_bf16.T,
+                            dz_bf16,
+                            expert_frequency_offset,
+                            x_gather_idx,
+                            accumulator=accum_view,
+                            M=H,
+                            N=w1_shape[1],
+                            total_K=TK,
+                            num_experts=E,
+                            device=x.device,
+                        )
+                        ctx._wgrad_w1_deferred = _defer_wgrad(
+                            "moe_sonic_expert_up_gate_proj",
+                            ctx._w1_original,
+                            _run_wgrad,
+                        )
+                        if not ctx._wgrad_w1_deferred:
+                            _run_wgrad()
                         dw1_base = None
                         dw1 = None
                     else:
@@ -1801,32 +1836,31 @@ class _UpProjection(torch.autograd.Function):
                 _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
                 if _wgrad_accum is not None:
                     accum_view = _wgrad_accum.permute(0, 2, 1)  # [E,2I,H] → [E,H,2I]
-                    if _use_wgrad_beta_accum():
-                        bf16_wgrad_gemm_varlen_k_accumulate(
-                            x.T,
-                            dz,
-                            expert_frequency_offset,
-                            x_gather_idx,
-                            accumulator=accum_view,
-                            M=H,
-                            N=w1_shape[1],
-                            total_K=TK,
-                            num_experts=E,
-                            device=x.device,
-                        )
-                    else:
-                        bf16_wgrad_gemm_varlen_k_tma_add(
-                            x.T,
-                            dz,
-                            expert_frequency_offset,
-                            x_gather_idx,
-                            accumulator=accum_view,
-                            M=H,
-                            N=w1_shape[1],
-                            total_K=TK,
-                            num_experts=E,
-                            device=x.device,
-                        )
+                    _wgrad_gemm = (
+                        bf16_wgrad_gemm_varlen_k_accumulate
+                        if _use_wgrad_beta_accum()
+                        else bf16_wgrad_gemm_varlen_k_tma_add
+                    )
+                    _run_wgrad = partial(
+                        _wgrad_gemm,
+                        x.T,
+                        dz,
+                        expert_frequency_offset,
+                        x_gather_idx,
+                        accumulator=accum_view,
+                        M=H,
+                        N=w1_shape[1],
+                        total_K=TK,
+                        num_experts=E,
+                        device=x.device,
+                    )
+                    ctx._wgrad_w1_deferred = _defer_wgrad(
+                        "moe_sonic_expert_up_gate_proj",
+                        ctx._w1_original,
+                        _run_wgrad,
+                    )
+                    if not ctx._wgrad_w1_deferred:
+                        _run_wgrad()
                     dw1 = None
                 else:
                     dw1_base = torch.empty((E, w1_shape[1], w1_shape[2]), dtype=w1_dtype, device=w1_device)
@@ -1884,7 +1918,11 @@ class _UpProjection(torch.autograd.Function):
             grads.append(None)
         if ctx._prequant_activation_payload:
             grads.append(tuple(None for _ in range(ctx._prequant_activation_payload_len)))
-        if ctx._wgrad_w1_accumulator is not None:
+        if ctx._wgrad_w1_accumulator is not None and not getattr(
+            ctx, "_wgrad_w1_deferred", False
+        ):
+            # When deferred, the host hook fires this after it runs the GEMM —
+            # main_grad is not complete yet at this point.
             _apply_weight_backward_hook(ctx._w1_original)
         return tuple(grads)
 
@@ -2538,26 +2576,30 @@ class _DownProjection(torch.autograd.Function):
                         # Fused wgrad accumulation (same as w1 path)
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
                         if _wgrad_accum_w2 is not None:
-                            if _use_wgrad_beta_accum():
-                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
-                                    y1s_col_fp8, y1s_col_sc,
-                                    dout_col_fp8, dout_col_sc,
-                                    expert_frequency_offset,
-                                    M=w2_shape[2], N=dout.shape[1],
-                                    total_K=TK_wgrad, num_experts=w2_shape[0],
-                                    device=dout.device,
-                                    accumulator=_wgrad_accum_w2,
-                                )
-                            else:
-                                _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
-                                    y1s_col_fp8, y1s_col_sc,
-                                    dout_col_fp8, dout_col_sc,
-                                    expert_frequency_offset,
-                                    M=w2_shape[2], N=dout.shape[1],
-                                    total_K=TK_wgrad, num_experts=w2_shape[0],
-                                    device=dout.device,
-                                    accumulator=_wgrad_accum_w2,
-                                )
+                            _wgrad_gemm_w2 = (
+                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate
+                                if _use_wgrad_beta_accum()
+                                else _run_cutlass_blockscaled_gemm_varlen_k_tma_add
+                            )
+                            # partial() pins the quantized activations, so they
+                            # outlive the ``del`` below when the host defers.
+                            _run_wgrad_w2 = partial(
+                                _wgrad_gemm_w2,
+                                y1s_col_fp8, y1s_col_sc,
+                                dout_col_fp8, dout_col_sc,
+                                expert_frequency_offset,
+                                M=w2_shape[2], N=dout.shape[1],
+                                total_K=TK_wgrad, num_experts=w2_shape[0],
+                                device=dout.device,
+                                accumulator=_wgrad_accum_w2,
+                            )
+                            ctx._wgrad_w2_deferred = _defer_wgrad(
+                                "moe_sonic_expert_down_proj",
+                                ctx._w2_original,
+                                _run_wgrad_w2,
+                            )
+                            if ctx._wgrad_w2_deferred is False:
+                                _run_wgrad_w2()
                             dw2_base = None
                             dw2 = None
                         else:
@@ -2580,32 +2622,33 @@ class _DownProjection(torch.autograd.Function):
                             y1s_wgrad = (
                                 y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
                             )
-                            if _use_wgrad_beta_accum():
-                                bf16_wgrad_gemm_varlen_k_accumulate(
-                                    dout.T,
-                                    y1s_wgrad,
-                                    expert_frequency_offset,
-                                    x_gather_idx,
-                                    accumulator=_wgrad_accum_w2.permute(0, 2, 1),
-                                    M=dout.shape[1],
-                                    N=w2_shape[2],
-                                    total_K=TK_wgrad,
-                                    num_experts=w2_shape[0],
-                                    device=dout.device,
-                                )
-                            else:
-                                bf16_wgrad_gemm_varlen_k_tma_add(
-                                    dout.T,
-                                    y1s_wgrad,
-                                    expert_frequency_offset,
-                                    x_gather_idx,
-                                    accumulator=_wgrad_accum_w2.permute(0, 2, 1),
-                                    M=dout.shape[1],
-                                    N=w2_shape[2],
-                                    total_K=TK_wgrad,
-                                    num_experts=w2_shape[0],
-                                    device=dout.device,
-                                )
+                            _wgrad_gemm_w2 = (
+                                bf16_wgrad_gemm_varlen_k_accumulate
+                                if _use_wgrad_beta_accum()
+                                else bf16_wgrad_gemm_varlen_k_tma_add
+                            )
+                            # partial() pins dout / y1s_wgrad, so they outlive
+                            # the ``del`` below when the host defers the GEMM.
+                            _run_wgrad_w2 = partial(
+                                _wgrad_gemm_w2,
+                                dout.T,
+                                y1s_wgrad,
+                                expert_frequency_offset,
+                                x_gather_idx,
+                                accumulator=_wgrad_accum_w2.permute(0, 2, 1),
+                                M=dout.shape[1],
+                                N=w2_shape[2],
+                                total_K=TK_wgrad,
+                                num_experts=w2_shape[0],
+                                device=dout.device,
+                            )
+                            ctx._wgrad_w2_deferred = _defer_wgrad(
+                                "moe_sonic_expert_down_proj",
+                                ctx._w2_original,
+                                _run_wgrad_w2,
+                            )
+                            if ctx._wgrad_w2_deferred is False:
+                                _run_wgrad_w2()
                             del y1s_wgrad
                             del y1s
                             dw2_base = None
@@ -2755,32 +2798,31 @@ class _DownProjection(torch.autograd.Function):
                 y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
                 _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
                 if _wgrad_accum_w2 is not None:
-                    if _use_wgrad_beta_accum():
-                        bf16_wgrad_gemm_varlen_k_accumulate(
-                            dout.T,
-                            y1s_wgrad,
-                            expert_frequency_offset,
-                            x_gather_idx,
-                            accumulator=_wgrad_accum_w2.permute(0, 2, 1),
-                            M=dout.shape[1],
-                            N=w2.shape[2],
-                            total_K=x_gather_idx.shape[0],
-                            num_experts=w2.shape[0],
-                            device=dout.device,
-                        )
-                    else:
-                        bf16_wgrad_gemm_varlen_k_tma_add(
-                            dout.T,
-                            y1s_wgrad,
-                            expert_frequency_offset,
-                            x_gather_idx,
-                            accumulator=_wgrad_accum_w2.permute(0, 2, 1),
-                            M=dout.shape[1],
-                            N=w2.shape[2],
-                            total_K=x_gather_idx.shape[0],
-                            num_experts=w2.shape[0],
-                            device=dout.device,
-                        )
+                    _wgrad_gemm_w2 = (
+                        bf16_wgrad_gemm_varlen_k_accumulate
+                        if _use_wgrad_beta_accum()
+                        else bf16_wgrad_gemm_varlen_k_tma_add
+                    )
+                    _run_wgrad_w2 = partial(
+                        _wgrad_gemm_w2,
+                        dout.T,
+                        y1s_wgrad,
+                        expert_frequency_offset,
+                        x_gather_idx,
+                        accumulator=_wgrad_accum_w2.permute(0, 2, 1),
+                        M=dout.shape[1],
+                        N=w2.shape[2],
+                        total_K=x_gather_idx.shape[0],
+                        num_experts=w2.shape[0],
+                        device=dout.device,
+                    )
+                    ctx._wgrad_w2_deferred = _defer_wgrad(
+                        "moe_sonic_expert_down_proj",
+                        ctx._w2_original,
+                        _run_wgrad_w2,
+                    )
+                    if not ctx._wgrad_w2_deferred:
+                        _run_wgrad_w2()
                     dw2 = None
                 else:
                     dw2_base = torch.empty((w2.shape[0], w2.shape[1], w2.shape[2]), dtype=w2.dtype, device=w2.device)
@@ -2850,7 +2892,11 @@ class _DownProjection(torch.autograd.Function):
             # Optional tensor inputs are returned only when present; fp8_config is
             # non-tensor and therefore has no corresponding Paddle PyLayer slot.
             grads.extend([router_score_source_grad, None])
-        if ctx._wgrad_w2_accumulator is not None:
+        if ctx._wgrad_w2_accumulator is not None and not getattr(
+            ctx, "_wgrad_w2_deferred", False
+        ):
+            # When deferred, the host hook fires this after it runs the GEMM —
+            # main_grad is not complete yet at this point.
             _apply_weight_backward_hook(ctx._w2_original)
         return tuple(grads)
 
