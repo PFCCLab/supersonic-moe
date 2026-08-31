@@ -39,13 +39,18 @@ epilogue callables.
 from functools import partial
 from typing import Callable, Optional, Tuple
 
-import math
-
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import dsl_user_op
 
 import quack.activation as _qact
+
+from ..situ_params import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    check_beta,
+    is_linear_beta_disabled,
+)
 
 F32_or_F32x2 = Float32 | Tuple[Float32, Float32]
 
@@ -195,23 +200,10 @@ def dsitu_glu(
 
 SITU_GLU_PREFIX = "situ_glu"
 
-# Defaults from the ernielite layer43 model_config.
-DEFAULT_SITU_BETA = 4.0
-DEFAULT_SITU_LINEAR_BETA = 25.0
-
 
 def _fmt(v: Optional[float]) -> str:
     # repr() of a float round-trips exactly, so the key is lossless.
     return "none" if v is None else repr(float(v))
-
-
-def _check_beta(name: str, value) -> None:
-    # Same contract as PaddleFleet transformer/activations.py::situ_glu, so an
-    # invalid model config fails identically on both paths.
-    if value is None or not math.isfinite(float(value)) or float(value) <= 0.0:
-        raise ValueError(
-            f"situ_glu {name} must be a positive finite value, but got {value!r}."
-        )
 
 
 def encode_situ_activation(
@@ -220,9 +212,11 @@ def encode_situ_activation(
     precise: bool = True,
 ) -> str:
     """Build the cache-safe activation string for a SiTU-GLU configuration."""
-    _check_beta("beta", beta)
+    beta = check_beta("beta", beta, where="encode_situ_activation")
     if linear_beta is not None:
-        _check_beta("linear_beta", linear_beta)
+        linear_beta = check_beta(
+            "linear_beta", linear_beta, where="encode_situ_activation"
+        )
     key = f"{SITU_GLU_PREFIX}:b={_fmt(beta)}:lb={_fmt(linear_beta)}"
     if not precise:
         key += ":approx"
@@ -242,22 +236,25 @@ def parse_situ_activation(activation) -> Optional[Tuple[float, Optional[float], 
     beta = DEFAULT_SITU_BETA
     linear_beta = DEFAULT_SITU_LINEAR_BETA
     precise = True
+    where = f"in {activation!r}"
     for field in activation.split(":")[1:]:
         if field == "approx":
             precise = False
         elif field == "precise":
             precise = True
         elif field.startswith("b="):
-            beta = float(field[2:])
+            # ``check_beta`` does the float() conversion so a bad ``b=`` field
+            # gets the same message here as it would from the config field.
+            beta = check_beta("beta", field[2:], where=where)
         elif field.startswith("lb="):
             raw = field[3:]
-            linear_beta = None if raw == "none" else float(raw)
+            linear_beta = (
+                None
+                if is_linear_beta_disabled(raw)
+                else check_beta("linear_beta", raw, where=where)
+            )
         else:
             raise ValueError(f"unrecognized situ_glu activation field {field!r} in {activation!r}")
-    if beta is None or not math.isfinite(beta) or beta <= 0.0:
-        raise ValueError(f"situ_glu beta must be positive and finite, got {activation!r}")
-    if linear_beta is not None and (not math.isfinite(linear_beta) or linear_beta <= 0.0):
-        raise ValueError(f"situ_glu linear_beta must be positive and finite, got {activation!r}")
     return beta, linear_beta, precise
 
 

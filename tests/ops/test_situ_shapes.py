@@ -58,14 +58,19 @@ from tests.ops.situ_reference import (
 )
 from tests.ops.test_situ_gemm import (
     BETA,
-    BWD_LIMITS,
     FWD_LIMITS,
     LINEAR_BETA,
     SEED,
+    Limits,
+    _assert_within,
     _fwd_inputs,
     _grouped_gemm_fp64,
     _report,
     _situ,
+    _SLOT_SWAP_MIN,
+    _SWIGLU_ORACLE_RATIO_MIN,
+    _SWIGLU_PAIR_MIN,
+    _CACHE_LIMITS,
 )
 
 pytestmark = [requires_blackwell, requires_quack]
@@ -83,6 +88,39 @@ _SKIP_HEAVY = os.getenv("SITU_SKIP_HEAVY", "0") == "1"
 heavy = pytest.mark.skipif(_SKIP_HEAVY, reason="SITU_SKIP_HEAVY=1")
 
 
+# ---------------------------------------------------------------------------
+# Production backward thresholds.
+#
+# This file used to import ``BWD_LIMITS`` from test_situ_gemm.py, which forced a
+# single table to cover both the smoke shape and the production geometry -- and
+# therefore to carry the looser of the two on every row.  The two shapes differ
+# by 800x in M and by 3x in the ``colvec`` reduction error, so they now get
+# separately calibrated tables.  Same rule as in test_situ_gemm.py (see the long
+# comment above ``FWD_LIMITS`` there): 1.5x worst for floor-pinned RRMSE, 2.0x
+# for RRMSE with real headroom, 2x on the cosine *deficit*, 2.5x on the max-abs
+# ulp, all over seeds {42, 123, 777} at E=512 H=2048 I=256 total_M=655360.
+#
+# Measured worsts:
+#   postact RRMSE 1.6668e-3, cosine 0.99999863 (deficit 1.371e-6), ulp 0.6716
+#   dgate   RRMSE 1.6592e-3, cosine 0.99999863 (deficit 1.371e-6), ulp 0.5767
+#   dup     RRMSE 1.6593e-3, cosine 0.99999857 (deficit 1.431e-6), ulp 0.6096
+#   colvec  RRMSE 2.1244e-6 (float32 output), ulp 5.577e-4
+#
+# The three bf16 rows are on the bf16 store floor and cannot be tightened
+# further.  ``colvec`` had the slack: 2.12e-6 measured against the old shared
+# 1.0e-5 limit.  Its cosine floor stays at 0.9999999 because the measured value
+# is 1.0 to within float32 resolution (some seeds even come back at
+# 1.0000001 from float32 round-off), so there is nothing left to squeeze.
+# ---------------------------------------------------------------------------
+
+PROD_BWD_LIMITS = {
+    "postact": Limits(2.6e-3, 0.9999972, 1.7),
+    "dgate": Limits(2.5e-3, 0.9999972, 1.5),
+    "dup": Limits(2.5e-3, 0.9999971, 1.6),
+    "colvec": Limits(4.3e-6, 0.9999999, 1.4e-3),
+}
+
+
 def _cu_seqlens(counts):
     """int32 prefix sum over per-expert token counts."""
     out = torch.zeros(len(counts) + 1, dtype=torch.int32, device="cuda")
@@ -96,17 +134,21 @@ def _uniform(TK, E):
 
 
 def _fwd(H, I, E, cu_seqlens, total_M, *, fp8=False, beta=BETA,
-         linear_beta=LINEAR_BETA, precise=True, x_scale=1.0, label=""):
+         linear_beta=LINEAR_BETA, precise=True, x_scale=1.0, label="",
+         seed=SEED):
     """Forward ``gemm_gated`` on an arbitrary routing, vs the float64 oracle.
 
-    Returns ``(rrmse, cosine)`` of the post-activation and prints the metrics.
-    The gold path accumulates ``z`` in float64 from the *same* bf16 operands the
-    kernel sees, so the comparison isolates kernel accumulation + the activation
-    from the input quantisation both sides share.
+    Returns the post-activation ``Metrics`` and prints them.  The gold path
+    accumulates ``z`` in float64 from the *same* bf16 operands the kernel sees,
+    so the comparison isolates kernel accumulation + the activation from the
+    input quantisation both sides share.
+
+    ``seed`` is a parameter so the threshold-calibration harness can sweep seeds
+    through this exact code path; the tests all use the default.
     """
     from sonicmoe.quack_utils.gemm_interface import gemm_gated
 
-    x, w1 = _fwd_inputs(total_M, H, I, E, x_scale=x_scale)
+    x, w1 = _fwd_inputs(total_M, H, I, E, seed=seed, x_scale=x_scale)
     z_gold = _grouped_gemm_fp64(x, w1, cu_seqlens, E, transpose_b=True)
     out_gold, _, _ = situ_glu_ref_fp64(z_gold, beta, linear_beta)
     w1_3d = w1.permute(2, 1, 0).contiguous()            # (E, H, 2I)
@@ -132,12 +174,8 @@ def _fwd(H, I, E, cu_seqlens, total_M, *, fp8=False, beta=BETA,
     kind = "fp8" if fp8 else "bf16"
     print(f"\n{label or kind} H={H} I={I} E={E} total_M={total_M} "
           f"N={2 * I} {activation}")
-    assert torch.isfinite(postact.float()).all(), "postact contains NaN/Inf"
-    r, c, _, _ = _report(postact, out_gold, f"postact {kind}")
-    rrmse_max, cosine_min = FWD_LIMITS[kind]
-    assert r < rrmse_max, f"{kind} postact RRMSE {r:.3e} >= {rrmse_max:.1e}"
-    assert c > cosine_min, f"{kind} postact cosine {c:.8f} <= {cosine_min}"
-    return r, c
+    return _assert_within(f"postact {kind}", postact, out_gold,
+                          FWD_LIMITS[kind])
 
 
 # ---------------------------------------------------------------------------
@@ -305,21 +343,20 @@ def test_prod_bwd():
 
     print(f"\nproduction bwd E={PROD_E} H={PROD_H} I={PROD_I} "
           f"total_M={total_M}")
-    assert torch.isfinite(dx.float()).all(), "dx contains NaN/Inf"
     checks = [("postact", postact, postact_gold)]
     dgate, dup = deinterleave(dx.float())
     dgate_gold, dup_gold = deinterleave(dz_gold)
     checks += [("dgate", dgate, dgate_gold), ("dup", dup, dup_gold),
                ("colvec", colvec, colvec_gold)]
     for name, act, exp in checks:
-        r, c, _, _ = _report(act, exp, f"prod {name}")
-        rrmse_max, cosine_min = BWD_LIMITS[name]
-        assert r < rrmse_max, f"{name} RRMSE {r:.3e} >= {rrmse_max:.1e}"
-        assert c > cosine_min, f"{name} cosine {c:.8f} <= {cosine_min}"
+        _assert_within(f"prod {name}", act, exp, PROD_BWD_LIMITS[name])
 
     swapped = rrmse(dgate, dup_gold.float())
     print(f"  [slot-swap control] RRMSE(dgate, dup_gold)={swapped:.3e}")
-    assert swapped > 0.5, "dgate/dup too similar for the slot check to bite"
+    assert swapped > _SLOT_SWAP_MIN, (
+        f"dgate/dup too similar for the slot check to bite: RRMSE {swapped:.3e}"
+        f" <= {_SLOT_SWAP_MIN}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -350,14 +387,22 @@ def test_prod_geometry_differs_from_swiglu():
 
     print(f"\nproduction-geometry control E={PROD_E} H={PROD_H} I={PROD_I} "
           f"total_M={total_M}")
-    r_pair, _, _, _ = _report(situ_out, swiglu_out, "situ vs swiglu")
-    r_situ, _, _, _ = _report(situ_out, out_gold, "situ vs situ oracle")
-    r_swiglu, _, _, _ = _report(swiglu_out, out_gold, "swiglu vs situ oracle")
-    assert r_pair > 0.03, (
+    r_pair = _report(situ_out, swiglu_out, "situ vs swiglu").rrmse
+    # The situ leg is also held to the ordinary accuracy gate: this control has
+    # to fail if the descriptor is ignored, not merely if the two paths differ.
+    r_situ = _assert_within("situ vs situ oracle", situ_out, out_gold,
+                            _CACHE_LIMITS).rrmse
+    r_swiglu = _report(swiglu_out, out_gold, "swiglu vs situ oracle").rrmse
+    print(f"  [control] pair RRMSE={r_pair:.4e} (floor {_SWIGLU_PAIR_MIN}) "
+          f"oracle-distance ratio={r_swiglu / r_situ:.2f} "
+          f"(floor {_SWIGLU_ORACLE_RATIO_MIN})")
+    assert r_pair > _SWIGLU_PAIR_MIN, (
         f"situ and swiglu differ by only RRMSE {r_pair:.3e} at the production "
-        "geometry; the descriptor is probably being ignored"
+        f"geometry (floor {_SWIGLU_PAIR_MIN}); the descriptor is probably being "
+        "ignored"
     )
-    assert r_situ < r_swiglu / 10.0, (
+    assert r_situ < r_swiglu / _SWIGLU_ORACLE_RATIO_MIN, (
         f"swiglu is nearly as close to the SiTU oracle ({r_swiglu:.3e}) as SiTU "
-        f"itself ({r_situ:.3e}); this control cannot distinguish them"
+        f"itself ({r_situ:.3e}); ratio {r_swiglu / r_situ:.2f} < "
+        f"{_SWIGLU_ORACLE_RATIO_MIN}, this control cannot distinguish them"
     )

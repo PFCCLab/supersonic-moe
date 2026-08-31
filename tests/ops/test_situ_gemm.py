@@ -40,6 +40,8 @@ What each test buys
 
 Run with ``-s`` — every comparison prints its measured metrics.
 """
+from typing import NamedTuple
+
 import pytest
 import torch
 
@@ -60,6 +62,24 @@ pytestmark = [requires_blackwell, requires_quack]
 
 BETA = 4.0
 LINEAR_BETA = 25.0
+
+
+class Metrics(NamedTuple):
+    """What every comparison in this suite measures."""
+
+    rrmse: float        # ||a-e|| / ||e||            -- aggregate magnitude
+    cosine: float       # <a,e> / (|a||e|)           -- aggregate direction
+    max_abs: float      # max |a-e|                  -- worst single element
+    scale: float        # max |e|
+    ulp: float          # max_abs / (scale * 2^-8)   -- max_abs in bf16 ulps
+
+
+class Limits(NamedTuple):
+    """One row of a limits table: all three gates for one quantity."""
+
+    rrmse_max: float
+    cosine_min: float
+    ulp_max: float
 
 
 def _situ(beta=BETA, linear_beta=LINEAR_BETA, precise=True) -> str:
@@ -175,18 +195,50 @@ def _bwd_gold(dout, w2, z_preact, cu_seqlens, E, beta, linear_beta):
 
 
 def _report(actual, expected, label):
+    """Print and return the four calibrated metrics for one comparison.
+
+    ``ulp`` is the scale-free absolute-error unit used by the limits tables: the
+    worst element-wise error measured in bf16 ulps *at the tensor's own peak
+    magnitude* (bf16 has 8 mantissa bits, so one ulp at the top of the range is
+    ``max|expected| * 2^-8``).  A bf16 store alone costs at most 0.5 of these at
+    the peak, so a value below ~1 means "indistinguishable from writing the exact
+    answer out in bf16".
+    """
     a = actual.float()
     e = expected.float()
     r = rrmse(a, e)
     c = cosine_sim(a, e)
     max_abs = (a - e).abs().max().item()
     scale = e.abs().max().item()
-    # Error in units of a bf16 ulp at the tensor's own scale (bf16 has 8 mantissa
-    # bits, so one ulp at the top of the range is scale * 2^-8).
     ulp = max_abs / (scale * 2.0 ** -8) if scale > 0 else 0.0
     print(f"  [{label}] RRMSE={r:.3e} cosine={c:.8f} max_abs={max_abs:.3e} "
           f"scale={scale:.3e} bf16_ulp={ulp:.2f}")
-    return r, c, max_abs, scale
+    return Metrics(r, c, max_abs, scale, ulp)
+
+
+def _assert_within(label, actual, expected, limits):
+    """Report, then gate on all three metrics of ``limits`` at once.
+
+    Every numeric assertion in this file and in ``test_situ_shapes.py`` goes
+    through here, so there is exactly one place where the gating rule lives:
+    RRMSE (aggregate magnitude), cosine (aggregate direction, scale-free) and
+    ``ulp`` (worst single element).  RRMSE alone is an average and will smear
+    out a localised blow-up; the ulp cap is what makes that visible.
+    """
+    assert torch.isfinite(actual.float()).all(), f"{label} contains NaN/Inf"
+    m = _report(actual, expected, label)
+    assert m.rrmse < limits.rrmse_max, (
+        f"{label} RRMSE {m.rrmse:.4e} >= {limits.rrmse_max:.2e}"
+    )
+    assert m.cosine > limits.cosine_min, (
+        f"{label} cosine {m.cosine:.10f} <= {limits.cosine_min} "
+        f"(deficit {1.0 - m.cosine:.3e} > {1.0 - limits.cosine_min:.3e})"
+    )
+    assert m.ulp < limits.ulp_max, (
+        f"{label} worst element is {m.ulp:.3f} bf16 ulp at tensor scale "
+        f">= {limits.ulp_max} (max_abs {m.max_abs:.3e}, scale {m.scale:.3e})"
+    )
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -194,15 +246,21 @@ def _report(actual, expected, label):
 # ---------------------------------------------------------------------------
 
 
-def _fwd_call(T, H, I, E, K, beta, linear_beta, precise=True, x_scale=1.0):
+def _fwd_call(T, H, I, E, K, beta, linear_beta, precise=True, x_scale=1.0,
+              seed=SEED):
     """Run forward ``gemm_gated`` with a SiTU descriptor.
 
     Returns ``(preact, postact, z_gold_fp64, out_gold_fp64)``.
+
+    ``seed`` exists so the threshold-calibration harness can sweep seeds through
+    *this* helper rather than re-deriving the oracle (which is where the
+    interleaved/chunked layout trap lives).  The tests themselves always use the
+    default, so the numbers in the limits tables below are reproducible.
     """
     from sonicmoe.quack_utils.gemm_interface import gemm_gated
 
     _, total_M, cu_seqlens = _setup(T, H, I, E, K)
-    x, w1 = _fwd_inputs(total_M, H, I, E, x_scale=x_scale)
+    x, w1 = _fwd_inputs(total_M, H, I, E, seed=seed, x_scale=x_scale)
     z_gold, out_gold = _fwd_gold(x, w1, cu_seqlens, E, beta, linear_beta)
     w1_3d = w1.permute(2, 1, 0).contiguous()  # (E, H, 2I)
     preact, postact = gemm_gated(
@@ -214,16 +272,18 @@ def _fwd_call(T, H, I, E, K, beta, linear_beta, precise=True, x_scale=1.0):
     return preact, postact, z_gold, out_gold
 
 
-def _bwd_call(T, H, I, E, K, beta, linear_beta, precise=True, colvec_reduce=False):
+def _bwd_call(T, H, I, E, K, beta, linear_beta, precise=True, colvec_reduce=False,
+              seed=SEED):
     """Run backward ``gemm_dgated`` with a SiTU descriptor.
 
     Returns ``(dx, postact, colvec, dz_gold_fp64, postact_gold_fp64,
-    colvec_gold_fp64)``; ``colvec`` is ``None`` unless requested.
+    colvec_gold_fp64)``; ``colvec`` is ``None`` unless requested.  See
+    ``_fwd_call`` for why ``seed`` is a parameter.
     """
     from sonicmoe.quack_utils.gemm_interface import gemm_dgated
 
     _, total_M, cu_seqlens = _setup(T, H, I, E, K)
-    dout, w2, z_preact = _bwd_inputs(total_M, H, I, E)
+    dout, w2, z_preact = _bwd_inputs(total_M, H, I, E, seed=seed)
     dy1_gold, dz_gold, postact_gold = _bwd_gold(
         dout, w2, z_preact, cu_seqlens, E, beta, linear_beta
     )
@@ -249,20 +309,93 @@ def _bwd_call(T, H, I, E, K, beta, linear_beta, precise=True, colvec_reduce=Fals
 
 
 # ---------------------------------------------------------------------------
-# Thresholds.  Every number below was measured on sm_103 and then rounded up;
-# the measured value is in the trailing comment.  ``bf16_ulp`` is the useful
-# scale-free unit here: the outputs are bf16, so ~1 ulp is the floor and the
-# error budget is dominated by how much the activation amplifies the bf16
-# rounding of its own input, not by the f32 activation math (which is ~1e-6,
-# see test_situ_activation.py).
+# Thresholds
+# ==========
+#
+# CALIBRATION RULE.  Applied uniformly to every table in this file *and* in
+# test_situ_shapes.py.  ``worst`` below always means: the worst value measured
+# over seeds {42, 123, 777} x every shape the corresponding test parametrises,
+# on sm_103 / B30Z / CUDA 13.2, driven through the very helpers the tests use
+# (``_fwd_call`` / ``_bwd_call`` / ``test_situ_shapes._fwd``, all of which take a
+# ``seed=`` argument for exactly this purpose).  The trailing comment on each
+# row records that measurement, so the margin is auditable without re-running.
+#
+#   RRMSE, output pinned to a dtype rounding floor  ->  limit = 1.5 * worst
+#   RRMSE, output with real headroom above a floor  ->  limit = 2.0 * worst
+#   cosine  ->  floor = 1 - 2.0 * (1 - worst_cosine), i.e. a 2x budget on the
+#       *deficit*.  Since 1 - cos ~= rrmse^2 / 2 for a small incoherent error, a
+#       2x deficit budget is only sqrt(2) ~= 1.41x in RRMSE terms: the cosine
+#       gate is therefore slightly TIGHTER than the 1.5x RRMSE gate and is not
+#       redundant with it.  Cosine is also scale-free, so it is the gate that
+#       survives a global-scale change of convention in the reference.
+#   ulp (= max_abs / (max|expected| * 2^-8), see ``_report``)  ->  cap = 2.5 *
+#       worst.  A maximum over ~1e6-1e8 elements is a tail statistic and moves
+#       more from seed to seed than the two aggregates, hence the wider factor.
+#       This is the gate that catches a localised blow-up that an RRMSE average
+#       would smear out; nothing gated it before.
+#   lower-bound controls (separations, ratios, slot-swap distances)
+#           ->  floor = worst_minimum / 1.5.
+#
+# Limits are then rounded away from the measurement to 2 significant figures.
+#
+# WHERE THE FLOORS ARE -- i.e. what CANNOT be tightened further.
+# Every bf16 output in this suite sits ON the bf16 output rounding floor:
+# 2^-9/sqrt(3) = 1.13e-3 RRMSE for a uniformly distributed round-off, and the
+# measured values are 1.63e-3 - 1.70e-3, *flat* across all 31 shapes tested
+# (26 bf16 + 5 fp8).  That flatness is the evidence the math is right, and it
+# also means 1.5x is already only ~2.2x the hardware floor -- there is no room
+# for a further large tightening without making the suite calibration-fragile.
+# The same holds for FP8 (5.37e-2 - 5.48e-2 flat = the e4m3 blockscaled
+# quantisation floor, not kernel error) and for the ``colvec`` cosine floors,
+# which are already inside 2 float32 ULPs of exactly 1.0.
+# The one place that had real slack was ``BWD_LIMITS["colvec"]`` (float32
+# output, measured 7.7e-7 against a 1.0e-5 limit = 13x of unused budget).
 # ---------------------------------------------------------------------------
 
-FWD_LIMITS = {  # (rrmse_max, cosine_min)
-    # Measured: bf16 1.65e-3 - 1.66e-3 (pure bf16 rounding of the postact, see
-    # BWD_LIMITS), FP8 blockscaled 5.40e-2.
-    "bf16": (5.0e-3, 0.99998),
-    "fp8": (1.0e-1, 0.99),
+FWD_LIMITS = {
+    # bf16 fused epilogue output vs the float64 oracle.  worst over 3 seeds x
+    # 26 bf16 shapes (this file's 2 + the 24 in test_situ_shapes.py):
+    #   RRMSE 1.6953e-3, cosine 0.99999845 (deficit 1.550e-6), ulp 0.9265.
+    # All three are at the bf16 store floor; see the note above.
+    "bf16": Limits(2.6e-3, 0.9999969, 2.4),
+    # The raw GEMM accumulator, before the activation.  Gated separately (it was
+    # only *printed* before) so a pure accumulation regression is attributable
+    # without having to reason through the activation's error amplification.
+    # worst over 3 seeds x 2 shapes: RRMSE 1.6625e-3, cosine 0.99999857
+    # (deficit 1.431e-6), ulp 0.8189.
+    "bf16_preact": Limits(2.5e-3, 0.9999971, 2.1),
+    # Blockscaled FP8 (e4m3 data, 1x32 e8m0 scales).  worst over 3 seeds x 5
+    # fp8 shapes: RRMSE 5.4744e-2, cosine 0.99850315 (deficit 1.497e-3),
+    # ulp 13.291.  RRMSE ~= 5.4e-2 is the e4m3 quantisation floor: 3 mantissa
+    # bits give a 2^-4 = 6.25% relative step, so this is input quantisation the
+    # kernel cannot undo, not kernel error.
+    "fp8": Limits(8.3e-2, 0.99700, 34.0),
 }
+
+# ---------------------------------------------------------------------------
+# Lower-bound controls.  These are the *opposite* direction: each asserts that
+# two things are far enough APART for the positive assertions above to have any
+# discriminating power.  Making the suite stricter therefore means RAISING these.
+# Rule: floor = smallest value measured over 3 seeds (x both geometries where the
+# control appears in test_situ_shapes.py too) divided by 1.5.
+# ---------------------------------------------------------------------------
+
+# RRMSE(situ, swiglu) on the same inputs.  Measured min 7.6595e-2 (smoke 7.663e-2,
+# production geometry 7.660e-2).  The two activations are genuinely close in
+# shape -- 4*tanh(g/4)*sigmoid(g) -> g*sigmoid(g) as g -> 0 -- so this cannot be
+# pushed to O(1); the discriminating assertion is the ratio below.
+_SWIGLU_PAIR_MIN = 0.05
+
+# RRMSE(swiglu, situ_oracle) / RRMSE(situ, situ_oracle).  Measured min 49.22.
+# This is the control that actually says "the descriptor was honoured": a
+# fallback to SwiGLU lands ~50x further from the SiTU oracle than SiTU does.
+_SWIGLU_ORACLE_RATIO_MIN = 30.0
+
+# RRMSE(dgate, dup_gold) -- the distance between the two interleaved output slots
+# on this data.  Measured min 1.4357 (smoke 1.4363, production 1.4357).  If this
+# ever drops, the per-slot assertions stop being able to see a swapped
+# interleave, so the control must be at least this strong.
+_SLOT_SWAP_MIN = 0.95
 
 
 # ---------------------------------------------------------------------------
@@ -277,13 +410,8 @@ def test_gated_bf16_vs_oracle(T, H, I, E, K, linear_beta):
     preact, postact, z_gold, out_gold = _fwd_call(T, H, I, E, K, BETA, linear_beta)
 
     print(f"\n{_situ(BETA, linear_beta)} shape T={T} H={H} I={I} E={E} K={K}")
-    _report(preact, z_gold, "preact z")
-    r, c, _, _ = _report(postact, out_gold, "postact")
-
-    assert torch.isfinite(postact.float()).all(), "postact contains NaN/Inf"
-    rrmse_max, cosine_min = FWD_LIMITS["bf16"]
-    assert r < rrmse_max, f"forward postact RRMSE {r:.3e} >= {rrmse_max:.1e}"
-    assert c > cosine_min, f"forward postact cosine {c:.8f} <= {cosine_min}"
+    _assert_within("preact z", preact, z_gold, FWD_LIMITS["bf16_preact"])
+    _assert_within("postact", postact, out_gold, FWD_LIMITS["bf16"])
 
 
 @pytest.mark.parametrize("T,H,I,E,K", [SMOKE_SHAPE])
@@ -305,22 +433,24 @@ def test_gated_situ_differs_from_swiglu(T, H, I, E, K):
     _, swiglu_out = gemm_gated(x, w1_3d, activation="swiglu",
                                cu_seqlens_m=cu_seqlens)
 
-    r, c, max_abs, scale = _report(situ_out, swiglu_out, "situ vs swiglu")
-    # Measured 7.73e-2 on the smoke shape.  The two activations are genuinely
-    # close in shape -- 4*tanh(g/4)*sigmoid(g) -> g*sigmoid(g) as g -> 0 -- so
-    # this floor is deliberately modest; the discriminating assertion is the
-    # oracle-distance ratio below, not this one.
-    assert r > 0.03, (
-        f"situ_glu and swiglu differ by only RRMSE {r:.3e}; the SiTU descriptor "
-        "is probably being ignored and swiglu computed instead"
+    m = _report(situ_out, swiglu_out, "situ vs swiglu")
+    assert m.rrmse > _SWIGLU_PAIR_MIN, (
+        f"situ_glu and swiglu differ by only RRMSE {m.rrmse:.3e} <= "
+        f"{_SWIGLU_PAIR_MIN}; the SiTU descriptor is probably being ignored and "
+        "swiglu computed instead"
     )
-    # And SiTU must still be the one that matches the SiTU oracle.
+    # And SiTU must still be the one that matches the SiTU oracle -- to full
+    # precision, not merely closer than SwiGLU.
     _, _, _, out_gold = _fwd_call(T, H, I, E, K, BETA, LINEAR_BETA)
-    r_situ, _, _, _ = _report(situ_out, out_gold, "situ vs situ oracle")
-    r_swiglu, _, _, _ = _report(swiglu_out, out_gold, "swiglu vs situ oracle")
-    assert r_situ < r_swiglu / 10.0, (
-        f"swiglu is nearly as close to the SiTU oracle ({r_swiglu:.3e}) as SiTU "
-        f"itself ({r_situ:.3e}); this control cannot distinguish them"
+    m_situ = _assert_within("situ vs situ oracle", situ_out, out_gold,
+                            _CACHE_LIMITS)
+    m_swiglu = _report(swiglu_out, out_gold, "swiglu vs situ oracle")
+    ratio = m_swiglu.rrmse / m_situ.rrmse
+    print(f"  [oracle-distance ratio] swiglu/situ={ratio:.1f}")
+    assert ratio > _SWIGLU_ORACLE_RATIO_MIN, (
+        f"swiglu is only {ratio:.1f}x further from the SiTU oracle than SiTU "
+        f"itself ({m_swiglu.rrmse:.3e} vs {m_situ.rrmse:.3e}); this control has "
+        f"lost its discriminating power (need > {_SWIGLU_ORACLE_RATIO_MIN})"
     )
 
 
@@ -351,28 +481,40 @@ def test_gated_fp8_vs_oracle(T, H, I, E, K):
     )
 
     print(f"\nFP8 {_situ()} shape T={T} H={H} I={I} E={E} K={K}")
-    r, c, _, _ = _report(postact, out_gold, "postact FP8 vs oracle")
-    assert torch.isfinite(postact.float()).all(), "FP8 postact contains NaN/Inf"
-    rrmse_max, cosine_min = FWD_LIMITS["fp8"]
-    assert r < rrmse_max, f"FP8 forward postact RRMSE {r:.3e} >= {rrmse_max:.1e}"
-    assert c > cosine_min, f"FP8 forward postact cosine {c:.8f} <= {cosine_min}"
+    _assert_within("postact FP8 vs oracle", postact, out_gold, FWD_LIMITS["fp8"])
 
 
 # ---------------------------------------------------------------------------
 # Backward
 # ---------------------------------------------------------------------------
 
-BWD_LIMITS = {  # (rrmse_max, cosine_min)
-    # bf16 outputs: measured 1.64e-3 - 1.67e-3, i.e. pure bf16 rounding of the
-    # result (2^-9 / sqrt(3) = 1.13e-3 for a uniformly distributed round-off,
-    # somewhat more once the activation's own sensitivity to the bf16 PreAct is
-    # folded in).  There is no headroom left for an actual math error here.
-    "postact": (5.0e-3, 0.99998),
-    "dgate": (5.0e-3, 0.99997),
-    "dup": (5.0e-3, 0.99998),
-    # colvec_reduce comes back in float32, so it is ~3 orders tighter:
-    # measured 7.71e-7.
-    "colvec": (1.0e-5, 0.9999999),
+BWD_LIMITS = {
+    # Calibrated on the SMOKE shape only -- these tests all run BWD_SHAPES.
+    # The production geometry has its own, separately calibrated table in
+    # test_situ_shapes.py (``PROD_BWD_LIMITS``); a single shared table would have
+    # had to carry the looser of the two everywhere, which is exactly the slack
+    # this pass is removing.
+    #
+    # bf16 outputs, worst over 5 seeds {42,123,777,2024,31337}:
+    #   postact RRMSE 1.6718e-3, cosine 0.99999851 (deficit 1.490e-6), ulp 0.8184
+    #   dgate   RRMSE 1.6664e-3, cosine 0.99999857 (deficit 1.431e-6), ulp 0.6857
+    #   dup     RRMSE 1.6615e-3, cosine 0.99999857 (deficit 1.431e-6), ulp 0.7614
+    # All three sit on the bf16 store floor (2^-9/sqrt(3) = 1.13e-3 for a
+    # uniform round-off, a little more once the activation's sensitivity to the
+    # bf16 PreAct is folded in), so 1.5x is close to all the room there is.
+    "postact": Limits(2.6e-3, 0.9999970, 2.1),
+    "dgate": Limits(2.5e-3, 0.9999971, 1.8),
+    "dup": Limits(2.5e-3, 0.9999971, 2.0),
+    # colvec_reduce comes back in FLOAT32, so it is ~3 orders tighter and it is
+    # the one quantity in this file that had genuine slack: measured RRMSE
+    # 7.7104e-7 against the old 1.0e-5 limit, i.e. 13x of unused budget.
+    # Worst over 5 seeds: RRMSE 7.7104e-7, ulp 2.2323e-4.
+    # The COSINE FLOOR IS DELIBERATELY LEFT AT 0.9999999 AND CANNOT BE
+    # TIGHTENED: the measured worst cosine is 0.99999994, which is exactly one
+    # float32 ULP below 1.0 (2^-24 = 5.96e-8).  0.9999999 already allows only
+    # 1.68 ULP of deficit; the next representable step down for the *floor*
+    # would put it above the measured value and the test would fail on noise.
+    "colvec": Limits(1.6e-6, 0.9999999, 5.6e-4),
 }
 
 
@@ -389,11 +531,7 @@ def test_dgated_postact_vs_oracle(T, H, I, E, K, linear_beta):
     _, postact, _, _, postact_gold, _ = _bwd_call(T, H, I, E, K, BETA, linear_beta)
 
     print(f"\n{_situ(BETA, linear_beta)} shape T={T} H={H} I={I} E={E} K={K}")
-    r, c, _, _ = _report(postact, postact_gold, "dgated postact")
-    assert torch.isfinite(postact.float()).all(), "postact contains NaN/Inf"
-    rrmse_max, cosine_min = BWD_LIMITS["postact"]
-    assert r < rrmse_max, f"dgated postact RRMSE {r:.3e} >= {rrmse_max:.1e}"
-    assert c > cosine_min, f"dgated postact cosine {c:.8f} <= {cosine_min}"
+    _assert_within("dgated postact", postact, postact_gold, BWD_LIMITS["postact"])
 
 
 @pytest.mark.parametrize("linear_beta", [LINEAR_BETA, None], ids=["lb25", "lbnone"])
@@ -414,18 +552,15 @@ def test_dgated_dx_vs_oracle(T, H, I, E, K, linear_beta):
     print(f"\n{_situ(BETA, linear_beta)} shape T={T} H={H} I={I} E={E} K={K}")
     assert torch.isfinite(dx.float()).all(), "dx contains NaN/Inf"
     for name, act, exp in (("dgate", dgate, dgate_gold), ("dup", dup, dup_gold)):
-        r, c, _, _ = _report(act, exp, f"dgated {name}")
-        rrmse_max, cosine_min = BWD_LIMITS[name]
-        assert r < rrmse_max, f"dgated {name} RRMSE {r:.3e} >= {rrmse_max:.1e}"
-        assert c > cosine_min, f"dgated {name} cosine {c:.8f} <= {cosine_min}"
+        _assert_within(f"dgated {name}", act, exp, BWD_LIMITS[name])
 
     # Slot sanity: swapping the two halves must be measurably worse, otherwise
     # the assertions above would not detect an interleave bug on this data.
     swapped = rrmse(dgate.float(), dup_gold.float())
     print(f"  [dgated slot-swap control] RRMSE(dgate, dup_gold)={swapped:.3e}")
-    assert swapped > 0.5, (
-        f"dgate and dup are too similar (swap RRMSE {swapped:.3e}) for this test "
-        "to detect an interleave bug"
+    assert swapped > _SLOT_SWAP_MIN, (
+        f"dgate and dup are too similar (swap RRMSE {swapped:.3e} <= "
+        f"{_SLOT_SWAP_MIN}) for this test to detect an interleave bug"
     )
 
 
@@ -446,11 +581,7 @@ def test_dgated_colvec_reduce(T, H, I, E, K):
     )
 
     print(f"\n{_situ()} shape T={T} H={H} I={I} E={E} K={K}")
-    r, c, _, _ = _report(colvec, colvec_gold, "colvec_reduce")
-    assert torch.isfinite(colvec.float()).all(), "colvec_reduce contains NaN/Inf"
-    rrmse_max, cosine_min = BWD_LIMITS["colvec"]
-    assert r < rrmse_max, f"colvec_reduce RRMSE {r:.3e} >= {rrmse_max:.1e}"
-    assert c > cosine_min, f"colvec_reduce cosine {c:.8f} <= {cosine_min}"
+    _assert_within("colvec_reduce", colvec, colvec_gold, BWD_LIMITS["colvec"])
 
 
 # ---------------------------------------------------------------------------
@@ -468,9 +599,30 @@ def test_dgated_colvec_reduce(T, H, I, E, K):
 # ---------------------------------------------------------------------------
 
 # Separation floor between two configurations, as RRMSE of one against the
-# other.  Measured values are far above these; the point is only that the
-# configurations are distinguishable at all.
-_CACHE_SEPARATION = 0.05
+# other.  Measured minima over 3 seeds: beta 4.0-vs-2.0 forward 0.17536,
+# backward 0.19545 -> the shared floor is 0.17536/1.5 rounded down.
+_CACHE_SEPARATION = 0.11
+
+# lb=25 vs lb=None at x_scale=8: measured min 0.10493 -> /1.5.
+_CACHE_SEPARATION_LB = 0.065
+
+# precise vs approx tanh/sigmoid: same math, different transcendental
+# implementation, so the separation is small by design.  Measured min 1.3556e-4
+# -> /1.5, rounded down.  This used to be ``> 0.0``, which only proved the two
+# results were not bit-identical -- a single differing element satisfied it.
+_CACHE_SEPARATION_PRECISE = 8.0e-5
+
+# Cross-check factor: each result must be at least this many times further from
+# the *other* configuration's oracle than from its own.  Measured min 63.7
+# (lb config A) -> /1.5, rounded down.
+_CACHE_CROSS_FACTOR = 40.0
+
+# Accuracy each of the two configurations must reach against its own oracle.
+# These cells are ordinary bf16 forward/backward outputs, so they are calibrated
+# exactly like FWD/BWD_LIMITS: worst over 3 seeds x 10 config cells (beta 4/2
+# fwd+bwd, lb 25/None at x_scale=8, precise/approx) was RRMSE 1.6658e-3,
+# cosine 0.99999851 (deficit 1.490e-6), ulp 0.8568.
+_CACHE_LIMITS = Limits(2.5e-3, 0.9999970, 2.2)
 
 
 def _assert_two_configs(label, res_a, gold_a, res_b, gold_b, min_separation):
@@ -478,8 +630,8 @@ def _assert_two_configs(label, res_a, gold_a, res_b, gold_b, min_separation):
     a = res_a.float()
     b = res_b.float()
     sep = rrmse(a, b)
-    r_a, c_a, _, _ = _report(a, gold_a, f"{label} A vs its own oracle")
-    r_b, c_b, _, _ = _report(b, gold_b, f"{label} B vs its own oracle")
+    m_a = _assert_within(f"{label} A vs its own oracle", a, gold_a, _CACHE_LIMITS)
+    m_b = _assert_within(f"{label} B vs its own oracle", b, gold_b, _CACHE_LIMITS)
     print(f"  [{label} separation] RRMSE(A, B)={sep:.3e}")
 
     assert sep > min_separation, (
@@ -488,16 +640,19 @@ def _assert_two_configs(label, res_a, gold_a, res_b, gold_b, min_separation):
         "reused the first compiled kernel, i.e. the SiTU parameters are missing "
         "from a JIT/autotune cache key"
     )
-    rrmse_max = 5.0e-3
-    assert r_a < rrmse_max, f"{label}: config A RRMSE {r_a:.3e} >= {rrmse_max:.1e}"
-    assert r_b < rrmse_max, f"{label}: config B RRMSE {r_b:.3e} >= {rrmse_max:.1e}"
     # Cross-check: each result must be closer to its own oracle than to the
     # other's, which is the actual statement "the right kernel ran".
-    assert rrmse(a, gold_b) > r_a * 10.0, (
-        f"{label}: config A is nearly as close to B's oracle as to its own"
+    cross_a = rrmse(a, gold_b) / m_a.rrmse
+    cross_b = rrmse(b, gold_a) / m_b.rrmse
+    print(f"  [{label} cross-check] A->B_oracle {cross_a:.1f}x  "
+          f"B->A_oracle {cross_b:.1f}x  (need > {_CACHE_CROSS_FACTOR})")
+    assert cross_a > _CACHE_CROSS_FACTOR, (
+        f"{label}: config A is only {cross_a:.1f}x further from B's oracle than "
+        f"from its own (need > {_CACHE_CROSS_FACTOR})"
     )
-    assert rrmse(b, gold_a) > r_b * 10.0, (
-        f"{label}: config B is nearly as close to A's oracle as to its own"
+    assert cross_b > _CACHE_CROSS_FACTOR, (
+        f"{label}: config B is only {cross_b:.1f}x further from A's oracle than "
+        f"from its own (need > {_CACHE_CROSS_FACTOR})"
     )
 
 
@@ -532,7 +687,8 @@ def test_cache_key_linear_beta(T, H, I, E, K):
     _, post_a, _, gold_a = _fwd_call(T, H, I, E, K, BETA, LINEAR_BETA, x_scale=8.0)
     _, post_b, _, gold_b = _fwd_call(T, H, I, E, K, BETA, None, x_scale=8.0)
     print("\nfwd lb 25.0 vs none (x_scale=8)")
-    _assert_two_configs("fwd lb", post_a, gold_a, post_b, gold_b, 1.0e-2)
+    _assert_two_configs("fwd lb", post_a, gold_a, post_b, gold_b,
+                        _CACHE_SEPARATION_LB)
 
 
 @pytest.mark.parametrize("T,H,I,E,K", [SMOKE_SHAPE])
@@ -541,25 +697,25 @@ def test_cache_key_precise(T, H, I, E, K):
 
     The two differ only at the ~1e-4 relative level (measured in
     test_situ_activation.py: geometric-mean RRMSE ratio 29x, worst-case max
-    relative error 2.5e-4 for approx), so this asserts the *separation* is
-    non-zero and each matches the shared oracle to its own budget, not that the
-    outputs are far apart.
+    relative error 2.5e-4 for approx), so this asserts the *separation* clears a
+    measured floor and that each matches the shared oracle to the full
+    ``_CACHE_LIMITS`` budget -- not that the outputs are far apart.
     """
     _, post_p, _, gold = _fwd_call(T, H, I, E, K, BETA, LINEAR_BETA, precise=True)
     _, post_a, _, _ = _fwd_call(T, H, I, E, K, BETA, LINEAR_BETA, precise=False)
 
     print("\nfwd precise vs approx")
-    r_p, _, _, _ = _report(post_p, gold, "precise vs oracle")
-    r_a, _, _, _ = _report(post_a, gold, "approx  vs oracle")
+    _assert_within("precise vs oracle", post_p, gold, _CACHE_LIMITS)
+    _assert_within("approx  vs oracle", post_a, gold, _CACHE_LIMITS)
     sep = rrmse(post_p.float(), post_a.float())
-    print(f"  [precise/approx separation] RRMSE={sep:.3e}")
+    print(f"  [precise/approx separation] RRMSE={sep:.3e} "
+          f"(need > {_CACHE_SEPARATION_PRECISE:.1e})")
 
-    assert sep > 0.0, (
-        "precise and approx produced bit-identical output; the ':approx' suffix "
-        "is being dropped from a cache key or from the descriptor parse"
+    assert sep > _CACHE_SEPARATION_PRECISE, (
+        f"precise and approx are only {sep:.3e} apart (need > "
+        f"{_CACHE_SEPARATION_PRECISE:.1e}); the ':approx' suffix is being dropped "
+        "from a cache key or from the descriptor parse"
     )
-    for tag, r in (("precise", r_p), ("approx", r_a)):
-        assert r < 5.0e-3, f"{tag} forward RRMSE {r:.3e} >= 5.0e-3"
 
 
 # ---------------------------------------------------------------------------

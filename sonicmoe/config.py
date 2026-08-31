@@ -34,6 +34,18 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from typing import Optional, Union
 
+# SiTU-GLU scalars live in ``situ_params``: a dependency-free module, because
+# this one is imported by ``functional/fp8_config.py``, which must stay clear of
+# the cutlass/quack imports that ``quack_utils/activation_situ`` pulls in.  Both
+# layers therefore share one set of defaults and one range check instead of
+# keeping duplicates in sync.
+from .situ_params import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    check_beta,
+    is_linear_beta_disabled,
+)
+
 
 def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
     """Read a boolean from an environment variable. Returns None if unset."""
@@ -43,15 +55,6 @@ def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
     if val in ("0", "false", "no", "off"):
         return False
     return default
-
-
-# SiTU-GLU beta defaults.  Deliberately duplicated from
-# ``quack_utils/activation_situ.py::DEFAULT_SITU_BETA`` /
-# ``DEFAULT_SITU_LINEAR_BETA`` instead of imported: this module is imported by
-# ``functional/fp8_config.py``, which must stay free of the cutlass/quack
-# dependency that ``activation_situ`` pulls in at import time.  Keep in sync.
-DEFAULT_SITU_BETA = 4.0
-DEFAULT_SITU_LINEAR_BETA = 25.0
 
 
 @dataclass
@@ -229,11 +232,18 @@ class SonicMoEConfig:
         return 0.0
 
     def resolve_situ_beta(self) -> float:
+        """Resolve the SiTU gate beta, validated here rather than at trace time.
+
+        ``check_beta`` rejects anything the kernel cannot represent as a float32
+        pair (``beta`` and ``1 / beta``); doing it here means a bad value is
+        reported against the config field or the env var that set it, not later
+        from ``encode_situ_activation``.
+        """
         if self.situ_beta is not None:
-            return float(self.situ_beta)
+            return check_beta("beta", self.situ_beta, where="SonicMoEConfig.situ_beta")
         env = os.getenv("SONIC_MOE_SITU_BETA", "").strip()
         if env:
-            return float(env)
+            return check_beta("beta", env, where="$SONIC_MOE_SITU_BETA")
         return DEFAULT_SITU_BETA
 
     def resolve_situ_linear_beta(self) -> Optional[float]:
@@ -243,20 +253,24 @@ class SonicMoEConfig:
         convention (config field > env var > built-in default), so *explicitly
         disabling* the clamp is spelled ``situ_linear_beta="none"`` (or
         ``False``), not ``situ_linear_beta=None`` — the latter falls through to
-        the 25.0 default.
+        the 25.0 default.  ``"none"`` / ``"null"`` / ``"off"`` are accepted in
+        any case, identically here, in the env var and in the ``lb=`` descriptor
+        field.  ``True`` is *not* a spelling of anything: it would otherwise
+        become ``float(True) == 1.0``, a plausible-looking clamp nobody asked
+        for, so ``check_beta`` rejects it.
         """
         value = self.situ_linear_beta
         if value is not None:
-            if value is False or (
-                isinstance(value, str) and value.strip().lower() in ("none", "null", "off")
-            ):
+            if is_linear_beta_disabled(value):
                 return None
-            return float(value)
+            return check_beta(
+                "linear_beta", value, where="SonicMoEConfig.situ_linear_beta"
+            )
         env = os.getenv("SONIC_MOE_SITU_LINEAR_BETA", "").strip()
         if env:
-            if env.lower() in ("none", "null", "off"):
+            if is_linear_beta_disabled(env):
                 return None
-            return float(env)
+            return check_beta("linear_beta", env, where="$SONIC_MOE_SITU_LINEAR_BETA")
         return DEFAULT_SITU_LINEAR_BETA
 
     # --- Context manager for temporary activation ----------------------------

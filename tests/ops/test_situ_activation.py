@@ -22,9 +22,14 @@ Every comparison is against the **float64** oracle in ``tests/ops/situ_reference
 
 Assertion thresholds
 --------------------
-The per-sweep thresholds in ``LIMITS`` were set from measured values on sm_103
-(B30Z, CUDA 13.2, cutlass-dsl 4.5.2) with roughly 4x headroom.  Every test prints
-its measured numbers under ``-s`` so a human can re-audit them.
+Every threshold in this module is set by the single rule stated above ``LIMITS``:
+**2x the worst value measured over 6 independent input seeds, rounded UP to two
+significant figures** (one-sided *lower* bounds use the mirror rule, floor to two
+significant figures of half the measured minimum).  Read that comment block
+before changing any number here — in particular the note that ``rel`` bands are
+only valid at the committed sampling density and that ``rrmse`` is the
+scale-invariant metric.  Every test prints its measured numbers under ``-s`` so a
+human can re-audit them.
 
 Run with::
 
@@ -265,6 +270,13 @@ def dsitu_glu_kernel(
 # near g ~ -1.2 (the two terms ``(1-t^2)*s`` and ``gate_act*(1-s)`` cancel), so the
 # relative error of dgate is unbounded there no matter how good the arithmetic is.
 # The unfiltered max-rel is still reported so nothing is hidden.
+#
+# [NOT TIGHTENED] SIG_FRAC is deliberately left at 1e-3.  It is a filter width,
+# not a tolerance, and it is not monotone in strictness: RAISING it discards more
+# elements and weakens the test, while LOWERING it admits elements sitting on the
+# root, whose relative error diverges, and would force the ``rel`` bands in
+# ``LIMITS`` to be loosened.  1e-3 is the widest value at which the ``rel``
+# statistic still has a finite bound.
 SIG_FRAC = 1e-3
 
 
@@ -430,12 +442,53 @@ def _print_table():
 
 
 # ===========================================================================
-# Assertion thresholds — MEASURED on sm_103 then given ~4x headroom.
+# Assertion thresholds — MEASURED on sm_103, then 2x headroom.
 # ===========================================================================
-# Every number below is 4x the worst value observed across
-# {scalar, packed} x {lb=25, lb=None} on B30Z / sm_103 / CUDA 13.2 /
-# cutlass-dsl 4.5.2.  The raw measurements are reproduced in the summary table
-# that this module prints at teardown, so a reviewer can re-derive them.
+# THE RULE (apply it verbatim if you ever re-baseline; do not eyeball numbers):
+#
+#   limit = ceil_2_significant_figures( 2.0 x worst )
+#
+#   where ``worst`` is the maximum of the metric over the full cross product
+#
+#       6 independent input seeds
+#         x {scalar, packed}                 (both device code paths)
+#         x {linear_beta=25, linear_beta=None}
+#         x {out, bout}                      (for the ``out`` rows only)
+#
+#   measured at the committed sampling density ``n = N_DEFAULT`` (8192) on
+#   B30Z / sm_103 / CUDA 13.2 / cutlass-dsl 4.5.2.  Seed 0 of the six is the
+#   seed the committed tests actually run, so the table is a superset of what
+#   CI exercises.  The raw single-seed measurements are reproduced in the
+#   summary table this module prints at teardown.
+#
+#   One-sided *lower* bounds elsewhere in this file (``geo``, the per-cell
+#   precise-vs-approx margin) use the mirror rule: floor to two significant
+#   figures of (measured minimum / 2).
+#
+#   A threshold is only ever moved DOWN.  Where ``2x worst`` came out at or
+#   above the previously committed value the old value is kept verbatim and the
+#   row is annotated ``[NOT TIGHTENED]`` with the reason.  There are three such
+#   cells, all of them ``dgate``/``rel`` or ``dgate``/``ulp`` — see below.
+#
+# WHICH METRIC TO TRUST
+#
+#   ``rrmse`` is the SCALE-INVARIANT metric and the one to gate hard on: it is
+#   an l2 ratio over the whole vector, so it is insensitive to how densely the
+#   sweep happens to sample a cancellation root.  Measured seed-to-seed spread
+#   of ``rrmse`` over the 6 seeds is <= 1.2x on every cell.
+#
+#   ``rel`` (= ``Err.max_rel_sig``) is NOT scale-invariant in that sense.  It is
+#   a max over elements of a ratio whose denominator has a genuine zero
+#   (``gate_grad`` vanishes at g = -1.2187557268720095 for beta=4), so it grows
+#   monotonically with the sampling density: for ``dgate`` it measures 5.3e-6 at
+#   n=2048 and 2.8e-5 at n=2^26 purely because denser sampling lands closer to
+#   the root.  The ``rel``/``rel_p``/``rel_a`` bands below are therefore ONLY
+#   valid at the committed ``n = N_DEFAULT = 8192`` (and the FD table's
+#   ``n = 2048``).  ANYONE WHO INCREASES ``n`` MUST RE-BASELINE THE ``rel``
+#   COLUMNS; the ``rrmse`` and ``ulp`` columns are stable under n.
+#
+#   ``ulp`` = max_abs / (max|ref| * 2^-23), i.e. absolute error expressed in
+#   float32 ulp of the largest element of the answer.  1.0 is the f32 floor.
 #
 # A limit of ``None`` means "this statistic is meaningless for this cell and is
 # only reported, not asserted"; the accompanying absolute bound carries the
@@ -448,46 +501,63 @@ _Lim = namedtuple("_Lim", "rel_p rrmse_p ulp_p rel_a rrmse_a ulp_a abs_")
 # is judged with the same limits as ``out``; they measured identical everywhere.
 LIMITS = {
     # ---- ordinary training data: ~1-2 f32 ulp for precise ------------------
-    ("randn1", "out"):   _Lim(1.6e-6, 4.0e-7, 6.0, 2.5e-4, 2.0e-5, 450.0, None),
-    ("randn1", "dgate"): _Lim(3.5e-5, 3.0e-7, 4.0, 2.0e-3, 1.5e-5, 150.0, None),
-    ("randn1", "dup"):   _Lim(1.5e-6, 3.5e-7, 4.0, 2.5e-4, 2.0e-5, 450.0, None),
-    ("randn3", "out"):   _Lim(1.5e-6, 4.0e-7, 8.0, 4.0e-4, 2.5e-5, 300.0, None),
-    ("randn3", "dgate"): _Lim(5.0e-5, 5.0e-7, 9.0, 2.5e-3, 2.5e-5, 300.0, None),
-    ("randn3", "dup"):   _Lim(1.2e-6, 3.0e-7, 4.0, 4.0e-4, 2.0e-5, 200.0, None),
+    # [NOT TIGHTENED] ("randn1", "dgate") rel_p stays 3.5e-5: worst over the 6
+    # seeds is 2.27e-5 (committed seed measures 8.3e-6, i.e. a 2.7x seed swing),
+    # so 2x worst = 4.6e-5 would be a LOOSENING.  This is the gate_grad-root
+    # sensitivity described above, not slack in the kernel — rrmse_p for the same
+    # cell tightened 1.8x and is the meaningful gate.
+    # [NOT TIGHTENED] ("randn1", "dgate") ulp_a stays 150: worst 73.5, 2x = 147
+    # rounds up to exactly 150.  No headroom left under the rule.
+    ("randn1", "out"):   _Lim(7.7e-7, 2.0e-7, 3.3, 1.4e-4, 1.2e-5, 230.0, None),
+    ("randn1", "dgate"): _Lim(3.5e-5, 1.7e-7, 2.8, 1.7e-3, 7.0e-6, 150.0, None),
+    ("randn1", "dup"):   _Lim(7.1e-7, 1.9e-7, 2.3, 1.4e-4, 9.2e-6, 220.0, None),
+    # [NOT TIGHTENED] ("randn3", "dgate") rel_a stays 2.5e-3: the worst over the
+    # 6 seeds is 3.97e-3, which already EXCEEDS the committed limit (the
+    # committed seed measures 5.6e-4 — a 7x seed swing).  The old bound only
+    # holds because the seed is pinned; tightening it is impossible and even
+    # keeping it is contingent on ``_sweep``'s fixed seed.  Gate on rrmse_a
+    # (tightened 1.8x) instead.
+    ("randn3", "out"):   _Lim(8.0e-7, 2.0e-7, 3.7, 2.0e-4, 1.2e-5, 170.0, None),
+    ("randn3", "dgate"): _Lim(3.4e-5, 2.5e-7, 5.3, 2.5e-3, 1.4e-5, 230.0, None),
+    ("randn3", "dup"):   _Lim(6.5e-7, 1.5e-7, 1.9, 1.9e-4, 1.1e-5, 110.0, None),
     # ---- |g|,|u| <= 1e-6: tanh(x) ~ x, so this is pure rounding ------------
-    # Note the approx limits equal the precise ones: MUFU.TANH is *not* worse
-    # here (see test_precise_and_approx_tie_near_zero).
-    ("near_zero", "out"):   _Lim(1.1e-6, 3.0e-7, 7.0, 1.1e-6, 3.0e-7, 7.0, None),
-    ("near_zero", "dgate"): _Lim(1.2e-6, 3.5e-7, 5.0, 1.2e-6, 3.5e-7, 5.0, None),
-    ("near_zero", "dup"):   _Lim(8.0e-7, 2.5e-7, 4.0, 8.0e-7, 2.5e-7, 4.0, None),
+    # The approx limits stay within ~10% of the precise ones: MUFU.TANH is *not*
+    # worse here (see test_precise_and_approx_tie_near_zero).  They are no longer
+    # forced equal — each side now carries its own measured bound, which is
+    # strictly stronger than sharing the looser of the two.
+    ("near_zero", "out"):   _Lim(5.3e-7, 1.4e-7, 3.4, 5.1e-7, 1.2e-7, 3.5, None),
+    ("near_zero", "dgate"): _Lim(6.0e-7, 1.6e-7, 3.3, 6.0e-7, 1.6e-7, 3.3, None),
+    ("near_zero", "dup"):   _Lim(3.8e-7, 1.2e-7, 1.9, 3.3e-7, 9.3e-8, 1.4, None),
     # ---- tanh saturated: |g/beta| >= 10 -----------------------------------
-    ("saturate", "out"):   _Lim(3.0e-8, 2.0e-8, 0.3, 2.5e-5, 1.2e-5, 180.0, None),
+    ("saturate", "out"):   _Lim(1.3e-8, 7.6e-9, 0.098, 1.1e-5, 6.0e-6, 81.0, None),
     # dgate is judged by an ABSOLUTE bound only.  In this regime f32 rounds
     # ``t = tanhf(g/4)`` to exactly +-1, so ``1 - t*t`` is exactly 0 and the
     # kernel returns dgate = 0 while the fp64 oracle keeps ~4e-9.  Every element
     # of the sweep is in that regime, so max_rel = rrmse = 1.0 and ulp = 2^23 by
-    # construction.  This is inherent to f32, not a kernel defect: the whole
-    # answer is <= 2.6e-4 in absolute terms (2.5e-4 comes from lb=None, where
-    # up_act = u = 1e4 multiplies the residual).  Bounding |dgate| itself is the
-    # only statement with content.
-    ("saturate", "dgate"): _Lim(None, None, None, None, None, None, 1.0e-3),
-    ("saturate", "dup"):   _Lim(1.5e-6, 1.5e-6, 11.0, 2.5e-4, 2.5e-4, 2000.0, None),
+    # construction.  This is inherent to f32, not a kernel defect: bounding
+    # |dgate| itself is the only statement with content.  Worst measured over the
+    # 6 seeds is 2.83e-4 (it comes from lb=None, where up_act = u = 1e4
+    # multiplies the residual), so the bound is 5.7e-4 rather than the old 1e-3.
+    ("saturate", "dgate"): _Lim(None, None, None, None, None, None, 5.7e-4),
+    ("saturate", "dup"):   _Lim(7.1e-7, 7.0e-7, 5.5, 1.2e-4, 1.2e-4, 990.0, None),
     # ---- exact zeros, +-beta, +-linear_beta, 1e-30 .. 1e30 -----------------
     # Judged on ulp (scale-relative) rather than an absolute bound: with lb=None
     # the answer legitimately reaches 4e30, so any fixed atol is meaningless.
-    ("boundary", "out"):   _Lim(6.0e-7, 1.0e-7, 2.0, 1.6e-4, 2.5e-5, 400.0, None),
-    ("boundary", "dgate"): _Lim(9.0e-7, 2.5e-7, 4.0, 1.5e-4, 3.0e-5, 550.0, None),
-    ("boundary", "dup"):   _Lim(1.5e-6, 1.5e-7, 2.0, 4.0e-4, 2.5e-5, 250.0, None),
+    ("boundary", "out"):   _Lim(2.6e-7, 3.0e-8, 0.62, 7.9e-5, 1.1e-5, 180.0, None),
+    ("boundary", "dgate"): _Lim(4.8e-7, 1.3e-7, 1.8, 6.6e-5, 1.5e-5, 270.0, None),
+    ("boundary", "dup"):   _Lim(7.5e-7, 8.4e-8, 1.3, 2.0e-4, 1.3e-5, 140.0, None),
     # ---- gate ~ N(0,1.5), up ~ N(0,50): straddles the linear_beta knee -----
-    ("mixed_scale", "out"):   _Lim(1.5e-6, 3.5e-7, 6.0, 3.5e-4, 2.5e-5, 400.0, None),
-    ("mixed_scale", "dgate"): _Lim(6.0e-5, 3.0e-7, 5.0, 3.0e-3, 2.0e-5, 250.0, None),
-    ("mixed_scale", "dup"):   _Lim(1.0e-4, 4.5e-7, 5.0, 5.0e-4, 4.0e-5, 400.0, None),
+    ("mixed_scale", "out"):   _Lim(8.3e-7, 1.8e-7, 3.4, 1.9e-4, 1.2e-5, 200.0, None),
+    ("mixed_scale", "dgate"): _Lim(4.0e-5, 1.6e-7, 3.6, 1.9e-3, 8.4e-6, 180.0, None),
+    ("mixed_scale", "dup"):   _Lim(5.2e-5, 2.5e-7, 2.7, 2.9e-4, 2.0e-5, 190.0, None),
     # ---- dense sampling through the root of d(gate_act)/dg (g ~ -1.22) -----
-    # max_rel_sig is intrinsically loose for dgate here: even after the SIG_FRAC
-    # filter, elements 1e-3 of the way to the peak sit right on the root.
-    ("gate_grad_root", "out"):   _Lim(1.6e-6, 4.0e-7, 9.0, 1.5e-4, 3.5e-5, 750.0, None),
-    ("gate_grad_root", "dgate"): _Lim(3.5e-4, 8.0e-7, 8.0, 1.6e-2, 4.0e-5, 320.0, None),
-    ("gate_grad_root", "dup"):   _Lim(1.6e-6, 4.0e-7, 13.0, 1.5e-4, 3.5e-5, 950.0, None),
+    # rel is intrinsically loose for dgate here: even after the SIG_FRAC filter,
+    # elements 1e-3 of the way to the peak sit right on the root.  This sweep is
+    # a deterministic ``linspace``, so its ``rel`` numbers would move under any
+    # change to ``n`` — see the re-baseline warning above.
+    ("gate_grad_root", "out"):   _Lim(8.0e-7, 2.1e-7, 4.2, 7.5e-5, 1.8e-5, 360.0, None),
+    ("gate_grad_root", "dgate"): _Lim(1.6e-4, 4.1e-7, 4.2, 7.8e-3, 2.2e-5, 190.0, None),
+    ("gate_grad_root", "dup"):   _Lim(7.5e-7, 1.9e-7, 6.3, 6.8e-5, 1.7e-5, 470.0, None),
 }
 
 
@@ -560,25 +630,39 @@ def test_oracle_vs_paddlefleet_random():
             e = Err(a, b)
             print(f"  [paddlefleet lb={lb} {name}] {e}")
             assert e.n_bad == 0
-            assert e.rrmse < 1e-6, f"paddlefleet {name} rrmse {e.rrmse:.3e}"
+            # rrmse: worst over 6 seeds 1.37e-7 -> 2x, 2 s.f. = 2.8e-7 (3.6x
+            # tighter than the old 1e-6).
+            assert e.rrmse < 2.8e-7, f"paddlefleet {name} rrmse {e.rrmse:.3e}"
+            # [NOT TIGHTENED] max_rel_sig stays 1e-5.  Worst over 6 seeds is
+            # 1.04e-5, which already exceeds this bound (the committed seed 7
+            # measures 3.3e-6).  PaddleFleet computes in f32 internally, so this
+            # statistic is a max over 512 elements of an f32-vs-fp64 ratio that
+            # spikes wherever the fp64 answer is a cancellation residue; it is
+            # seed-luck, not headroom.  rrmse above is the real gate.
             assert e.max_rel_sig < 1e-5, f"paddlefleet {name} {e.max_rel_sig:.3e}"
 
 
-# Finite-difference vs analytic limits: (max_rel_sig, rrmse), 4x measured worst.
+# Finite-difference vs analytic limits: (max_rel_sig, rrmse).  Same rule as
+# ``LIMITS``: 2x the worst over 6 seeds x {lb=25, lb=None}, ceil to 2 s.f.
 # Both sides are fp64, so these bounds are about the *step size* and the
 # conditioning of the sweep, not about float32 at all.
+# NOTE these are measured at ``n = 2048`` (the n this test uses), NOT at
+# ``N_DEFAULT``; the ``max_rel_sig`` column is sampling-density dependent for the
+# same reason as in ``LIMITS`` and must be re-baselined if ``n`` changes here.
 FD_LIMITS = {
-    "randn1":         (1.0e-8, 1.0e-10),   # measured 3.2e-9 / 1.6e-11
-    "randn3":         (5.0e-9, 1.0e-10),   # measured 9.1e-10 / 2.2e-11
-    "near_zero":      (1.0e-11, 1.0e-11),  # measured 2.1e-12 / 2.1e-12
+    "randn1":         (9.2e-9, 3.1e-11),   # worst over seeds 4.55e-9 / 1.54e-11
+    # [NOT TIGHTENED] randn3 rel stays 5.0e-9: worst over seeds is 2.82e-9, so
+    # 2x = 5.6e-9 would loosen it.  Only 1.8x headroom remains at this cell.
+    "randn3":         (5.0e-9, 4.4e-11),   # worst over seeds 2.82e-9 / 2.20e-11
+    "near_zero":      (4.2e-12, 4.2e-12),  # worst 2.084e-12 / 2.083e-12 (seed-invariant)
     # dgate at |g/beta|>=10 is ~1e-7 while the forward value is ~1e5, so the
     # central difference loses ~12 digits to cancellation even in fp64. The
     # agreement is still 1e-4-level, which is far tighter than any plausible
     # formula error (a wrong derivative would be off by O(1)).
-    "saturate":       (3.0e-4, 2.0e-4),    # measured 6.6e-5 / 3.9e-5
-    "boundary":       (1.0e-9, 1.0e-10),   # measured 1.7e-10 / 1.1e-11
-    "mixed_scale":    (2.0e-8, 1.0e-10),   # measured 3.2e-9 / 2.7e-11
-    "gate_grad_root": (1.0e-7, 1.0e-9),    # measured 2.6e-8 / 7.9e-11
+    "saturate":       (1.4e-4, 7.8e-5),    # worst 6.58e-5 / 3.89e-5 (seed-invariant)
+    "boundary":       (3.5e-10, 2.5e-11),  # worst 1.72e-10 / 1.22e-11 (seed-invariant)
+    "mixed_scale":    (1.1e-8, 5.4e-11),   # worst over seeds 5.42e-9 / 2.69e-11
+    "gate_grad_root": (5.7e-8, 1.7e-10),   # worst over seeds 2.80e-8 / 8.31e-11
 }
 
 
@@ -673,10 +757,16 @@ def test_fwd_bwd_out_agree(lb, precise, packed):
     print(f"\n  [fwd-vs-bwd out lb={lb} {'precise' if precise else 'approx'} "
           f"{'packed' if packed else 'scalar'}] bitwise-differing="
           f"{n_diff}/{fwd.numel()}, max_abs_diff={max_d:.3e}")
-    # Not asserted bit-exact (the epilogues never require it); assert they are
-    # within a couple of f32 ulp so recompute-vs-save-z paths stay consistent.
+    # Measurement over 6 seeds x {lb=25, lb=None} x {precise, approx} x
+    # {scalar, packed} = 48 configurations: the two expression trees are
+    # BIT-IDENTICAL in all 48 (0 differing elements, max_abs_diff exactly 0.0).
+    # The assertion is 1 f32 ulp rather than literal bit-equality only so that a
+    # benign fma reassociation by a future nvcc/cutlass-dsl does not fail the
+    # suite; 1 ulp is already 8x tighter than the previous 8-ulp bound and any
+    # real divergence between the saved-z and recompute-z epilogue paths would be
+    # orders of magnitude larger.
     scale = max(fwd.double().abs().max().item(), 1e-30)
-    assert max_d <= 8 * scale * 1.1920929e-7, (
+    assert max_d <= 1 * scale * 1.1920929e-7, (
         f"situ_glu and dsitu_glu disagree on the forward value by {max_d:.3e} "
         f"(scale {scale:.3e}) — the epilogue's saved-z and recompute-z paths "
         f"would diverge")
@@ -704,8 +794,12 @@ def test_scalar_vs_packed(lb, precise):
         print(f"  [scalar-vs-packed lb={lb} {'precise' if precise else 'approx'} "
               f"{name}] bitwise-differing={nbit}/{a.numel()}  {e}")
         assert e.n_bad == 0
-        assert e.rrmse < 1e-6, f"packed vs scalar {name} rrmse {e.rrmse:.3e}"
-        assert e.ulp_norm <= 8.0, (
+        # Worst over 6 seeds x {lb=25, lb=None} x {precise, approx}:
+        # rrmse 5.52e-8, ulp 1.235 (with ~3.2k of 8192 elements differing in
+        # their last bits, so this is NOT bit-identical for randn3 and the bound
+        # has to be numeric).  2x + 2 s.f. -> 1.2e-7 and 2.5.
+        assert e.rrmse < 1.2e-7, f"packed vs scalar {name} rrmse {e.rrmse:.3e}"
+        assert e.ulp_norm <= 2.5, (
             f"packed vs scalar {name} differ by {e.ulp_norm:.1f} f32-ulp")
 
 
@@ -814,6 +908,14 @@ def test_precise_beats_approx():
     tie is asserted as a tie (see ``TIE_BAND``) rather than swept under the rug.
     """
     # A ratio inside [1/TIE_BAND, TIE_BAND] counts as "same accuracy".
+    # [NOT TIGHTENED] TIE_BAND stays 1.5.  This is not an error bound but a
+    # two-sided equality window, and its *lower* edge (1/1.5 = 0.667) is what
+    # decides whether a cell is reported as a LOSS.  The measured minimum ratio
+    # over 6 seeds is 0.799 (committed seed: 0.7992, in the near-zero region
+    # where approx legitimately ties or edges ahead), so the next step down,
+    # TIE_BAND = 1.25 -> lower edge 0.800, would fail on the committed seed.
+    # There is no room; the strictness here is carried by ``geo`` and by the
+    # per-cell realistic-sweep margin below.
     TIE_BAND = 1.5
     rows = []
     for sweep in SWEEPS:
@@ -866,7 +968,7 @@ def test_precise_beats_approx():
                   f"precise rrmse {r[4]:.3e} vs approx {r[5]:.3e} ({r[8]:.2f}x)")
     print("=" * 112 + "\n")
 
-    assert geo > 5.0, (
+    assert geo > 14.0, (
         f"precise=True is only {geo:.2f}x better than precise=False in "
         f"geometric-mean RRMSE. If this is <= 1, precise=True should NOT be the "
         f"default and the extra expf/tanhf cost is being paid for nothing.")
@@ -874,10 +976,13 @@ def test_precise_beats_approx():
         f"precise=True was materially LESS accurate than precise=False in "
         f"{len(losses)} of {len(rows)} measurements: {losses[:3]}")
     # Per-cell margin on the sweeps that look like real activations.
+    # Mirror of the LIMITS rule for a one-sided lower bound: floor to 2 s.f. of
+    # (minimum over 6 seeds / 2).  Measured minimum over the realistic sweeps is
+    # 23.87x (per-seed minima 23.9 .. 28.0), so the bar is 11.0x, up from 10.0x.
     REALISTIC = {"randn1", "randn3", "mixed_scale"}
-    thin = [r for r in rows if r[0] in REALISTIC and r[8] < 10.0]
+    thin = [r for r in rows if r[0] in REALISTIC and r[8] < 11.0]
     assert not thin, (
-        f"precise=True wins by less than 10x on realistic data in "
+        f"precise=True wins by less than 11x on realistic data in "
         f"{len(thin)} cells: {thin[:3]}")
 
 
@@ -896,6 +1001,13 @@ def test_precise_and_approx_tie_near_zero():
     (see ``test_precise_beats_approx``), not on the near-zero tail.  This test
     pins the tie so a future regression in either direction is visible.
     """
+    # [NOT TIGHTENED] TIE_BAND stays 2.0.  Like the band in
+    # test_precise_beats_approx this is a two-sided equality window, not an error
+    # bound, and the binding edge is the lower one: measured ratios over 6 seeds
+    # are out 0.856-0.876, dgate 0.946-0.991, dup 0.812-0.843, so the minimum is
+    # 0.812 and a band of 1.25 (lower edge 0.800) would sit 1.5% from a flake.
+    # The precision requirement of this test is carried by the ulp floor below,
+    # which IS tightened (7.0 -> 3.5).
     TIE_BAND = 2.0
     g, u, d = _sweep("near_zero")
     out_ref, dg_ref, du_ref = _oracle(g, u, d, LINEAR_BETA)
@@ -921,8 +1033,9 @@ def test_precise_and_approx_tie_near_zero():
             f"Either a tanh implementation changed or the sweep drifted; "
             f"re-measure before adjusting this bound.")
         # Both must still be at the f32 noise floor: ~1 ulp of the peak.
+        # Worst ulp over 6 seeds x {precise, approx} = 1.744 -> 2x, 2 s.f. = 3.5.
         for nm, e in (("precise", p), ("approx", a)):
-            assert e.ulp_norm <= 7.0, (
+            assert e.ulp_norm <= 3.5, (
                 f"near_zero {qn} {nm} is {e.ulp_norm:.1f} f32-ulp off the "
                 f"oracle; the near-zero path is no longer exact-to-rounding")
 
