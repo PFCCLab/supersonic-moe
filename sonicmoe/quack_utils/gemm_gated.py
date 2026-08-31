@@ -52,6 +52,12 @@ from ._gated_epilogues import (
     BlockscaledQuantOnlyMixin,
 )
 
+from .activation_situ import (
+    is_situ_activation,
+    is_supported_activation,
+    resolve_gate_fn,
+)
+
 from .gemm_sm100_fp8_zeromat import (
     GemmGatedSm100ZeroMat,
     GemmGatedSm100ZeroMatBlockscaledQuant,
@@ -161,6 +167,18 @@ gate_fn_map = {
     "geglu": quack.activation.geglu,
     "glu": quack.activation.glu,
 }
+# `activation` may also be a SiTU-GLU descriptor, e.g. "situ_glu:b=4.0:lb=25.0".
+# Those are resolved by `resolve_gate_fn` instead of a dict lookup, because the
+# betas are baked into the traced kernel as Constexpr values.
+
+
+def _reject_situ_clamp(activation, swiglu_clamp_value) -> None:
+    """SiTU-GLU has no clamped variant, so never silently drop a requested clamp."""
+    if is_situ_activation(activation) and float(swiglu_clamp_value) > 0.0:
+        raise ValueError(
+            f"swiglu_clamp_value={swiglu_clamp_value} is not supported for activation "
+            f"{activation!r}: SiTU-GLU has no clamped variant. Pass swiglu_clamp_value=0.0."
+        )
 
 
 _GATED_FFI_CLASSES = {
@@ -245,7 +263,7 @@ def _compile_gemm_gated_tvm_ffi(
         epi_kwargs["postact_bf16_trunc"] = bool(postact_bf16_trunc)
     epi_args = GemmCls.EpilogueArguments(
         mPostAct,
-        gate_fn_map[activation],
+        resolve_gate_fn(activation, gate_fn_map),
         swiglu_clamp_value=float(swiglu_clamp_value),
         mRowVecBroadcast=None,
         mColVecBroadcast=None,
@@ -567,8 +585,11 @@ def try_gemm_gated_tvm_ffi_sonic_fast(
         "on",
     }:
         return False
+    # Nothing below is swiglu-specific: `activation` is only forwarded to the
+    # compile cache key and to `resolve_gate_fn`, so SiTU descriptors are fine.
+    _reject_situ_clamp(activation, swiglu_clamp_value)
     if (
-        activation != "swiglu"
+        not (activation == "swiglu" or is_situ_activation(activation))
         or D is None
         or PostAct is None
         or C is not None
@@ -757,6 +778,10 @@ def gemm_gated(
     current_stream=None,
 ) -> None:
     if activation != "swiglu":
+        # SiTU-GLU has no clamped variant: raise rather than silently changing
+        # the numerics the caller asked for. Legacy non-swiglu activations keep
+        # their historical silent-zero behaviour.
+        _reject_situ_clamp(activation, swiglu_clamp_value)
         swiglu_clamp_value = 0.0
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
@@ -768,7 +793,7 @@ def gemm_gated(
     if gather_A:
         assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
-    assert activation in gate_fn_map, f"Unsupported activation {activation}"
+    assert is_supported_activation(activation, gate_fn_map), f"Unsupported activation {activation}"
 
     # Special validation for PostAct shape
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
@@ -889,7 +914,7 @@ def gemm_gated(
         if info.tensor is not None and name in major_configs:
             leading_dim = 1 if info.major == major_configs[name][1] else 0
             info.cute_tensor = _make_cute_tensor_dynamic(info.tensor, leading_dim)
-    act_fn = gate_fn_map[activation]
+    act_fn = resolve_gate_fn(activation, gate_fn_map)
     epi_kwargs = {}
     if epilogue_quant:
         epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)

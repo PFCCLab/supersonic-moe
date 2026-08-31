@@ -63,6 +63,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "--clear", action="store_true",
         help="Wipe the disk cache + sentinel before warming.",
     )
+    p.add_argument(
+        "--activation", default=None,
+        help=(
+            "Activation to warm. Defaults to swiglu. Use an encoded SiTU "
+            "descriptor to warm a SiTU config, e.g. 'situ_glu:b=4.0:lb=25.0' "
+            "(the betas are baked into the kernel, so they are part of the "
+            "warmup sentinel and each pair needs its own warmup)."
+        ),
+    )
     return p
 
 
@@ -110,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 E=args.E, H=args.H, I=args.I, fp8=fp8,
                 total_K_list=ks, workers=args.workers,
                 cache_dir=args.cache_dir,
+                activation_type=args.activation,
             )
             ran_any = True
             logging.info("[warmup-cli] parallel cold warmup fp8=%s %.1fs",
@@ -126,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
                 total_K_list=ks,
                 max_workers=args.max_workers,
                 force=args.force,
+                activation_type=args.activation,
             ) or ran
     stats = cache_stats()
     logging.info("[warmup-cli] cache_root = %s", get_cache_root())

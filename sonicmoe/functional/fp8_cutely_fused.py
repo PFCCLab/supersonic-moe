@@ -6,8 +6,38 @@ from __future__ import annotations
 
 import torch
 
+from ..enums import ActivationType
 from .fp8_protocol import FP8Protocol, validate_fp8_runtime_support
 from .fp8_quant import dequantize_activation_blockwise, quantize_activation_blockwise, round_scale_to_e8m0
+
+
+def _reject_situ_activation(activation_type, site: str) -> None:
+    """Refuse SiTU-GLU: this module's fused kernel is hard-wired to SwiGLU.
+
+    ``cutify.fused_weighted_swiglu_act_quant_best`` computes SwiGLU internally,
+    so there is no way to express ``situ(g, beta) * up_act(u, lb)`` here.
+    Silently returning a SwiGLU postact would be a wrong-activation bug, so
+    raise instead.  Deliberately a cheap prefix check rather than an import of
+    ``quack_utils.activation_situ`` (which pulls in cutlass at import time).
+    """
+    if activation_type is None:
+        return
+    is_situ = activation_type is ActivationType.SITU_GLU or (
+        isinstance(activation_type, str)
+        and activation_type.split(":", 1)[0] == ActivationType.SITU_GLU.value
+    )
+    if is_situ:
+        raise NotImplementedError(
+            f"sonicmoe/functional/fp8_cutely_fused.py [{site}]: the fused "
+            "cutify preact path is SwiGLU-only "
+            "(fused_weighted_swiglu_act_quant_best) and cannot express "
+            "situ_glu. Disable the fused SwiGLU quant adapter "
+            "(SonicMoEConfig(fused_swiglu_quant=False) / "
+            "SONIC_MOE_FP8_FUSED_SWIGLU_QUANT=0) or run the fused gated "
+            "CUTLASS epilogue path (fused_gated=True), which computes the "
+            "SiTU epilogue natively. Falling back to swiglu is deliberately "
+            "not done."
+        )
 
 
 def _get_cutify():
@@ -85,7 +115,15 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
     scale_out: torch.Tensor | None = None,
     restored_out: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
+    activation_type=None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # The fused branch below computes SwiGLU inside cutify; refuse situ_glu
+    # before doing any work.  The group_size != 128 fallback is
+    # activation-agnostic (it only quantizes an already-computed postact), but
+    # this call cannot know which branch a caller wanted, so reject up front.
+    _reject_situ_activation(
+        activation_type, "apply_preact_activation_fp8_protocol_cutely_fused"
+    )
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), preact.device, quack_enabled=quack_enabled)
     if output_dtype is None:
         if postact is None:

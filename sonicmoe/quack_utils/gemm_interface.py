@@ -3,7 +3,7 @@
 # ********************************************************************************
 
 from functools import partial
-from typing import Literal, Optional, Tuple
+from typing import Optional, Tuple
 
 import paddle
 import torch
@@ -138,7 +138,9 @@ def gemm_gated_tuned(
     postact_out: Tensor,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    # "swiglu" | "swiglu_oai" | "reglu" | "geglu" | "glu", or a SiTU-GLU
+    # descriptor such as "situ_glu:b=4.0:lb=25.0" (see activation_situ.py).
+    activation: str = "swiglu",
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
@@ -253,7 +255,9 @@ def gemm_dgated_tuned(
     dx_out: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    # "swiglu" | "swiglu_oai" | "reglu" | "geglu" | "glu", or a SiTU-GLU
+    # descriptor such as "situ_glu:b=4.0:lb=25.0" (see activation_situ.py).
+    activation: str = "swiglu",
     # whether to do colvec reduction, returning (M,) or (L, M) or (total_M) if varlen_m
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,  # (L+1), int32
@@ -339,7 +343,9 @@ def gemm_gated(
     B: Tensor,  # (K, N) or (L, K, N)
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    # "swiglu" | "swiglu_oai" | "reglu" | "geglu" | "glu", or a SiTU-GLU
+    # descriptor such as "situ_glu:b=4.0:lb=25.0" (see activation_situ.py).
+    activation: str = "swiglu",
     preact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     postact_out: Optional[Tensor] = None,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
@@ -426,7 +432,9 @@ def gemm_gated_out(
     postact_out: Tensor,  # (M, N//2) or (L, M, N//2) or (total_M, N//2) if varlen_m
     C: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     bias: Optional[Tensor] = None,  # (N,) or (L, N)
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    # "swiglu" | "swiglu_oai" | "reglu" | "geglu" | "glu", or a SiTU-GLU
+    # descriptor such as "situ_glu:b=4.0:lb=25.0" (see activation_situ.py).
+    activation: str = "swiglu",
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
@@ -451,7 +459,9 @@ def gemm_dgated(
     B: Tensor,  # (K, N) or (L, K, N)
     PreAct: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    # "swiglu" | "swiglu_oai" | "reglu" | "geglu" | "glu", or a SiTU-GLU
+    # descriptor such as "situ_glu:b=4.0:lb=25.0" (see activation_situ.py).
+    activation: str = "swiglu",
     dx_out: Optional[Tensor] = None,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     postact_out: Optional[Tensor] = None,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     out_dtype: Optional[torch.dtype] = None,
@@ -521,7 +531,9 @@ def gemm_dgated_out(
     dx_out: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    # "swiglu" | "swiglu_oai" | "reglu" | "geglu" | "glu", or a SiTU-GLU
+    # descriptor such as "situ_glu:b=4.0:lb=25.0" (see activation_situ.py).
+    activation: str = "swiglu",
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
@@ -560,7 +572,9 @@ def gemm_dgated_out_fake(
     dx_out: Tensor,  # (M, 2*N) or (L, M, 2*N) or (total_M, 2*N) if varlen_m
     postact_out: Tensor,  # (M, N) or (L, M, N) or (total_M, N) if varlen_m
     colvec_scale: Optional[Tensor] = None,  # (M,) or (L, M) or (total_M,) if varlen_m
-    activation: Literal["swiglu", "swiglu_oai", "reglu", "geglu", "glu"] = "swiglu",
+    # "swiglu" | "swiglu_oai" | "reglu" | "geglu" | "glu", or a SiTU-GLU
+    # descriptor such as "situ_glu:b=4.0:lb=25.0" (see activation_situ.py).
+    activation: str = "swiglu",
     colvec_reduce: bool = False,
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m

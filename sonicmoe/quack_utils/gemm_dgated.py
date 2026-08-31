@@ -56,6 +56,12 @@ from ._gated_epilogues import (
     GemmDGatedFP8CLoadMixin,
 )
 
+from .activation_situ import (
+    is_situ_activation,
+    is_supported_activation,
+    resolve_dgate_fn,
+)
+
 from .gemm_sm100_fp8_zeromat import (
     GemmDGatedSm100ZeroMat,
     GemmDGatedFP8CLoadSm100ZeroMat,
@@ -86,6 +92,8 @@ dgate_fn_map = {
     "geglu": quack.activation.dgeglu,
     "glu": quack.activation.dglu,
 }
+# `activation` may also be a SiTU-GLU descriptor, e.g. "situ_glu:b=4.0:lb=25.0";
+# see `resolve_dgate_fn`.
 
 
 _DGATED_FFI_CLASSES = {
@@ -187,7 +195,7 @@ def _compile_gemm_dgated_tvm_ffi(
         )
     epi_args = GemmCls.EpilogueArguments(
         mPostAct,
-        dgate_fn_map[activation],
+        resolve_dgate_fn(activation, dgate_fn_map),
         swiglu_clamp_value=float(swiglu_clamp_value),
         mColVecBroadcast=mColVec,
         mColVecReduce=mColVecReduce,
@@ -370,6 +378,14 @@ def gemm_dgated(
 ) -> None:
     """If tile_count_semaphore is provided, it must already be zero'ed out."""
     if activation != "swiglu":
+        # SiTU-GLU has no clamped variant: raise rather than silently changing
+        # the numerics the caller asked for. Legacy non-swiglu activations keep
+        # their historical silent-zero behaviour.
+        if is_situ_activation(activation) and float(swiglu_clamp_value) > 0.0:
+            raise ValueError(
+                f"swiglu_clamp_value={swiglu_clamp_value} is not supported for activation "
+                f"{activation!r}: SiTU-GLU has no clamped variant. Pass swiglu_clamp_value=0.0."
+            )
         swiglu_clamp_value = 0.0
     fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
     if cu_seqlens_m is not None:
@@ -383,7 +399,7 @@ def gemm_dgated(
     if gather_A:
         assert cu_seqlens_m is not None, "gather_A requires varlen (cu_seqlens_m must be specified)"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
-    assert activation in dgate_fn_map, f"Unsupported activation {activation}"
+    assert is_supported_activation(activation, dgate_fn_map), f"Unsupported activation {activation}"
 
     # Special handling for Out and PreAct
     AB_swapped = not Out.stride(-1) == 1
@@ -503,7 +519,7 @@ def gemm_dgated(
                 info.tensor,
                 leading_dim=1 if info.major == major_configs[name][1] else 0,
             )
-    act_fn = dgate_fn_map[activation]
+    act_fn = resolve_dgate_fn(activation, dgate_fn_map)
     epi_kwargs = {}
     if fp8_preact_mode:
         epi_kwargs["mFP8PreAct_fp8"] = _make_cute_tensor_dynamic(preact_fp8, leading_dim=1)

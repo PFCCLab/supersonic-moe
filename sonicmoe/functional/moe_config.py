@@ -36,9 +36,33 @@ class HopperGEMMConfig:
     initial_d_epi_stage: cutlass.Constexpr[int] = 4
 
 
+def _reject_situ_bf16(activation_type, site: str) -> None:
+    """Refuse SiTU-GLU on the Hopper WGMMA (BF16) MoE kernels.
+
+    These kernels select their epilogue with compile-time booleans
+    (``compute_swiglu`` / ``compute_geglu`` / ...) and have no SiTU epilogue.
+    SiTU-GLU is FP8-only in SonicMoE today, so raise with a specific message
+    instead of letting it fall into the generic "not supported yet" branch.
+    """
+    is_situ = activation_type is ActivationType.SITU_GLU or (
+        isinstance(activation_type, str)
+        and activation_type.split(":", 1)[0] == ActivationType.SITU_GLU.value
+    )
+    if is_situ:
+        raise NotImplementedError(
+            f"sonicmoe/functional/moe_config.py [{site}]: situ_glu is FP8-only "
+            "on SonicMoE today. The Hopper WGMMA BF16 grouped-GEMM kernels have "
+            "no SiTU epilogue (only swiglu/geglu/reglu/relu_sq/relu/silu/gelu). "
+            "Enable FP8 (SonicMoEConfig(use_fp8=True) / SONIC_MOE_FP8_MODE=1) so "
+            "the CUTLASS SM100 gated FP8 path is used. Falling back to swiglu is "
+            "deliberately not done."
+        )
+
+
 class HopperWgmma_MoE_Up_proj_Fwd:
     def __init__(self, E: int, H: int, I: int, activation_type: ActivationType, inference_mode=False):
         super().__init__()
+        _reject_situ_bf16(activation_type, "HopperWgmma_MoE_Up_proj_Fwd")
         is_glu_activation = is_glu(activation_type)
         if is_glu_activation:
             assert (
@@ -237,6 +261,7 @@ class HopperWgmma_MoE_Down_proj_Fwd:
 class HopperWgmma_MoE_Down_proj_ActGrad_Bwd:
     def __init__(self, E: int, H: int, I: int, activation_type: ActivationType):
         super().__init__()
+        _reject_situ_bf16(activation_type, "HopperWgmma_MoE_Down_proj_ActGrad_Bwd")
         is_glu_activation = is_glu(activation_type)
         if is_glu_activation:
             assert (

@@ -102,6 +102,153 @@ _GATED_OUTPUT_PAYLOAD_ATTR = "_sonic_preallocated_gated_outputs"
 
 
 # ---------------------------------------------------------------------------
+# Activation representation boundary
+# ---------------------------------------------------------------------------
+# Two representations of "which activation" coexist, and this module is the
+# only place they meet:
+#
+#   1. Upper layers (interface.run_sonic_moe, ernie_compat.mlp_node_v2,
+#      moe.MoE, jit_warmup, moe_TC_softmax_topk_layer, and the
+#      _UpProjection / _DownProjection signatures) carry an
+#      ``ActivationType`` enum member plus, for SiTU, two separate beta
+#      scalars living on ``_FP8Config`` (``cfg.situ_beta`` /
+#      ``cfg.situ_linear_beta``).
+#
+#   2. The quack_utils GEMM kernels (``gemm_gated`` / ``gemm_dgated`` /
+#      ``try_gemm_gated_tvm_ffi_sonic_prepared``) take a *string*, which is
+#      also part of every JIT / autotune cache key.  For SiTU that string
+#      must additionally encode the betas, because they are baked into the
+#      traced kernel as Constexpr values:
+#      ``"situ_glu:b=4.0:lb=25.0"``.
+#
+# ``_gemm_activation_name()`` below is the single conversion point:
+# ``ActivationType`` (+ cfg) -> GEMM string, calling
+# ``encode_situ_activation()`` for SiTU.  Nothing else in this file, and
+# nothing above it, may build a GEMM activation string by hand.
+#
+# It is also the single place that refuses SiTU on the BF16 path: pass
+# ``fp8=False`` and a SiTU activation raises NotImplementedError, so it is
+# structurally impossible for a BF16 caller to silently fall back to SwiGLU.
+from ..quack_utils.activation_situ import (
+    encode_situ_activation,
+    is_situ_activation,
+    parse_situ_activation,
+)
+
+# ActivationType -> quack GEMM activation string.  Deliberately NOT
+# ``activation_type.value``: quack's ``"swiglu"`` entry already is
+# ``swiglu_precise``, and ``"swiglu_precise"`` is not a key in its
+# gate_fn_map / dgate_fn_map.  SITU_GLU is absent on purpose — it needs the
+# betas and is handled separately below.
+_GEMM_ACTIVATION_NAMES = {
+    ActivationType.SWIGLU: "swiglu",
+    ActivationType.SWIGLU_PRECISE: "swiglu",
+    ActivationType.GEGLU: "geglu",
+    ActivationType.REGLU: "reglu",
+}
+
+# Raw strings the quack kernels accept directly (no ActivationType member).
+_RAW_GEMM_ACTIVATIONS = frozenset({"swiglu", "swiglu_oai", "reglu", "geglu", "glu"})
+
+
+def _gemm_activation_name(
+    activation_type,
+    cfg=None,
+    *,
+    fp8: bool,
+    site: str,
+) -> str:
+    """Translate an ``ActivationType`` (or raw string) into a GEMM activation.
+
+    Parameters
+    ----------
+    activation_type:
+        ``ActivationType`` member, a raw quack activation string, or an
+        already-encoded ``"situ_glu:..."`` string.
+    cfg:
+        ``_FP8Config`` snapshot supplying ``situ_beta`` / ``situ_linear_beta``.
+        Only consulted for SiTU.
+    fp8:
+        Whether the call site is on the FP8 codepath.  SiTU on ``fp8=False``
+        raises: BF16 SiTU is not implemented in SonicMoE today and must never
+        silently degrade to SwiGLU.
+    site:
+        Human-readable call-site tag used in error messages.
+    """
+    # Already-encoded SiTU string (or the bare "situ_glu" prefix): validate and
+    # pass through, re-encoding to normalise the key.
+    if is_situ_activation(activation_type):
+        if not fp8:
+            raise NotImplementedError(
+                f"sonicmoe/functional/__init__.py [{site}]: situ_glu is FP8-only "
+                "on SonicMoE today; the BF16 (non-FP8) GEMM path has no SiTU "
+                "epilogue. Enable FP8 (SonicMoEConfig(use_fp8=True) / "
+                "SONIC_MOE_FP8_MODE=1) or use a SwiGLU-family activation. "
+                "Falling back to swiglu is deliberately not done."
+            )
+        beta, linear_beta, precise = parse_situ_activation(activation_type)
+        return encode_situ_activation(beta, linear_beta, precise)
+
+    if activation_type is ActivationType.SITU_GLU:
+        if not fp8:
+            raise NotImplementedError(
+                f"sonicmoe/functional/__init__.py [{site}]: situ_glu is FP8-only "
+                "on SonicMoE today; the BF16 (non-FP8) GEMM path has no SiTU "
+                "epilogue. Enable FP8 (SonicMoEConfig(use_fp8=True) / "
+                "SONIC_MOE_FP8_MODE=1) or use a SwiGLU-family activation. "
+                "Falling back to swiglu is deliberately not done."
+            )
+        if cfg is None:
+            cfg = _get_fp8_config()
+        return encode_situ_activation(
+            getattr(cfg, "situ_beta", None),
+            getattr(cfg, "situ_linear_beta", None),
+        )
+
+    name = _GEMM_ACTIVATION_NAMES.get(activation_type)
+    if name is not None:
+        return name
+    if isinstance(activation_type, str) and activation_type in _RAW_GEMM_ACTIVATIONS:
+        return activation_type
+    raise NotImplementedError(
+        f"sonicmoe/functional/__init__.py [{site}]: activation "
+        f"{activation_type!r} has no QuACK gated-GEMM epilogue. Supported: "
+        f"{sorted(_RAW_GEMM_ACTIVATIONS)} plus situ_glu (FP8 only)."
+    )
+
+
+def _coerce_activation_type(activation_type):
+    """Normalise a user-supplied activation into an ``ActivationType``.
+
+    Accepts ``ActivationType`` members, plain enum values (``"swiglu"``), and
+    encoded SiTU strings (``"situ_glu:b=4.0:lb=25.0"``) — the latter cannot go
+    through ``ActivationType(...)`` because the enum value is the bare
+    ``"situ_glu"``.  Encoded SiTU strings are returned unchanged so the betas
+    they carry are not lost; ``_gemm_activation_name`` handles both forms.
+    """
+    if isinstance(activation_type, ActivationType):
+        return activation_type
+    if isinstance(activation_type, str):
+        if is_situ_activation(activation_type):
+            # Validate now so a malformed string fails at the API boundary.
+            parse_situ_activation(activation_type)
+            return (
+                ActivationType.SITU_GLU
+                if activation_type == ActivationType.SITU_GLU.value
+                else activation_type
+            )
+        return ActivationType(activation_type)
+    return activation_type
+
+
+def _is_situ_activation_type(activation_type) -> bool:
+    """True for ``ActivationType.SITU_GLU`` or an encoded ``situ_glu:...``."""
+    return activation_type is ActivationType.SITU_GLU or is_situ_activation(
+        activation_type
+    )
+
+
+# ---------------------------------------------------------------------------
 # Standalone SwiGLU forward/backward (for blockscaled split path)
 # ---------------------------------------------------------------------------
 # SonicMoE stores w1 interleaved: [gate_row0, up_row0, gate_row1, ...].
@@ -262,6 +409,7 @@ def _fused_blockscaled_gated_forward(
     fp8_config: _FP8Config | None = None,
     current_stream=None,
     w1_pretransposed: bool = False,
+    activation_type=ActivationType.SWIGLU,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
@@ -331,6 +479,10 @@ def _fused_blockscaled_gated_forward(
     # and halves D bandwidth (192MB fp8 vs 384MB bf16).
     cfg = fp8_config if fp8_config is not None else _get_fp8_config()
     epilogue_quant = cfg.epilogue_quant and cfg.save_z_fp8
+    # ActivationType -> GEMM string (SiTU betas baked into the key here).
+    gemm_activation = _gemm_activation_name(
+        activation_type, cfg, fp8=True, site="_fused_blockscaled_gated_forward"
+    )
     N = w1.shape[1]  # pretransposed weight is (E, 2I, H)
     if epilogue_quant:
         z_scale_out = (
@@ -415,7 +567,7 @@ def _fused_blockscaled_gated_forward(
             w1_fp8,
             preact_out,
             postact_out,
-            activation="swiglu",
+            activation=gemm_activation,
             cu_seqlens_m=expert_frequency_offset,
             A_idx=x_gather_idx,
             a_scales=x_scales_tk_e8m0,
@@ -435,7 +587,7 @@ def _fused_blockscaled_gated_forward(
         z, y1 = gemm_gated(
             x_fp8,
             w1_fp8,
-            activation="swiglu",
+            activation=gemm_activation,
             preact_out=preact_out,
             postact_out=postact_out,
             out_dtype=z_out_dtype,
@@ -673,6 +825,7 @@ def _padded_blockscaled_gated_forward(
     w1: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
+    activation_type=ActivationType.SWIGLU,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """FP8 up-proj with padding for non-128-aligned expert segments.
 
@@ -688,7 +841,8 @@ def _padded_blockscaled_gated_forward(
     )
     if not needs_pad:
         z, y1, _y1_fp8, _y1_sc = _fused_blockscaled_gated_forward(
-            x, w1, expert_frequency_offset, x_gather_idx
+            x, w1, expert_frequency_offset, x_gather_idx,
+            activation_type=activation_type,
         )
         return z, y1
 
@@ -733,11 +887,15 @@ def _padded_blockscaled_gated_forward(
         or precompute_weight_fp8_for_fused_gated(w1)
     )
 
-    # Step 5: Zero-mat GEMM+SwiGLU with padded 128-aligned boundaries
+    # Step 5: Zero-mat GEMM+gated activation with padded 128-aligned boundaries
+    _padded_cfg = _get_fp8_config()
     z_padded, y1_padded = gemm_gated(
         x_fp8,
         w1_fp8,
-        activation="swiglu",
+        activation=_gemm_activation_name(
+            activation_type, _padded_cfg, fp8=True,
+            site="_padded_blockscaled_gated_forward",
+        ),
         out_dtype=torch.bfloat16,
         postact_dtype=torch.bfloat16,
         cu_seqlens_m=padded_cu,
@@ -746,7 +904,7 @@ def _padded_blockscaled_gated_forward(
         b_scales=w1_scales,
         dynamic_scheduler=False,
         tuned=False,
-        swiglu_clamp_value=_get_fp8_config().swiglu_clamp_value,
+        swiglu_clamp_value=_padded_cfg.swiglu_clamp_value,
     )
     del x_fp8, x_scales_tk_e8m0, padded_gather_idx
 
@@ -1332,6 +1490,7 @@ class _UpProjection(torch.autograd.Function):
                         fp8_config=cfg,
                         current_stream=stream_id,
                         w1_pretransposed=True,
+                        activation_type=activation_type,
                     )
                     if cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);
@@ -1390,6 +1549,19 @@ class _UpProjection(torch.autograd.Function):
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                     # y1.untyped_storage().resize_(0)
                 elif aligned:
+                    # Split GEMM + standalone Triton SwiGLU.  The Triton helpers
+                    # below are SwiGLU-only; there is no SiTU variant, so refuse
+                    # rather than silently computing the wrong activation.
+                    if _is_situ_activation_type(activation_type):
+                        raise NotImplementedError(
+                            "sonicmoe/functional/__init__.py "
+                            "[_UpProjection.forward split-GEMM path]: situ_glu has "
+                            "no standalone Triton activation kernel; only the fused "
+                            "gated CUTLASS epilogue supports it. Enable "
+                            "SonicMoEConfig(fused_gated=True) "
+                            "(SONIC_MOE_FP8_FUSED_GATED=1, the default). Falling "
+                            "back to swiglu is deliberately not done."
+                        )
                     w1_fp8, w1_scales = precompute_weight_fp8(w1.permute([1, 2, 0]))
                     # All segments 128-aligned: use fused gather+quantize
                     # and pre-quantized GEMM (no padding overhead).
@@ -1435,13 +1607,18 @@ class _UpProjection(torch.autograd.Function):
                     # path.  Overhead is only the extra padded GEMM rows (~5-25%
                     # depending on routing), much cheaper than full BF16 fallback.
                     z, y1 = _padded_blockscaled_gated_forward(
-                        x, w1.permute([1, 2, 0]), expert_frequency_offset, x_gather_idx
+                        x, w1.permute([1, 2, 0]), expert_frequency_offset, x_gather_idx,
+                        activation_type=activation_type,
                     )
             else:
                 z, y1 = gemm_gated(
                     x,
                     w1.permute(0, 2, 1),
-                    activation="swiglu",
+                    # BF16 path: _gemm_activation_name(fp8=False) refuses situ_glu.
+                    activation=_gemm_activation_name(
+                        activation_type, cfg, fp8=False,
+                        site="_UpProjection.forward bf16",
+                    ),
                     cu_seqlens_m=expert_frequency_offset,
                     A_idx=x_gather_idx,
                     postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
@@ -2496,7 +2673,10 @@ class _DownProjection(torch.autograd.Function):
                         z if not use_fp8_preact else dz,  # PreAct: bf16 z when not fp8, ignored otherwise
                         y1s,
                         None,
-                        "swiglu",
+                        _gemm_activation_name(
+                            activation_type, ctx._fp8_cfg, fp8=True,
+                            site="_DownProjection.backward fused dgated",
+                        ),
                         config.tile_m,
                         config.tile_n,
                         config.cluster_m,
@@ -2680,6 +2860,18 @@ class _DownProjection(torch.autograd.Function):
                     # _log_stage_memory("In backward, after w2 grad")
                     ds = ds[s_reverse_scatter_idx]
                 else:
+                    # Split GEMM + standalone Triton SwiGLU backward.  Mirrors the
+                    # forward split path: SwiGLU-only, no SiTU variant exists.
+                    if _is_situ_activation_type(activation_type):
+                        raise NotImplementedError(
+                            "sonicmoe/functional/__init__.py "
+                            "[_DownProjection.backward split-GEMM path]: situ_glu has "
+                            "no standalone Triton activation-backward kernel; only the "
+                            "fused dgated CUTLASS epilogue supports it. Enable "
+                            "SonicMoEConfig(fused_gated=True) "
+                            "(SONIC_MOE_FP8_FUSED_GATED=1, the default). Falling back "
+                            "to swiglu is deliberately not done."
+                        )
                     # w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
                     w2_fp8, w2_scales = precompute_weight_fp8(w2)
 
@@ -2780,7 +2972,11 @@ class _DownProjection(torch.autograd.Function):
                     dout,
                     w2,
                     PreAct=z,
-                    activation="swiglu",
+                    # BF16 path: _gemm_activation_name(fp8=False) refuses situ_glu.
+                    activation=_gemm_activation_name(
+                        activation_type, ctx._fp8_cfg, fp8=False,
+                        site="_DownProjection.backward bf16",
+                    ),
                     dx_out=dz,
                     colvec_scale=s.float(),
                     colvec_reduce=True,
@@ -2953,7 +3149,10 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             z, y1 = gemm_gated(
                 x_fp8,
                 w1_fp8,
-                activation="swiglu",
+                activation=_gemm_activation_name(
+                    activation_type, _get_fp8_config(), fp8=True,
+                    site="_moe_tc_softmax_topk_layer_quack_inference fused",
+                ),
                 out_dtype=torch.bfloat16,
                 postact_dtype=torch.bfloat16,
                 cu_seqlens_m=expert_frequency_offset,
@@ -2970,7 +3169,10 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             z, y1 = gemm_gated(
                 x_fp8,
                 w1_fp8,
-                activation="swiglu",
+                activation=_gemm_activation_name(
+                    activation_type, _get_fp8_config(), fp8=True,
+                    site="_moe_tc_softmax_topk_layer_quack_inference unaligned",
+                ),
                 cu_seqlens_m=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 out_dtype=torch.bfloat16,
@@ -2983,7 +3185,11 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             z, y1 = gemm_gated(
                 x,
                 w1.permute(2, 1, 0),
-                activation="swiglu",
+                # BF16 path: _gemm_activation_name(fp8=False) refuses situ_glu.
+                activation=_gemm_activation_name(
+                    activation_type, _get_fp8_config(), fp8=False,
+                    site="_moe_tc_softmax_topk_layer_quack_inference bf16",
+                ),
                 cu_seqlens_m=expert_frequency_offset,
                 A_idx=x_gather_idx,
                 postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
@@ -3024,6 +3230,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
                     use_ste=False,
                     restored_out=restored_out,
                     output_dtype=x.dtype,
+                    activation_type=activation_type,
                 )
             # _log_stage_memory("forward:fp8-boundary")
 
@@ -3102,8 +3309,10 @@ def moe_TC_softmax_topk_layer(
     _validate_runtime_precision_switches(fp8_protocol)
     # Resolve all FP8 flags once at entry — eliminates repeated os.getenv in hot path.
     fp8_config = _refresh_fp8_config()
-    if type(activation_type) == str:
-        activation_type = ActivationType(activation_type)
+    # Accepts ActivationType, plain enum values ("swiglu"), and encoded SiTU
+    # strings ("situ_glu:b=4.0:lb=25.0") — the latter cannot go through
+    # ActivationType(...) since the enum value is the bare "situ_glu".
+    activation_type = _coerce_activation_type(activation_type)
 
     use_low_precision_postact_buffer = False
     if is_inference_mode_enabled and is_using_quack_gemm():
@@ -3206,6 +3415,7 @@ def moe_TC_softmax_topk_layer(
                     use_ste=False,
                     restored_out=restored_out,
                     output_dtype=z.dtype,
+                    activation_type=activation_type,
                 )
         elif is_using_quack_gemm():
             # Unaligned QuACK path: up-proj used padded FP8 zero-mat, producing
@@ -3269,13 +3479,14 @@ def moe_general_routing_inputs(
     b2: torch.Tensor | None,
     E: int,
     stream_id: int,
-    activation_type: ActivationType,
+    activation_type: ActivationType | str,
     is_inference_mode_enabled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
     ), "b1 and b2 has to be None or not None at the same time!"
     fp8_config = _refresh_fp8_config()
+    activation_type = _coerce_activation_type(activation_type)
 
     T = x.size(0)
     TK = router_scores.size(0)

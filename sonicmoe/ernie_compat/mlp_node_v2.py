@@ -48,6 +48,7 @@ from .deepep_metadata import (
 from ..functional import (
     _DownProjection,
     _UpProjection,
+    _coerce_activation_type,
     _refresh_fp8_config,
     clear_all_fp8_weight_caches,
 )
@@ -440,7 +441,10 @@ class SonicMoEMlpNode:
     hidden_size, intermediate_size
         Model dims.  ``up_gate_proj`` has 2*I columns.
     activation_type
-        Activation function (default SWIGLU).
+        Activation function (default SWIGLU).  Accepts an ``ActivationType``
+        member, a plain enum value (``"swiglu"``), or an encoded SiTU string
+        (``"situ_glu:b=4.0:lb=25.0"``).  ``ActivationType.SITU_GLU`` reads its
+        betas from the active ``SonicMoEConfig`` and requires FP8.
     stream_id
         CUDA stream index for FP8 ops.
     """
@@ -451,14 +455,20 @@ class SonicMoEMlpNode:
         n_experts: int,
         hidden_size: int,
         intermediate_size: int,
-        activation_type: ActivationType = ActivationType.SWIGLU,
+        activation_type: ActivationType | str = ActivationType.SWIGLU,
         stream_id: int = 0,
     ):
         self._experts = list(experts)
         self._E = n_experts
         self._H = hidden_size
         self._I = intermediate_size
-        self._activation_type = activation_type
+        # Normalised at construction so downstream consumers
+        # (_UpProjection / _DownProjection / warmup) see one representation.
+        # Accepts ActivationType members, plain enum values ("swiglu"), and
+        # encoded SiTU strings ("situ_glu:b=4.0:lb=25.0"); bare
+        # ActivationType.SITU_GLU takes its betas from the active
+        # SonicMoEConfig at GEMM time.
+        self._activation_type = _coerce_activation_type(activation_type)
         self._stream_id = stream_id
 
         # Per-instance state — no module-level globals.
@@ -541,6 +551,9 @@ class SonicMoEMlpNode:
             fp8=True,
             total_K_list=total_K_list,
             max_workers=max_workers,
+            # The gated epilogue is baked into the kernel, so warm the
+            # activation this node actually runs, not a hardcoded SwiGLU.
+            activation_type=self._activation_type,
         )
 
     def forward(
@@ -725,7 +738,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         T_down: int = 0,
         TK_padded: int = 0,
         topk: int = 1,
-        activation_type: ActivationType = ActivationType.SWIGLU,
+        activation_type: ActivationType | str = ActivationType.SWIGLU,
         stream_id: int = 0,
     ) -> torch.Tensor:
         # ── Determine FP8 vs BF16 mode ──────────────────────────────────
