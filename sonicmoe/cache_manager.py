@@ -252,6 +252,10 @@ def _git_hash_or_none() -> str | None:
 
 DEFAULT_WARMUP_ACTIVATION = "swiglu"
 
+# Kept as a literal (not imported from quack_utils.activation_situ) so this
+# module has no dependency on the CuTe stack; see _normalize_activation.
+_SITU_PREFIX = "situ_glu"
+
 
 def _normalize_activation(activation) -> str:
     """Canonical string form of a warmup activation for the sentinel.
@@ -262,10 +266,26 @@ def _normalize_activation(activation) -> str:
     encoded SiTU betas are kept verbatim: they are baked into the traced kernel
     as compile-time constants, so a different beta is a different kernel and
     must not be reported as warm.
+
+    A *bare* ``"situ_glu"`` is rejected for exactly that reason — it carries no
+    betas, so accepting it would let a beta=4 warmup satisfy a beta=8 run.
+    ``jit_warmup.resolve_warmup_activation`` resolves the bare form against the
+    active config before it ever reaches here; this is the backstop for any
+    other caller.
     """
     if activation is None:
         return DEFAULT_WARMUP_ACTIVATION
-    return str(getattr(activation, "value", activation))
+    name = str(getattr(activation, "value", activation))
+    if name == _SITU_PREFIX:
+        raise ValueError(
+            "cache_manager: a bare 'situ_glu' cannot be used as a warmup "
+            "signature because it carries no beta / linear_beta, and those are "
+            "compile-time constants of the kernel. Pass the encoded descriptor "
+            "(e.g. 'situ_glu:b=4.0:lb=25.0'), or route through "
+            "jit_warmup.resolve_warmup_activation() to resolve it from the "
+            "active SonicMoEConfig."
+        )
+    return name
 
 
 def warmup_signature(E: int, H: int, I: int, fp8: bool, activation=None) -> dict:

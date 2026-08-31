@@ -175,8 +175,14 @@ def _gemm_activation_name(
     site:
         Human-readable call-site tag used in error messages.
     """
-    # Already-encoded SiTU string (or the bare "situ_glu" prefix): validate and
-    # pass through, re-encoding to normalise the key.
+    # A bare ``"situ_glu"`` string is the enum's own ``.value``; normalise it so
+    # it resolves its betas from ``cfg`` exactly like the enum member does,
+    # instead of silently taking ``parse_situ_activation``'s built-in defaults.
+    if activation_type == ActivationType.SITU_GLU.value:
+        activation_type = ActivationType.SITU_GLU
+
+    # Already-encoded SiTU string: validate and pass through, re-encoding to
+    # normalise the key.
     if is_situ_activation(activation_type):
         if not fp8:
             raise NotImplementedError(

@@ -69,9 +69,13 @@ def _situ(beta=BETA, linear_beta=LINEAR_BETA, precise=True) -> str:
 
 
 # Same alignment predicate as the SwiGLU GEMM tests (FP8 path needs 128-aligned
-# per-expert token counts).  Trimmed to two shapes: every extra shape is another
-# JIT compile (~30s each) and the numerics do not depend on M.  "smoke" is the
-# small/fast one; "large-E" carries the production H/I with 32 experts.
+# per-expert token counts).  Trimmed to two shapes on purpose: this file is about
+# the numerics, and shape coverage lives in test_situ_shapes.py (which also
+# carries the real production geometry).  Note that adding a shape here is
+# actually cheap -- neither the compile cache (gemm_gated.py:200, fake tensors use
+# cute.sym_int()) nor the autotune key (gemm_interface.py:129,
+# key=["activation", "dynamic_scheduler"]) contains m/n/k -- what costs is a new
+# *descriptor*.
 _WANTED_IDS = {"smoke", "large-E"}
 _SITU_SHAPES = []
 for _p in GEMM_SHAPES:
@@ -83,11 +87,11 @@ for _p in GEMM_SHAPES:
 SITU_SHAPES = _SITU_SHAPES if _SITU_SHAPES else GEMM_SHAPES[:1]
 
 SMOKE_SHAPE = SITU_SHAPES[0]
-# The backward kernel is the most expensive thing here to JIT-compile, and every
-# distinct (shape, descriptor) pair is another compile whose MLIR/LLVM state stays
-# resident for the life of the process.  A full cross product of shapes and
-# descriptors OOM-kills the host, so the backward and cache-key tests stay on the
-# smoke shape; none of the numerics below depend on M.
+# The backward kernel is by far the most expensive thing here to JIT-compile
+# (200-270 s cold), and each descriptor below needs its own compile whose
+# MLIR/LLVM state stays resident for the life of the process.  Keeping the
+# backward and cache-key tests on one shape is therefore about the *descriptor*
+# count, not the shape count; the numerics do not depend on M either way.
 BWD_SHAPES = [SMOKE_SHAPE]
 SEED = 42
 

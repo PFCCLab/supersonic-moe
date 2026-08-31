@@ -26,6 +26,54 @@ import torch
 _log = logging.getLogger("sonicmoe.jit")
 
 
+def resolve_warmup_activation(activation_type):
+    """Expand a bare SiTU activation into its fully-encoded descriptor.
+
+    The two SiTU betas are traced into the kernel as compile-time constants, so
+    a different beta is a different kernel.  ``ActivationType.SITU_GLU`` (or the
+    bare ``"situ_glu"`` string) carries neither: they get resolved from the
+    active config later, inside ``_gemm_activation_name``.  That is too late for
+    two consumers here:
+
+    * the sentinel signature, which only sees what is handed to
+      ``warmup_signature`` and would otherwise record a beta-less
+      ``"situ_glu"`` — making a beta=4 warmup report warm for a beta=8 run;
+    * a ``warmup_jit_parallel`` subprocess, which inherits the environment but
+      *not* an in-process ``SonicMoEConfig`` object, and would therefore compile
+      the default betas while the parent marks the cache warm.
+
+    Resolving once at the warmup boundary closes both.  Non-SiTU activations
+    pass through untouched.
+    """
+    from .enums import ActivationType
+    from .quack_utils.activation_situ import (
+        encode_situ_activation,
+        is_situ_activation,
+        parse_situ_activation,
+    )
+
+    bare = activation_type is ActivationType.SITU_GLU or (
+        activation_type == ActivationType.SITU_GLU.value
+    )
+    if bare:
+        # Same source of truth as ``_FP8Config.__init__`` (fp8_config.py) and
+        # therefore as the GEMM call sites in
+        # ``functional/__init__.py::_gemm_activation_name``.  Read the active
+        # config directly rather than the ``_FP8Config`` singleton, which is
+        # only refreshed at forward entry and would be stale here.
+        from .config import SonicMoEConfig, get_active_config
+
+        cfg = get_active_config() or SonicMoEConfig()
+        return encode_situ_activation(
+            cfg.resolve_situ_beta(), cfg.resolve_situ_linear_beta()
+        )
+    if is_situ_activation(activation_type):
+        # Already encoded: re-encode so the sentinel key is canonical.
+        beta, linear_beta, precise = parse_situ_activation(activation_type)
+        return encode_situ_activation(beta, linear_beta, precise)
+    return activation_type
+
+
 def warmup_jit(
     E: int,
     H: int,
@@ -102,6 +150,11 @@ def warmup_jit(
         setup_cache(cache_dir)
     else:
         setup_cache()
+
+    # Must happen before the sentinel is consulted: a bare SITU_GLU would
+    # otherwise be recorded without its betas.  See
+    # ``resolve_warmup_activation``.
+    activation_type = resolve_warmup_activation(activation_type)
 
     if skip_if_warm and not force and is_warm(E, H, I, fp8, activation_type):
         _log.info(
@@ -203,8 +256,12 @@ warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, activation_type=%s, force=
     procs = []
     t0 = time.perf_counter()
     # Enum members are not reconstructible in the subprocess snippet, so send
-    # the plain activation value ("swiglu" / "situ_glu" / "situ_glu:b=4.0:...").
-    # ``warmup_jit`` -> ``SonicMoEMlpNode`` re-coerces it back.
+    # the plain activation value ("swiglu" / "situ_glu:b=4.0:lb=25.0").
+    # ``warmup_jit`` -> ``SonicMoEMlpNode`` re-coerces it back.  The betas MUST
+    # be resolved on this side of the fork: the child inherits the environment
+    # but not an in-process ``SonicMoEConfig``, so a bare SITU_GLU would compile
+    # the default betas here while the parent marks its own betas warm.
+    activation_type = resolve_warmup_activation(activation_type)
     _act_arg = repr(getattr(activation_type, "value", activation_type))
     for w_idx, ks in enumerate(buckets):
         code = snippet_template % (E, H, I, repr(bool(fp8)), repr(list(ks)), _act_arg)

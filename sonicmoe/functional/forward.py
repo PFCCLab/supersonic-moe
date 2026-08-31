@@ -12,7 +12,11 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 
 from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from ..utils import convert_torch_tensor_to_cute_tensor
-from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
+from .moe_config import (
+    HopperWgmma_MoE_Down_proj_Fwd,
+    HopperWgmma_MoE_Up_proj_Fwd,
+    _reject_situ_bf16,
+)
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 from .topk_softmax import TopK_Softmax
 
@@ -92,6 +96,10 @@ def _up_projection_forward(
 
     compile_w1_key = (E, H, I, (b1 is None), x.dtype, activation_type, is_inference_mode_enabled)
     if compile_w1_key not in _up_projection_forward.compile_cache:
+        # Before ActivationType(...), which would raise a bare ValueError on an
+        # encoded "situ_glu:b=...:lb=..." descriptor instead of the specific
+        # FP8-only message.
+        _reject_situ_bf16(activation_type, "_up_projection_forward")
         w1_module = HopperWgmma_MoE_Up_proj_Fwd(
             E, H, I, activation_type=ActivationType(activation_type), inference_mode=is_inference_mode_enabled
         )
