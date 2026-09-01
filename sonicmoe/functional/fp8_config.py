@@ -13,7 +13,12 @@ from __future__ import annotations
 
 import os
 
-from ..config import SonicMoEConfig, get_active_config
+from ..config import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    SonicMoEConfig,
+    get_active_config,
+)
 from .utils import is_fp8_active
 
 
@@ -150,7 +155,7 @@ class _FP8Config:
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "_fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
         "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant", "fuse_y1_bf16_trunc",
-        "fused_weight_layout",
+        "fused_weight_layout", "situ_beta", "situ_linear_beta",
     )
 
     def __init__(self) -> None:
@@ -171,6 +176,12 @@ class _FP8Config:
         self.swiglu_clamp_value: float = (
             _active.resolve_swiglu_clamp_value() if _active is not None else 0.0
         )
+        # SiTU-GLU shape constants.  Always resolved (cheap) so that every GEMM
+        # call site can build the encoded activation string from ``cfg`` alone;
+        # they are ignored unless the activation is ActivationType.SITU_GLU.
+        _situ_src = _active if _active is not None else SonicMoEConfig()
+        self.situ_beta: float = _situ_src.resolve_situ_beta()
+        self.situ_linear_beta = _situ_src.resolve_situ_linear_beta()
 
     @property
     def fp8_wgrad(self) -> bool:
@@ -209,6 +220,11 @@ class _FP8Config:
         cfg.fuse_y1_quant = False
         cfg.fuse_y1_bf16_trunc = False
         cfg.fused_weight_layout = False
+        # BF16 path never reaches a SiTU epilogue (guarded in functional/
+        # __init__.py::_gemm_activation_name), but keep the slots populated so
+        # ``cfg.situ_beta`` is never an AttributeError.
+        cfg.situ_beta = DEFAULT_SITU_BETA
+        cfg.situ_linear_beta = DEFAULT_SITU_LINEAR_BETA
         return cfg
 
 

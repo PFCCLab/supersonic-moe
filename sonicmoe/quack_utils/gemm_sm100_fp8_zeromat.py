@@ -468,6 +468,9 @@ _TORCH_TO_CUTLASS = {
 _gate_fn_map = {
     "swiglu": quack.activation.swiglu,
 }
+# SiTU-GLU descriptors ("situ_glu:b=4.0:lb=25.0") are resolved through
+# `resolve_gate_fn` so they raise a readable error instead of a bare KeyError.
+from .activation_situ import is_supported_activation, resolve_gate_fn
 
 from ..cache_manager import InstrumentedCompileCache as _ICC
 _zeromat_compile_cache = _ICC("zeromat")
@@ -500,7 +503,7 @@ def gemm_gated_zeromat(
     a_scales is TK-sized — pre-gathered ISA-packed scales.
     No TK-sized FP8 activation is materialized.
     """
-    assert activation in _gate_fn_map
+    assert is_supported_activation(activation, _gate_fn_map), f"Unsupported activation {activation}"
     TK = A_idx.shape[0]
     N = B.shape[-2]
     K = A.shape[-1]
@@ -539,7 +542,7 @@ def gemm_gated_zeromat(
             leading_dim = 1 if info.major == major_configs[name][1] else 0
             info.cute_tensor = _make_cute(info.tensor, leading_dim)
 
-    act_fn = _gate_fn_map[activation]
+    act_fn = resolve_gate_fn(activation, _gate_fn_map)
     epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
     varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)

@@ -26,6 +26,7 @@ from .ernie_compat.mlp_node_v2 import (
 from .functional import (
     _DownProjection,
     _UpProjection,
+    _coerce_activation_type,
     attach_preallocated_gated_outputs,
 )
 from .functional.utils import enable_fp8
@@ -126,7 +127,16 @@ def run_sonic_moe(
     fp8_combine_grad_handle=None,
     fp8_config=None,
     release_fp8_weights=False,
+    activation_type=ActivationType.SWIGLU,
 ):
+    """Run one SonicMoE expert-compute forward.
+
+    ``activation_type`` accepts an ``ActivationType`` member, a plain enum value
+    (``"swiglu"``), or an encoded SiTU string (``"situ_glu:b=4.0:lb=25.0"``).
+    Bare ``ActivationType.SITU_GLU`` picks up its betas from the active
+    ``SonicMoEConfig`` (``situ_beta`` / ``situ_linear_beta``).  Defaults to
+    SWIGLU so existing callers are unaffected.
+    """
     T = hidden_states.shape[0]
     stream_id = paddle.device.current_stream()
     topk_indices_i32 = (
@@ -218,7 +228,10 @@ def run_sonic_moe(
         )
 
     s_scatter_idx.stop_gradient = True
-    activation_type = ActivationType("swiglu")
+    # Caller-supplied activation (was hardcoded to "swiglu").  Normalised here so
+    # encoded SiTU strings survive: ActivationType("situ_glu:b=4.0:lb=25.0")
+    # would raise, since the enum value is the bare "situ_glu".
+    activation_type = _coerce_activation_type(activation_type)
 
     total_expert_freq = TK_padded
     router_score_source = None

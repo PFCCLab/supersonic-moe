@@ -32,7 +32,19 @@ import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
-from typing import Optional
+from typing import Optional, Union
+
+# SiTU-GLU scalars live in ``situ_params``: a dependency-free module, because
+# this one is imported by ``functional/fp8_config.py``, which must stay clear of
+# the cutlass/quack imports that ``quack_utils/activation_situ`` pulls in.  Both
+# layers therefore share one set of defaults and one range check instead of
+# keeping duplicates in sync.
+from .situ_params import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    check_beta,
+    is_linear_beta_disabled,
+)
 
 
 def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
@@ -81,6 +93,21 @@ class SonicMoEConfig:
             Env: ``SONIC_MOE_STAGEWISE_MEMORY``. Default: False.
         swiglu_clamp_value: Optional user-controlled SwiGLU clamp value.
             Default: 0.0 (disabled).
+        situ_beta: SiTU-GLU gate beta (``situ(g) = beta*tanh(g/beta)*sigmoid(g)``).
+            Only consulted when the activation is ``ActivationType.SITU_GLU``.
+            Env: ``SONIC_MOE_SITU_BETA``. Default: 4.0 (ernielite layer43).
+        situ_linear_beta: SiTU-GLU up-projection clamp
+            (``up_act(u) = lb*tanh(u/lb)``).  Pass ``"none"`` (or ``False``) to
+            disable the clamp so ``up_act(u) = u``; ``None`` means "unset" and
+            falls through to the env var / default.  Env:
+            ``SONIC_MOE_SITU_LINEAR_BETA`` (accepts ``none``/``null``/``off``).
+            Default: 25.0 (ernielite layer43).
+
+    Note: the activation itself is NOT a field here.  It is passed explicitly
+    down the call chain (``SonicMoEMlpNode(activation_type=...)`` /
+    ``run_sonic_moe(activation_type=...)``) because it is a per-layer property
+    of the model, not a global FP8 tuning knob.  Only the SiTU beta scalars live
+    in this config, mirroring ``swiglu_clamp_value``.
     """
 
     use_fp8: Optional[bool] = None
@@ -99,6 +126,8 @@ class SonicMoEConfig:
     stagewise_memory: Optional[bool] = None
     iso32_weight: Optional[bool] = None
     swiglu_clamp_value: Optional[float] = None
+    situ_beta: Optional[float] = None
+    situ_linear_beta: Optional[Union[float, str, bool]] = None
 
     def __post_init__(self) -> None:
         # Auto-enable quack_gemm when fp8 is explicitly enabled.
@@ -201,6 +230,48 @@ class SonicMoEConfig:
         if self.swiglu_clamp_value is not None:
             return max(float(self.swiglu_clamp_value), 0.0)
         return 0.0
+
+    def resolve_situ_beta(self) -> float:
+        """Resolve the SiTU gate beta, validated here rather than at trace time.
+
+        ``check_beta`` rejects anything the kernel cannot represent as a float32
+        pair (``beta`` and ``1 / beta``); doing it here means a bad value is
+        reported against the config field or the env var that set it, not later
+        from ``encode_situ_activation``.
+        """
+        if self.situ_beta is not None:
+            return check_beta("beta", self.situ_beta, where="SonicMoEConfig.situ_beta")
+        env = os.getenv("SONIC_MOE_SITU_BETA", "").strip()
+        if env:
+            return check_beta("beta", env, where="$SONIC_MOE_SITU_BETA")
+        return DEFAULT_SITU_BETA
+
+    def resolve_situ_linear_beta(self) -> Optional[float]:
+        """Resolve the SiTU up-projection clamp; a ``None`` return = no clamp.
+
+        The dataclass field follows the file-wide "``None`` means unset"
+        convention (config field > env var > built-in default), so *explicitly
+        disabling* the clamp is spelled ``situ_linear_beta="none"`` (or
+        ``False``), not ``situ_linear_beta=None`` — the latter falls through to
+        the 25.0 default.  ``"none"`` / ``"null"`` / ``"off"`` are accepted in
+        any case, identically here, in the env var and in the ``lb=`` descriptor
+        field.  ``True`` is *not* a spelling of anything: it would otherwise
+        become ``float(True) == 1.0``, a plausible-looking clamp nobody asked
+        for, so ``check_beta`` rejects it.
+        """
+        value = self.situ_linear_beta
+        if value is not None:
+            if is_linear_beta_disabled(value):
+                return None
+            return check_beta(
+                "linear_beta", value, where="SonicMoEConfig.situ_linear_beta"
+            )
+        env = os.getenv("SONIC_MOE_SITU_LINEAR_BETA", "").strip()
+        if env:
+            if is_linear_beta_disabled(env):
+                return None
+            return check_beta("linear_beta", env, where="$SONIC_MOE_SITU_LINEAR_BETA")
+        return DEFAULT_SITU_LINEAR_BETA
 
     # --- Context manager for temporary activation ----------------------------
 

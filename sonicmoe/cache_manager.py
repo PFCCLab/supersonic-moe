@@ -217,10 +217,10 @@ def cache_stats() -> dict:
 # Triton's TRITON_CACHE_DIR and Quack's QUACK_CACHE_DIR are both file-backed
 # disk caches that are safely shared across processes / nodes via NFS. A
 # successful warmup leaves them populated with N kernel.cubin / N
-# {fn_name}.autotune.json files. We record the (E, H, I, fp8, git_hash,
-# kernel_signature_version) tuple on which the warmup ran in a sentinel JSON
-# file. On subsequent process starts, ``is_warm()`` checks the sentinel
-# matches and that the on-disk file counts have not regressed; if so,
+# {fn_name}.autotune.json files. We record the (E, H, I, fp8, activation,
+# git_hash, kernel_signature_version) tuple on which the warmup ran in a
+# sentinel JSON file. On subsequent process starts, ``is_warm()`` checks the
+# sentinel matches and that the on-disk file counts have not regressed; if so,
 # ``warmup_jit`` can be skipped entirely.
 #
 # CuTe's in-memory ``_COMPILE_CACHE`` is NOT covered (cute.compile artifacts
@@ -228,7 +228,7 @@ def cache_stats() -> dict:
 # warmup still has to run once per process — but Triton autotune-cache and
 # Quack autotune-cache hits eliminate the bulk of the autotune time.
 
-_KERNEL_SIG_VERSION = "v1"
+_KERNEL_SIG_VERSION = "v2"
 
 
 def _warmup_sentinel_path(root: Path | None = None) -> Path:
@@ -250,16 +250,62 @@ def _git_hash_or_none() -> str | None:
         return None
 
 
-def warmup_signature(E: int, H: int, I: int, fp8: bool) -> dict:
-    """Stable identity of a warmup invocation."""
+DEFAULT_WARMUP_ACTIVATION = "swiglu"
+
+# Kept as a literal (not imported from quack_utils.activation_situ) so this
+# module has no dependency on the CuTe stack; see _normalize_activation.
+_SITU_PREFIX = "situ_glu"
+
+
+def _normalize_activation(activation) -> str:
+    """Canonical string form of a warmup activation for the sentinel.
+
+    Accepts an ``ActivationType`` member, a plain enum value (``"swiglu"``) or
+    an encoded SiTU string (``"situ_glu:b=4.0:lb=25.0"``).  Duck-typed via
+    ``.value`` so this module stays import-free of ``sonicmoe.enums``.  The
+    encoded SiTU betas are kept verbatim: they are baked into the traced kernel
+    as compile-time constants, so a different beta is a different kernel and
+    must not be reported as warm.
+
+    A *bare* ``"situ_glu"`` is rejected for exactly that reason — it carries no
+    betas, so accepting it would let a beta=4 warmup satisfy a beta=8 run.
+    ``jit_warmup.resolve_warmup_activation`` resolves the bare form against the
+    active config before it ever reaches here; this is the backstop for any
+    other caller.
+    """
+    if activation is None:
+        return DEFAULT_WARMUP_ACTIVATION
+    name = str(getattr(activation, "value", activation))
+    if name == _SITU_PREFIX:
+        raise ValueError(
+            "cache_manager: a bare 'situ_glu' cannot be used as a warmup "
+            "signature because it carries no beta / linear_beta, and those are "
+            "compile-time constants of the kernel. Pass the encoded descriptor "
+            "(e.g. 'situ_glu:b=4.0:lb=25.0'), or route through "
+            "jit_warmup.resolve_warmup_activation() to resolve it from the "
+            "active SonicMoEConfig."
+        )
+    return name
+
+
+def warmup_signature(E: int, H: int, I: int, fp8: bool, activation=None) -> dict:
+    """Stable identity of a warmup invocation.
+
+    ``activation`` participates in the signature because the gated epilogue is
+    compiled into the kernel: a SwiGLU-warmed cache says nothing about a
+    ``situ_glu`` configuration.  Defaults to ``"swiglu"`` so callers that do not
+    pass one keep the historical identity (modulo ``_KERNEL_SIG_VERSION``,
+    bumped to ``v2`` because the signature shape changed).
+    """
     return {
         "E": E, "H": H, "I": I, "fp8": fp8,
+        "activation": _normalize_activation(activation),
         "kernel_sig": _KERNEL_SIG_VERSION,
         "git_hash": _git_hash_or_none(),
     }
 
 
-def is_warm(E: int, H: int, I: int, fp8: bool = True,
+def is_warm(E: int, H: int, I: int, fp8: bool = True, activation=None,
             *, min_triton_files: int = 1, min_quack_files: int = 0) -> bool:
     """True iff a previous ``warmup_jit`` for this signature is still on disk.
 
@@ -283,9 +329,9 @@ def is_warm(E: int, H: int, I: int, fp8: bool = True,
         rec = json.loads(sentinel.read_text())
     except Exception:
         return False
-    sig = warmup_signature(E, H, I, fp8)
+    sig = warmup_signature(E, H, I, fp8, activation)
     # git_hash is informational; mismatch is OK if user opts in.
-    must_match = ("E", "H", "I", "fp8", "kernel_sig")
+    must_match = ("E", "H", "I", "fp8", "activation", "kernel_sig")
     if any(rec.get(k) != sig[k] for k in must_match):
         return False
     if rec.get("git_hash") != sig["git_hash"] and not os.environ.get(
@@ -300,7 +346,7 @@ def is_warm(E: int, H: int, I: int, fp8: bool = True,
     return True
 
 
-def mark_warm(E: int, H: int, I: int, fp8: bool = True) -> Path:
+def mark_warm(E: int, H: int, I: int, fp8: bool = True, activation=None) -> Path:
     """Write the sentinel after a successful ``warmup_jit`` run.
 
     Atomic rename so concurrent parallel-warmup writers cannot leave a
@@ -308,7 +354,7 @@ def mark_warm(E: int, H: int, I: int, fp8: bool = True) -> Path:
     """
     root = get_cache_root()
     sentinel = _warmup_sentinel_path(root)
-    sig = warmup_signature(E, H, I, fp8)
+    sig = warmup_signature(E, H, I, fp8, activation)
     stats = cache_stats()
     sig["cache_stats"] = stats
     sig["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")

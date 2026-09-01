@@ -20,6 +20,7 @@ from .moe_config import (
     HopperWgmma_MoE_Down_proj_WeightGrad_Bwd,
     HopperWgmma_MoE_Up_proj_ActGrad_Bwd,
     HopperWgmma_MoE_Up_proj_WeightGrad_Bwd,
+    _reject_situ_bf16,
 )
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
@@ -386,6 +387,10 @@ def _down_projection_backward_act(
 
     compile_dz_key = ("dz", E, H, I, z.dtype, activation_type)
     if compile_dz_key not in _down_projection_backward_act.compile_cache:
+        # Before ActivationType(...), which would raise a bare ValueError on an
+        # encoded "situ_glu:b=...:lb=..." descriptor instead of the specific
+        # FP8-only message.
+        _reject_situ_bf16(activation_type, "_down_projection_backward_act")
         # I don't know why but this sync appears to fix a mysterious initialization bug??
         torch.cuda.synchronize()
         dz_module = HopperWgmma_MoE_Down_proj_ActGrad_Bwd(E, H, I, ActivationType(activation_type))

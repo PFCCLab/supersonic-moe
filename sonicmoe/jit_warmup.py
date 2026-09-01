@@ -26,6 +26,54 @@ import torch
 _log = logging.getLogger("sonicmoe.jit")
 
 
+def resolve_warmup_activation(activation_type):
+    """Expand a bare SiTU activation into its fully-encoded descriptor.
+
+    The two SiTU betas are traced into the kernel as compile-time constants, so
+    a different beta is a different kernel.  ``ActivationType.SITU_GLU`` (or the
+    bare ``"situ_glu"`` string) carries neither: they get resolved from the
+    active config later, inside ``_gemm_activation_name``.  That is too late for
+    two consumers here:
+
+    * the sentinel signature, which only sees what is handed to
+      ``warmup_signature`` and would otherwise record a beta-less
+      ``"situ_glu"`` — making a beta=4 warmup report warm for a beta=8 run;
+    * a ``warmup_jit_parallel`` subprocess, which inherits the environment but
+      *not* an in-process ``SonicMoEConfig`` object, and would therefore compile
+      the default betas while the parent marks the cache warm.
+
+    Resolving once at the warmup boundary closes both.  Non-SiTU activations
+    pass through untouched.
+    """
+    from .enums import ActivationType
+    from .quack_utils.activation_situ import (
+        encode_situ_activation,
+        is_situ_activation,
+        parse_situ_activation,
+    )
+
+    bare = activation_type is ActivationType.SITU_GLU or (
+        activation_type == ActivationType.SITU_GLU.value
+    )
+    if bare:
+        # Same source of truth as ``_FP8Config.__init__`` (fp8_config.py) and
+        # therefore as the GEMM call sites in
+        # ``functional/__init__.py::_gemm_activation_name``.  Read the active
+        # config directly rather than the ``_FP8Config`` singleton, which is
+        # only refreshed at forward entry and would be stale here.
+        from .config import SonicMoEConfig, get_active_config
+
+        cfg = get_active_config() or SonicMoEConfig()
+        return encode_situ_activation(
+            cfg.resolve_situ_beta(), cfg.resolve_situ_linear_beta()
+        )
+    if is_situ_activation(activation_type):
+        # Already encoded: re-encode so the sentinel key is canonical.
+        beta, linear_beta, precise = parse_situ_activation(activation_type)
+        return encode_situ_activation(beta, linear_beta, precise)
+    return activation_type
+
+
 def warmup_jit(
     E: int,
     H: int,
@@ -38,6 +86,7 @@ def warmup_jit(
     cache_dir: str | None = None,
     skip_if_warm: bool = True,
     force: bool = False,
+    activation_type=None,
 ) -> bool:
     """Pre-compile all CuTe + Triton kernels with dummy data.
 
@@ -66,10 +115,19 @@ def warmup_jit(
         Override SONIC_MOE_CACHE_DIR.
     skip_if_warm : bool
         If True (default), check the cache sentinel and skip compilation
-        when it indicates a previous warmup for this (E,H,I,fp8,kernel-sig,
-        git-hash) tuple has populated the disk caches. Ignored if ``force``.
+        when it indicates a previous warmup for this (E,H,I,fp8,activation,
+        kernel-sig,git-hash) tuple has populated the disk caches. Ignored if
+        ``force``.
     force : bool
         Run warmup even if the sentinel matches.
+    activation_type : ActivationType or str, optional
+        Activation to warm.  ``None`` (default) means ``ActivationType.SWIGLU``,
+        preserving the historical behaviour.  Pass
+        ``ActivationType.SITU_GLU`` (betas taken from the active
+        ``SonicMoEConfig``) or an encoded ``"situ_glu:b=4.0:lb=25.0"`` string to
+        warm a SiTU configuration; the activation is part of the sentinel
+        signature, so a SwiGLU-warmed cache will not be reported as warm for
+        SiTU.
     """
     if device is None:
         # Resolve current device through paddle to avoid hitting the
@@ -93,9 +151,15 @@ def warmup_jit(
     else:
         setup_cache()
 
-    if skip_if_warm and not force and is_warm(E, H, I, fp8):
+    # Must happen before the sentinel is consulted: a bare SITU_GLU would
+    # otherwise be recorded without its betas.  See
+    # ``resolve_warmup_activation``.
+    activation_type = resolve_warmup_activation(activation_type)
+
+    if skip_if_warm and not force and is_warm(E, H, I, fp8, activation_type):
         _log.info(
-            f"[Warmup] sentinel hit (E={E}, H={H}, I={I}, fp8={fp8}); "
+            f"[Warmup] sentinel hit (E={E}, H={H}, I={I}, fp8={fp8}, "
+            f"activation={activation_type}); "
             f"skipping compile. Set force=True or `clear_warmup_sentinel()` "
             f"to override."
         )
@@ -110,13 +174,14 @@ def warmup_jit(
 
     _log.info(
         f"[Warmup] E={E}, H={H}, I={I}, fp8={fp8}, "
+        f"activation={activation_type}, "
         f"shapes={len(total_K_list)}, workers={max_workers}"
     )
     t0 = time.perf_counter()
 
     for i, total_K in enumerate(total_K_list):
         t1 = time.perf_counter()
-        _warmup_single(E, H, I, total_K, device, fp8)
+        _warmup_single(E, H, I, total_K, device, fp8, activation_type)
         dt = time.perf_counter() - t1
         _log.info(
             f"[Warmup] shape {i + 1}/{len(total_K_list)} "
@@ -125,7 +190,7 @@ def warmup_jit(
 
     total = time.perf_counter() - t0
     _log.info(f"[Warmup] All done in {total:.1f}s")
-    mark_warm(E, H, I, fp8)
+    mark_warm(E, H, I, fp8, activation_type)
     return True
 
 
@@ -138,6 +203,7 @@ def warmup_jit_parallel(
     total_K_list: list[int] | None = None,
     workers: int = 2,
     cache_dir: str | None = None,
+    activation_type=None,
 ) -> float:
     """Multi-process cold warmup. Spawns ``workers`` subprocesses, each
     warming a partition of ``total_K_list``. All share the same disk cache
@@ -168,7 +234,7 @@ import paddle
 paddle.compat.enable_torch_proxy(scope={'sonicmoe','quack','triton'}, silent=True)
 from sonicmoe.cache_manager import setup_cache; setup_cache()
 from sonicmoe.jit_warmup import warmup_jit
-warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, force=True, skip_if_warm=False)
+warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, activation_type=%s, force=True, skip_if_warm=False)
 """
     env_base = os.environ.copy()
     env_base.setdefault("TRITON_PTXAS_PATH", "/usr/local/cuda/bin/ptxas")
@@ -189,8 +255,16 @@ warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, force=True, skip_if_warm=F
             gpu_pool = ["0"]
     procs = []
     t0 = time.perf_counter()
+    # Enum members are not reconstructible in the subprocess snippet, so send
+    # the plain activation value ("swiglu" / "situ_glu:b=4.0:lb=25.0").
+    # ``warmup_jit`` -> ``SonicMoEMlpNode`` re-coerces it back.  The betas MUST
+    # be resolved on this side of the fork: the child inherits the environment
+    # but not an in-process ``SonicMoEConfig``, so a bare SITU_GLU would compile
+    # the default betas here while the parent marks its own betas warm.
+    activation_type = resolve_warmup_activation(activation_type)
+    _act_arg = repr(getattr(activation_type, "value", activation_type))
     for w_idx, ks in enumerate(buckets):
-        code = snippet_template % (E, H, I, repr(bool(fp8)), repr(list(ks)))
+        code = snippet_template % (E, H, I, repr(bool(fp8)), repr(list(ks)), _act_arg)
         env_w = env_base.copy()
         env_w["CUDA_VISIBLE_DEVICES"] = gpu_pool[w_idx % len(gpu_pool)]
         p = subprocess.Popen(
@@ -214,7 +288,8 @@ warmup_jit(E=%d, H=%d, I=%d, fp8=%s, total_K_list=%s, force=True, skip_if_warm=F
     return dt
 
 
-def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool):
+def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool,
+                   activation_type=None):
     """One fwd+bwd through SonicMoEMlpNode to compile ALL production kernels.
 
     Runs under Paddle torch-proxy (same as production), compiles:
@@ -225,6 +300,10 @@ def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool):
       - Triton SwiGLU fwd/bwd kernels
       - Triton metadata kernel (_build_score_src_idx_kernel)
       - CUDA topk metadata kernel
+
+    ``activation_type`` defaults to ``ActivationType.SWIGLU``.  Since the gated
+    epilogue is compiled into the kernel, warming SwiGLU does not warm SiTU;
+    pass the activation actually used in training.
     """
     import paddle
     paddle.compat.enable_torch_proxy(
@@ -264,7 +343,10 @@ def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool):
 
     node = SonicMoEMlpNode(
         experts=experts, n_experts=E, hidden_size=H,
-        intermediate_size=I, activation_type=ActivationType.SWIGLU,
+        intermediate_size=I,
+        activation_type=(
+            ActivationType.SWIGLU if activation_type is None else activation_type
+        ),
     )
 
     # Build dispatched_indices and dispatched_probs

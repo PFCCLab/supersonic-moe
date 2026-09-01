@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Callable
 from contextlib import ExitStack
+from functools import partial
 
 import torch
 import paddle
@@ -68,6 +69,28 @@ def _relu_sq(x: torch.Tensor) -> torch.Tensor:
 
 def _silu(x: torch.Tensor) -> torch.Tensor:
     return F.silu(x)
+
+
+def _situ_glu(x: torch.Tensor, beta: float, linear_beta: float | None) -> torch.Tensor:
+    """Eager SiTU-GLU reference: ``situ(g, beta) * up_act(u, linear_beta)``.
+
+    ``situ(g)    = beta * tanh(g / beta) * sigmoid(g)``
+    ``up_act(u)  = linear_beta * tanh(u / linear_beta)``, or ``u`` when
+    ``linear_beta is None``.
+
+    Layout note: this follows the INTERLEAVED convention used by every other
+    activation in this file (``g = x[..., ::2]``, ``u = x[..., 1::2]``), which
+    matches SonicMoE's interleaved w1 / preact layout.  PaddleFleet's
+    ``transformer/activations.py::situ_glu`` is mathematically identical but
+    CHUNKED (``paddle.chunk(x, 2, axis=-1)``); do not copy its slicing here.
+    """
+    u = x[..., 1::2]
+    g = x[..., ::2]
+    g32 = g.to(dtype=torch.float32)
+    u32 = u.to(dtype=torch.float32)
+    gate = beta * torch.tanh(g32 / beta) * torch.sigmoid(g32)
+    up = u32 if linear_beta is None else linear_beta * torch.tanh(u32 / linear_beta)
+    return (gate * up).to(dtype=g.dtype)
 
 
 class Experts(nn.Module):
@@ -673,15 +696,26 @@ class MoE(nn.Module):
             expert_frequency = selected_experts.bincount(minlength=self.num_experts).to(torch.int32)
             expert_offsets = expert_frequency.cumsum(-1).to(torch.int32)
 
-        act_func = {
-            ActivationType.SWIGLU: _swiglu,
-            ActivationType.GEGLU: _geglu,
-            ActivationType.REGLU: _reglu,
-            ActivationType.GELU: _gelu,
-            ActivationType.RELU: _relu,
-            ActivationType.SILU: _silu,
-            ActivationType.RELU_SQ: _relu_sq,
-        }[self.activation_function]
+        if self.activation_function is ActivationType.SITU_GLU:
+            # SiTU betas are not part of the enum; bind them from the active
+            # SonicMoEConfig.  Resolved through the config rather than
+            # quack_utils.activation_situ so this module stays cutlass-free.
+            _situ_cfg = self.config if self.config is not None else SonicMoEConfig()
+            act_func = partial(
+                _situ_glu,
+                beta=_situ_cfg.resolve_situ_beta(),
+                linear_beta=_situ_cfg.resolve_situ_linear_beta(),
+            )
+        else:
+            act_func = {
+                ActivationType.SWIGLU: _swiglu,
+                ActivationType.GEGLU: _geglu,
+                ActivationType.REGLU: _reglu,
+                ActivationType.GELU: _gelu,
+                ActivationType.RELU: _relu,
+                ActivationType.SILU: _silu,
+                ActivationType.RELU_SQ: _relu_sq,
+            }[self.activation_function]
 
         T = hidden_states.size(0)
 
