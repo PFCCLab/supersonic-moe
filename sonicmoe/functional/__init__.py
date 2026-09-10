@@ -823,7 +823,57 @@ def _use_fused_zy1_quant() -> bool:
 # storage in a fresh Tensor object, so object identity alone is too strict.
 # "fwd": _UpProjection.forward -> _DownProjection.forward  (3-tuple: ref, fp8, scales)
 # "bwd": _DownProjection.backward -> _UpProjection.backward (3-tuple: ref, fp8, scales)
-_PREQUANTIZED_SCALES: dict[str, tuple] = {}
+_PrequantKey = str | tuple[str, object]
+_PREQUANTIZED_SCALES: dict[_PrequantKey, tuple] = {}
+
+# Per-invocation addressing for the backward hand-off slots.
+#
+# The forward slot ("fwd") is safe with a constant key: _UpProjection.forward and
+# _DownProjection.forward run back to back within one invocation. The backward
+# order is not — autograd's reverse topological order plus a pipeline schedule
+# can interleave two invocations as write(A), write(B), read, read, in which case
+# the second write clobbers the first entry and the second reader pops nothing
+# ("dz storage freed but no bwd prequant"). Any caller that invokes the expert
+# more than once per micro batch can hit this.
+#
+# The token is created in _UpProjection.forward and stamped on the tensors it
+# returns, using the same carrier trick as attach_preallocated_gated_outputs
+# below. Forward keeps Python object identity, unlike gradients (see the note
+# above on fresh Tensor objects wrapping the same storage). _DownProjection.forward
+# copies it onto its own ctx, so both halves of a pair address the same entry.
+_SM_INVOCATION_TOKEN_ATTR = "_sm_invocation_token"
+
+
+def _new_invocation_token() -> object:
+    return object()
+
+
+def _get_invocation_token(value):
+    return getattr(value, _SM_INVOCATION_TOKEN_ATTR, None)
+
+
+def _require_invocation_token(ctx) -> object:
+    token = _get_invocation_token(ctx)
+    if token is None:
+        raise RuntimeError(
+            "FP8 backward requires an invocation token; "
+            "the UpProjection/DownProjection hand-off was not preserved."
+        )
+    return token
+
+
+def _set_invocation_token(value, token) -> None:
+    setattr(value, _SM_INVOCATION_TOKEN_ATTR, token)
+
+
+def _prequant_bwd_key(ctx, name: str) -> _PrequantKey:
+    """Return the backward hand-off key for one invocation.
+
+    Keep the legacy string key when no token is available for compatibility
+    with callers that bypass _UpProjection.forward.
+    """
+    token = _get_invocation_token(ctx)
+    return name if token is None else (name, token)
 
 # Stashed FP8 weight references — populated by MoE.stash_bf16_to_cpu(),
 # consumed by _fused_blockscaled_gated_forward and _DownProjection.forward
@@ -1528,6 +1578,14 @@ class _UpProjection(torch.autograd.Function):
         # Keep w1 FP8 cache — backward hits cache (~112µs savings) at ~74MB memory cost.
         # The cache auto-invalidates via w._version when optimizer updates weights.
 
+        invocation_token = _new_invocation_token()
+        _set_invocation_token(ctx, invocation_token)
+        for carrier in (y1, z):
+            if carrier is not None:
+                try:
+                    _set_invocation_token(carrier, invocation_token)
+                except AttributeError:
+                    pass
         return y1, z
 
     @staticmethod
@@ -1602,7 +1660,9 @@ class _UpProjection(torch.autograd.Function):
                 else:
                     # w1T_fp8, w1T_scales = precompute_weight_fp8(w1, permute=(1, 0, 2))
                     raise NotImplementedError("Quant in backward not supported yet.")
-                prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
+                if ctx._fp8_cfg.fp8_wgrad:
+                    _require_invocation_token(ctx)
+                prequant_dz = _PREQUANTIZED_SCALES.pop(_prequant_bwd_key(ctx, "bwd"), None)
                 if ctx._fp8_cfg.fp8_wgrad:
                     # FP8 wgrad: dz_bf16 was already freed in DownProj via dual-quant.
                     # Skip _matches_prequant_tensor (dz storage is 0).
@@ -1618,7 +1678,7 @@ class _UpProjection(torch.autograd.Function):
                     # FP8 wgrad with early dz_bf16 release.
                     # dz_col_fp8 was pre-computed in DownProj via dual_quantize_varlen
                     # (single HBM read of dz produced both row+col fp8).
-                    bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
+                    bwd_col = _PREQUANTIZED_SCALES.pop(_prequant_bwd_key(ctx, "bwd_col"), None)
 
                     # Sequential quant pipeline (all on default stream):
                     if ctx._prequant_activation_payload:
@@ -1686,7 +1746,7 @@ class _UpProjection(torch.autograd.Function):
                         dw1 = dw1_base.permute(1, 2, 0)
                     del dz_col_fp8, dz_col_scales, x_col_fp8, x_col_scales
                 else:
-                    bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
+                    bwd_col = _PREQUANTIZED_SCALES.pop(_prequant_bwd_key(ctx, "bwd_col"), None)
                     if ctx._prequant_activation_payload:
                         assert x_fp8_pre is not None and x_scales_pre is not None, "Pre-quantized input is None."
                         x_bf16 = dequantize_blockscaled_fp8(
@@ -1920,6 +1980,11 @@ class _DownProjection(torch.autograd.Function):
         # w2.transposed_fp8 = getattr(w2_original, "transposed_fp8", None)
         TK = y1.size(0)
         E, H, I = w2.shape
+
+        invocation_token = _get_invocation_token(z)
+        if invocation_token is None:
+            invocation_token = _get_invocation_token(y1)
+        _set_invocation_token(ctx, invocation_token)
 
         if (router_score_source is None) != (router_score_src_idx is None):
             raise ValueError("router_score_source and router_score_src_idx must be provided together")
@@ -2532,8 +2597,8 @@ class _DownProjection(torch.autograd.Function):
                                     dz, dout, x_gather_idx,
                                     TK_wgrad, dz.shape[1], dout.shape[1],
                                 )
-                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
-                        _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
+                        _PREQUANTIZED_SCALES[_prequant_bwd_key(ctx, "bwd")] = (dz, dz_fp8, dz_packed_scales)
+                        _PREQUANTIZED_SCALES[_prequant_bwd_key(ctx, "bwd_col")] = (dz_col_fp8, dz_col_scales)
 
                         # Fused wgrad accumulation (same as w1 path)
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
@@ -2633,7 +2698,7 @@ class _DownProjection(torch.autograd.Function):
                     # wgrad path already did this above before dw2 allocation).
                     if not ctx._fp8_cfg.fp8_wgrad:
                         dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
-                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                        _PREQUANTIZED_SCALES[_prequant_bwd_key(ctx, "bwd")] = (dz, dz_fp8, dz_packed_scales)
                     # _log_stage_memory("In backward, after w2 grad")
                     ds = ds[s_reverse_scatter_idx]
                 else:
@@ -2667,7 +2732,7 @@ class _DownProjection(torch.autograd.Function):
                             )
                             del z_bf16
                             dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
-                            _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                            _PREQUANTIZED_SCALES[_prequant_bwd_key(ctx, "bwd")] = (dz, dz_fp8, dz_packed_scales)
                         elif ctx._fp8_cfg.fused_swiglu_quant:
                             # Decomposed path (faster than fully-fused):
                             # 1. Dequant z_fp8 -> z_bf16  (~0.046ms, BLOCK_ROWS=16)
@@ -2680,7 +2745,7 @@ class _DownProjection(torch.autograd.Function):
                                 )
                             )
                             del z_bf16
-                            _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                            _PREQUANTIZED_SCALES[_prequant_bwd_key(ctx, "bwd")] = (dz, dz_fp8, dz_packed_scales)
                         else:
                             # Fused: read fp8 z directly, skip bf16 materialization
                             dz, y1s, ds = swiglu_backward_from_fp8_triton(
