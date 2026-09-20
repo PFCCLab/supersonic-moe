@@ -613,17 +613,20 @@ def _deepep_topk_to_sonic_metadata_cuda(
                 "Each token's topk slots must be unique experts."
             )
 
-    # Sync-free sizing. Computing the *exact* TK / TK_padded requires reading
-    # tokens_per_expert back to host (a blocking D2H) which stalls the launch
-    # path and surfaces as inter-rank collective skew. Instead size all outputs
-    # at a STATIC upper bound derived purely from shapes (N_recv, topk, E, block)
-    # — no GPU read. The CUDA kernel computes the exact per-expert layout
-    # on-device (expert_offsets[E] = true TK_padded, naept[N_recv] = true TK) and
-    # fills the over-allocated tail with padding, so over-sizing is inert.
-    # tokens_per_expert is intentionally NOT read on this path: the per-expert
-    # histogram is rebuilt on-device from dispatched_indices.
-    TK = N_recv * topk
-    TK_padded = ((TK + block - 1) // block) * block + E * block
+    # DeepEP already returns the counts on host, so use them only to size the
+    # outputs. The CUDA kernels derive their own expert counts from block_hist;
+    # no redundant pinned H2D copy is needed on the launch-critical path.
+    if isinstance(tokens_per_expert, torch.Tensor):
+        tpe_list = tokens_per_expert.tolist()
+    else:
+        tpe_list = list(tokens_per_expert)
+
+    TK = sum(tpe_list)
+    # Compute TK_padded (padded sum)
+    TK_padded = 0
+    for count in tpe_list:
+        if count > 0:
+            TK_padded += ((count + block - 1) // block) * block
     total_pad_rows = TK_padded - TK
 
     if TK == 0:
