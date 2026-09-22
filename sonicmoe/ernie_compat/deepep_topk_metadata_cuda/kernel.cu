@@ -573,15 +573,36 @@ void scatter_and_fixup_kernel(
     }
 
     // ═══════════ Phase 2: Pad-fill (vectorized, coalesced) ════════════════════
-    // Fill padding positions: x_gather_idx=0, s_scatter_idx=TK, topk_scores=0
+    // Fill padding positions: x_gather_idx=0, s_scatter_idx=real_TK, topk_scores=0
     // Process all TK_padded positions, skip real ones.
     // Use grid-stride loop for full coverage.
+    //
+    // NOTE: TK / TK_padded are STATIC UPPER BOUNDS (output allocation sizes),
+    // not the exact counts. The exact per-expert layout lives on-device:
+    // expert_offsets[num_experts] == true padded row count, naept[N_recv] ==
+    // true valid-pair count (both finalized by prefix_sums_kernel before this
+    // launch). We drive all fixup bounds from those, then clear/pad the
+    // over-allocated tail so oversizing is inert and no consumer reads
+    // uninitialized memory.
+    const int real_TK_padded = expert_offsets[num_experts];
+    const int real_TK = naept[N_recv];
 
     const int total_threads = gridDim.x * BLOCK_DIM;
     const int global_tid = blockIdx.x * BLOCK_DIM + threadIdx.x;
 
     for (int pos = global_tid; pos < TK_padded; pos += total_threads) {
-        // Binary search for expert
+        if (pos >= real_TK_padded) {
+            // Over-allocated tail (upper bound > true padded size): inert pad.
+            x_gather_idx[pos] = 0;
+            s_scatter_idx[pos] = real_TK;  // -> topk_scores[real_TK] == 0
+            if constexpr (PACK_SCALES) {
+                pack_scale_row_to_sfa(
+                    raw_scales, 0, pos, packed_scales,
+                    scale_cols, raw_stride_row, raw_stride_col, k_tiles);
+            }
+            continue;
+        }
+        // Binary search for expert (safe: pos < real_TK_padded so lo < num_experts)
         int lo = 0, hi = num_experts;
         while (lo < hi) {
             int mid = (lo + hi) >> 1;
@@ -595,7 +616,7 @@ void scatter_and_fixup_kernel(
         if (local_pos >= real_count) {
             // Padding position: fill defaults
             x_gather_idx[pos] = 0;
-            s_scatter_idx[pos] = TK;  // points to topk_scores[TK]=0
+            s_scatter_idx[pos] = real_TK;  // points to topk_scores[real_TK]=0
             // topk_scores[pos] already 0 from zero-init
             if constexpr (PACK_SCALES) {
                 pack_scale_row_to_sfa(
@@ -605,11 +626,21 @@ void scatter_and_fixup_kernel(
         }
     }
 
-    // Real scores densely cover [0, TK); clear only the padded tail here.
-    for (int score_pos = TK + global_tid;
+    // Real scores densely cover [0, real_TK); clear the whole tail up to the
+    // allocated TK_padded (covers both true padding and over-allocation).
+    for (int score_pos = real_TK + global_tid;
          score_pos < TK_padded;
          score_pos += total_threads) {
         topk_scores[score_pos] = 0.0f;
+    }
+
+    // s_reverse_scatter_idx / score_src_idx are allocated at the [TK] upper
+    // bound but written densely only over [0, real_TK). Fill the over-allocated
+    // tail with an inert sentinel (0) so shape-bounded consumers never read
+    // uninitialized memory.
+    for (int pos = real_TK + global_tid; pos < TK; pos += total_threads) {
+        s_reverse_scatter_idx[pos] = 0;
+        score_src_idx[pos] = 0;
     }
 }
 

@@ -177,6 +177,7 @@ def deepep_topk_to_sonic_metadata(
     E: int,
     device: str | torch.device = "cuda",
     block: int = 128,
+    sync_free_sizing: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
     """Convert real DeepEP topk dispatch results to SonicMoE routing metadata.
 
@@ -217,6 +218,15 @@ def deepep_topk_to_sonic_metadata(
         differentiable score reconstruction.  None when the CUDA kernel is
         not available (Python fallback); callers must then rebuild via the
         Triton _build_score_src_idx_kernel.
+
+    Other Parameters
+    ----------------
+    sync_free_sizing : bool
+        Size the outputs at a shape-only upper bound instead of reading
+        ``tokens_per_expert``. For callers whose counts live on-device and who
+        cannot afford the blocking D2H (the ring dispatcher); see the sizing
+        comment in ``_deepep_topk_to_sonic_metadata_cuda``. CUDA path only --
+        the Python fallback derives its counts from the data itself.
     """
     N_recv = dispatched_indices.shape[0]
     topk = dispatched_indices.shape[1]
@@ -235,7 +245,7 @@ def deepep_topk_to_sonic_metadata(
     if _HAS_TOPK_CUDA_KERNEL:
         return _deepep_topk_to_sonic_metadata_cuda(
             dispatched_indices, dispatched_probs, tokens_per_expert,
-            E, device, block,
+            E, device, block, sync_free_sizing=sync_free_sizing,
         )
 
     # ── Phase 1: Flatten and filter valid entries ───────────────────────
@@ -356,6 +366,7 @@ def deepep_topk_to_sonic_metadata_with_scales(
     gated_n: int | None = None,
     gated_preact_bf16: bool = False,
     gated_allocate_z_scale: bool = True,
+    sync_free_sizing: bool = False,
 ):
     """Topk metadata conversion plus optional Sonic FP8 scale packing.
 
@@ -442,6 +453,7 @@ def deepep_topk_to_sonic_metadata_with_scales(
             gated_n=gated_n,
             gated_preact_bf16=bool(gated_preact_bf16),
             gated_allocate_z_scale=bool(gated_allocate_z_scale),
+            sync_free_sizing=sync_free_sizing,
         )
 
     meta = deepep_topk_to_sonic_metadata(
@@ -451,6 +463,7 @@ def deepep_topk_to_sonic_metadata_with_scales(
         E,
         device,
         block,
+        sync_free_sizing=sync_free_sizing,
     )
     return (*meta, None)
 
@@ -585,6 +598,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
     gated_n: int | None = None,
     gated_preact_bf16: bool = False,
     gated_allocate_z_scale: bool = True,
+    sync_free_sizing: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
     """CUDA fused topk metadata conversion (warp-ballot, zero argsort).
 
@@ -613,20 +627,30 @@ def _deepep_topk_to_sonic_metadata_cuda(
                 "Each token's topk slots must be unique experts."
             )
 
-    # DeepEP already returns the counts on host, so use them only to size the
-    # outputs. The CUDA kernels derive their own expert counts from block_hist;
-    # no redundant pinned H2D copy is needed on the launch-critical path.
-    if isinstance(tokens_per_expert, torch.Tensor):
-        tpe_list = tokens_per_expert.tolist()
+    # Output sizing. Exact by default, since DeepEP returns the per-expert counts
+    # on host anyway and its sparse recv table would make a shape-only bound
+    # overshoot badly.
+    #
+    # ``sync_free_sizing`` is for callers whose counts live on-device and cannot
+    # afford the blocking D2H (the ring dispatcher). Safe to over-allocate: the
+    # kernel takes the true layout from the device and pads the tail inertly.
+    if sync_free_sizing:
+        # A row holds at most min(topk, E) valid entries: its slots are unique
+        # expert ids (enforced contract) or -1.
+        TK = N_recv * min(topk, E)
+        TK_padded = ((TK + block - 1) // block) * block + E * block
     else:
-        tpe_list = list(tokens_per_expert)
+        if isinstance(tokens_per_expert, torch.Tensor):
+            tpe_list = tokens_per_expert.tolist()
+        else:
+            tpe_list = list(tokens_per_expert)
 
-    TK = sum(tpe_list)
-    # Compute TK_padded (padded sum)
-    TK_padded = 0
-    for count in tpe_list:
-        if count > 0:
-            TK_padded += ((count + block - 1) // block) * block
+        TK = sum(tpe_list)
+        # Compute TK_padded (padded sum)
+        TK_padded = 0
+        for count in tpe_list:
+            if count > 0:
+                TK_padded += ((count + block - 1) // block) * block
     total_pad_rows = TK_padded - TK
 
     if TK == 0:
