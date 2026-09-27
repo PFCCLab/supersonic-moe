@@ -24,7 +24,35 @@ from tests.ops.conftest import (
     GEMM_SHAPES,
 )
 
-pytestmark = [requires_blackwell, requires_quack]
+def _has_sm90_plus() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+
+
+requires_sm90_plus = pytest.mark.skipif(not _has_sm90_plus(), reason="Requires SM90+ GPU")
+pytestmark = [requires_quack]
+
+
+def test_sm90_setup_hook_uses_hopper_signature(monkeypatch):
+    import cutlass
+    from sonicmoe.quack_utils.gemm_gated import GemmGatedSm90
+    from quack.gemm_sm90 import GemmSm90
+
+    instance = GemmGatedSm90(cutlass.Float32, cutlass.BFloat16, (64, 64), (1, 1, 1))
+    assert instance.blockscaled is False
+
+    sentinel = object()
+    seen = {}
+
+    def fake_setup(self, epilogue_args):
+        seen["self"] = self
+        seen["epilogue_args"] = epilogue_args
+        return sentinel
+
+    monkeypatch.setattr(GemmSm90, "_setup_attributes", fake_setup)
+
+    assert instance._setup_attributes("epi") is sentinel
+    assert seen == {"self": instance, "epilogue_args": "epi"}
+
 
 # Filter to aligned shapes: per-expert tokens must be 128-aligned for FP8 path
 _GATED_SHAPES = []
@@ -84,6 +112,7 @@ def _report_metrics(actual, expected, label):
     return r, c
 
 
+@requires_sm90_plus
 @pytest.mark.parametrize("T,H,I,E,K", GATED_SHAPES)
 def test_torch_vs_bf16(T, H, I, E, K, seed):
     """(1/3) BF16 CUTLASS gemm_gated vs torch gold."""
@@ -112,6 +141,7 @@ def test_torch_vs_bf16(T, H, I, E, K, seed):
         warnings.warn(f"BF16 gemm_gated y1 RRMSE vs torch = {r_y1:.6f} (>0.5%)")
 
 
+@requires_blackwell
 @pytest.mark.parametrize("T,H,I,E,K", GATED_SHAPES)
 def test_torch_vs_fp8(T, H, I, E, K, seed):
     """(2/3) FP8 blockscaled gemm_gated vs torch gold."""
@@ -152,6 +182,7 @@ def test_torch_vs_fp8(T, H, I, E, K, seed):
         assert max_abs < 0.01, f"FP8 gemm_gated y1 max_abs {max_abs:.6f} >= 0.01 (near-zero gold)"
 
 
+@requires_blackwell
 @pytest.mark.parametrize("T,H,I,E,K", GATED_SHAPES)
 def test_bf16_vs_fp8(T, H, I, E, K, seed):
     """(3/3) FP8 blockscaled vs BF16 CUTLASS cross-check."""

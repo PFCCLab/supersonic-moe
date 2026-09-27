@@ -1402,7 +1402,11 @@ def test_down_projection_router_score_bridge_bit_exact():
     T, H, I, E, K = 256, 768, 384, 8, 2
     TK = T * K
     N_PAD = 128
-    x, w1_split, w2, topk_indices, source_values = _make_test_data(T, H, I, E, K, seed=314159)
+    x, w1_split, w2, _, source_values = _make_test_data(T, H, I, E, K, seed=314159)
+    token_ids = torch.arange(T, dtype=torch.int32, device="cuda")
+    expert_lo = token_ids % E
+    topk_indices = torch.stack([(expert_lo + 1) % E, expert_lo], dim=1)
+    assert bool(torch.any(topk_indices[:, 0] > topk_indices[:, 1]).item())
     w1_param, w2_param = _convert_weights_for_sonicmoe(w1_split, w2)
     # The current functional API receives expert-major Sonic weights directly.
     w1_func = w1_param
@@ -1451,9 +1455,15 @@ def test_down_projection_router_score_bridge_bit_exact():
         z = z.detach()
         z.stop_gradient = False
 
-        # DeepEP may reorder received rows.  Reverse order makes an accidental
-        # identity mapping visible while keeping every source index unique.
-        score_src_idx = torch.arange(TK - 1, -1, -1, dtype=torch.int32, device="cuda")
+        # Metadata stores each token's routes in expert order, not the original
+        # top-k slot order.  K=2 and descending route pairs make the mapping
+        # deliberately non-identity.
+        route_slots = torch.argsort(topk_indices, dim=1).cast(torch.int32)
+        score_src_idx = (
+            token_ids.reshape([-1, 1]) * K + route_slots
+        ).reshape([-1]).contiguous()
+        identity = torch.arange(TK, dtype=torch.int32, device="cuda")
+        assert bool(torch.any(score_src_idx != identity).item())
         metadata_values = _gather_router_scores_i32(source_values.detach().reshape([-1]), score_src_idx)
         # Real DeepEP metadata is block-aligned and can contain score padding.
         # Keep source indices route-sized while exercising a larger score buffer.
@@ -1464,6 +1474,7 @@ def test_down_projection_router_score_bridge_bit_exact():
             ]
         )
         grad_out = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
+        assert bool(torch.any(grad_out != grad_out[0, 0]).item())
 
         metadata_reference = metadata_values.detach().clone()
         metadata_reference.stop_gradient = False
@@ -1530,12 +1541,116 @@ def test_down_projection_router_score_bridge_bit_exact():
         out_fused.backward(grad_out)
 
         assert bool(torch.all(out_fused.view(torch.uint8) == out_reference.view(torch.uint8)).item())
+        assert source_fused.grad is not None
+        assert tuple(source_fused.grad.shape) == (T, K)
+        assert bool(torch.isfinite(source_fused.grad).all().item())
+        assert float(source_fused.grad.float().abs().sum().item()) > 0.0
+        assert bool(torch.isfinite(expected_source_grad).all().item())
         assert bool(torch.all(source_fused.grad.view(torch.uint8) == expected_source_grad.view(torch.uint8)).item())
         assert bool(torch.all(z_fused.grad.view(torch.uint8) == expected_z_grad.view(torch.uint8)).item())
         assert bool(torch.all(w2_fused.grad.view(torch.uint8) == expected_w2_grad.view(torch.uint8)).item())
         assert source_fused.stop_gradient is False
         assert metadata_fused.stop_gradient is True
         assert metadata_fused.grad is None
+
+        # A distributed-style metadata source map may still be supplied by a
+        # lower-level caller when its original router source is frozen. Paddle
+        # requires backward to return None for that tensor input slot.
+        source_frozen = source_values.detach().clone()
+        assert source_frozen.stop_gradient is True
+        metadata_frozen = metadata_values.detach().clone()
+        z_frozen = z.detach().clone()
+        z_frozen.stop_gradient = False
+        w2_frozen = w2_func.detach().clone()
+        assert w2_frozen.stop_gradient is True
+        out_frozen = _DownProjection.apply(
+            y1,
+            z_frozen,
+            w2_frozen,
+            None,
+            metadata_frozen,
+            s_scatter_idx,
+            expert_frequency_offset,
+            T,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            token_offsets,
+            True,
+            ActivationType.SWIGLU,
+            None,
+            None,
+            None,
+            source_frozen,
+            score_src_idx,
+        )
+        out_frozen.backward(grad_out)
+        assert source_frozen.grad is None
+        assert w2_frozen.grad is None
+        assert metadata_frozen.stop_gradient is True
+        assert metadata_frozen.grad is None
+        assert bool(torch.all(out_frozen.view(torch.uint8) == out_reference.view(torch.uint8)).item())
+
+        # Gate-only training: both expert weights are frozen while the original
+        # router score source remains differentiable. Backward must cross both
+        # PyLayers, return None for w2 and w1, and still reach the router edge.
+        source_gate_only = source_values.detach().clone()
+        source_gate_only.stop_gradient = False
+        metadata_gate_only = metadata_values.detach().clone()
+        x_gate_only = x.detach().clone()
+        w1_gate_only = w1_func.detach().clone()
+        w2_gate_only = w2_func.detach().clone()
+        assert w1_gate_only.stop_gradient is True
+        assert w2_gate_only.stop_gradient is True
+        y1_gate_only, z_gate_only = _UpProjection.apply(
+            x_gate_only,
+            w1_gate_only,
+            None,
+            expert_frequency_offset,
+            TK,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            None,
+            False,
+            ActivationType.SWIGLU,
+            False,
+            False,
+        )
+        out_gate_only = _DownProjection.apply(
+            y1_gate_only,
+            z_gate_only,
+            w2_gate_only,
+            None,
+            metadata_gate_only,
+            s_scatter_idx,
+            expert_frequency_offset,
+            T,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            token_offsets,
+            True,
+            ActivationType.SWIGLU,
+            None,
+            None,
+            None,
+            source_gate_only,
+            score_src_idx,
+        )
+        out_gate_only.backward(grad_out)
+        assert source_gate_only.grad is not None
+        assert bool(torch.isfinite(source_gate_only.grad).all().item())
+        assert float(source_gate_only.grad.float().abs().sum().item()) > 0.0
+        assert bool(torch.all(source_gate_only.grad.view(torch.uint8) == expected_source_grad.view(torch.uint8)).item())
+        assert w1_gate_only.grad is None
+        assert w2_gate_only.grad is None
     finally:
         _fp8_utils._IS_FP8_ACTIVE = old_fp8_active
         if old_env is None:

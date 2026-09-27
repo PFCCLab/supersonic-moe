@@ -4,6 +4,7 @@
 
 from functools import partial
 import os
+import sys
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
@@ -62,6 +63,18 @@ from .activation_situ import (
     resolve_dgate_fn,
 )
 
+from .sm90_fp8_runtime import (
+    claim_pending_sm90_carrier,
+    current_sm90_invocation,
+    get_sm90_carrier,
+    get_sm90_storage_carriers,
+    is_sm90_native_active,
+    is_sm90_native_carrier,
+    register_sm90_carrier,
+    unique_retained_sm90_invocation,
+    use_sm90_invocation,
+)
+from .gemm_sm90_scaled import sm90_scaled_dgated
 from .gemm_sm100_fp8_zeromat import (
     GemmDGatedSm100ZeroMat,
     GemmDGatedFP8CLoadSm100ZeroMat,
@@ -74,7 +87,15 @@ if _SONIC_QUACK_UTILS_DIR not in EXTRA_SOURCE_DIRS:
 
 
 class GemmDGatedSm90(GemmDGatedMixin, GemmSm90):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # GemmSm100 defines this flag, while current GemmSm90 does not.
+        # Shared dGated epilogue hooks use it to select the BF16 path.
+        self.blockscaled = False
+
+    def _setup_attributes(self, epilogue_args):
+        """Match the one-argument setup hook used by current QuACK Hopper."""
+        return GemmSm90._setup_attributes(self, epilogue_args)
 
 
 class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
@@ -350,6 +371,161 @@ def _run_gemm_dgated_tvm_ffi(
     )
 
 
+def _native_preact_payload(PreAct):
+    carrier = get_sm90_carrier(PreAct)
+    if carrier is None:
+        return PreAct, None
+    mode = carrier.metadata.get("mode")
+    if mode == "bf16":
+        return PreAct, None
+    if carrier.recipe is None and carrier.data is None:
+        return PreAct, None
+    carrier.materialize()
+    if carrier.data is None or carrier.scales is None:
+        raise RuntimeError("SM90 FP8 preact carrier materialized without data and scales")
+    rows, cols = map(int, carrier.data.shape)
+    expected_scales = (rows, cols // 32)
+    if carrier.data.dtype != torch.float8_e4m3fn or cols % 32:
+        raise TypeError("SM90 FP8 preact data must be rank-2 E4M3 with 32-aligned width")
+    if (
+        carrier.scales.dtype != torch.uint8
+        or tuple(carrier.scales.shape) != expected_scales
+        or not carrier.scales.is_contiguous()
+    ):
+        raise TypeError(
+            "SM90 FP8 preact scales must use fixed raw uint8 1x32 ABI; expected "
+            f"{expected_scales}, got {tuple(carrier.scales.shape)} and {carrier.scales.dtype}"
+        )
+    carrier.metadata["group_size"] = 32
+    carrier.metadata["scale_abi"] = "raw_ue8m0_1x32"
+    carrier.metadata["consumed_by_dgated"] = True
+    carrier.metadata["recompute_calls"] = int(carrier.metadata.get("recompute_calls", 0)) + 1
+    return carrier.data, carrier.scales
+
+
+def _attach_sm90_dgated_colwise_outputs(D, PostAct, cu_seqlens_m):
+    if cu_seqlens_m is None:
+        return
+    for tensor in (D, PostAct):
+        carrier = get_sm90_carrier(tensor)
+        if carrier is None:
+            carrier = register_sm90_carrier(
+                tensor,
+                role="dgated_output",
+                metadata={"group_size": 32},
+            )
+        functional_package = next(
+            name
+            for name in (
+                __package__.split(".quack_utils", 1)[0] + ".functional",
+                "paddlefleet_ops.sonicmoe.functional",
+            )
+            if name in sys.modules
+        )
+        functional = sys.modules[functional_package]
+        functional.sm90_reference.attach_sm90_wgrad_colwise_recipe(
+            tensor, cu_seqlens_m, source=tensor
+        )
+
+
+def _try_sm90_native_dgated(
+    A, B, Out, PreAct, PostAct, *, activation, cu_seqlens_m, A_idx,
+    colvec_scale, colvec_reduce, swiglu_clamp_value,
+):
+    if is_sm90_native_active():
+        if activation != "swiglu":
+            raise NotImplementedError(
+                "native SM90 FP8 carrier dGated GEMM supports only swiglu; "
+                f"got activation={activation!r}. Refusing to read compatibility anchors."
+            )
+        if float(swiglu_clamp_value) != 0.0:
+            raise NotImplementedError(
+                "native SM90 FP8 carrier dGated GEMM does not support "
+                f"swiglu_clamp_value={swiglu_clamp_value}. Refusing to read compatibility anchors."
+            )
+    invocation = current_sm90_invocation() or unique_retained_sm90_invocation()
+    if invocation is None:
+        return False
+    a_carrier = get_sm90_carrier(A, invocation=invocation)
+    b_carrier = get_sm90_carrier(B, invocation=invocation)
+    if a_carrier is not None and b_carrier is None:
+        b_carrier = get_sm90_carrier(B, invocation=invocation)
+        if b_carrier is None:
+            a_k = int(a_carrier.data.shape[-1])
+            candidates = [
+                candidate
+                for candidate in get_sm90_storage_carriers(B, invocation=invocation)
+                if candidate.data is not None
+                and int(candidate.data.shape[-1]) == a_k
+            ]
+            if len(candidates) == 1:
+                b_carrier = candidates[0]
+    if b_carrier is not None and a_carrier is None:
+        a_carrier = claim_pending_sm90_carrier(A, invocation)
+    if a_carrier is None or b_carrier is None:
+        return False
+    if not (
+        is_sm90_native_active()
+        or (is_sm90_native_carrier(a_carrier) and is_sm90_native_carrier(b_carrier))
+    ):
+        return False
+    if activation != "swiglu":
+        raise NotImplementedError(
+            "native SM90 FP8 carrier dGated GEMM supports only swiglu; "
+            f"got activation={activation!r}. Refusing to read compatibility anchors."
+        )
+    if float(swiglu_clamp_value) != 0.0:
+        raise NotImplementedError(
+            "native SM90 FP8 carrier dGated GEMM does not support "
+            f"swiglu_clamp_value={swiglu_clamp_value}. Refusing to read compatibility anchors."
+        )
+    a_carrier.materialize()
+    b_carrier.materialize()
+    kernel_out, kernel_postact = Out, PostAct
+    if int(Out.shape[-1]) == 2 * int(PostAct.shape[-1]):
+        kernel_out = Out.view(torch.float32)
+    elif Out.dtype not in (torch.bfloat16, torch.float16) or PostAct.dtype != Out.dtype:
+        kernel_out = torch.empty_like(Out, dtype=torch.bfloat16)
+        kernel_postact = torch.empty_like(PostAct, dtype=torch.bfloat16)
+    group_size = int(a_carrier.metadata.get("group_size", 32))
+    block_size = int(b_carrier.metadata.get("block_size", group_size))
+    preact, preact_scales = _native_preact_payload(PreAct)
+    if preact_scales is None and preact.dtype != Out.dtype:
+        preact = preact.to(Out.dtype)
+    invocation = a_carrier.metadata["invocation"]
+    with use_sm90_invocation(invocation):
+        sm90_scaled_dgated(
+            a_carrier.data,
+            b_carrier.data,
+            kernel_out,
+            preact,
+            kernel_postact,
+            a_carrier.scales,
+            b_carrier.scales,
+            activation=activation,
+            preact_fp8=preact if preact_scales is not None else None,
+            preact_scales=preact_scales,
+            colvec_scale=colvec_scale,
+            colvec_reduce=colvec_reduce,
+            cu_seqlens_m=cu_seqlens_m,
+            A_idx=A_idx,
+            activation_group=group_size,
+            weight_block=block_size,
+        )
+        if kernel_out is not Out and kernel_out.dtype == torch.bfloat16:
+            Out.copy_(kernel_out.to(Out.dtype))
+            PostAct.copy_(kernel_postact.to(PostAct.dtype))
+        for tensor, role in ((Out, "dz"), (PostAct, "y1s")):
+            register_sm90_carrier(
+                tensor,
+                role=role,
+                metadata={"group_size": group_size},
+                replace=True,
+            )
+        _attach_sm90_dgated_colwise_outputs(Out, PostAct, cu_seqlens_m)
+    return True
+
+
 def gemm_dgated(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
     B: Tensor,  # (l, n, k)
@@ -388,6 +564,21 @@ def gemm_dgated(
             )
         swiglu_clamp_value = 0.0
     fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
+    device_capacity = get_device_capacity(A.device)
+    if device_capacity[0] == 9 and _try_sm90_native_dgated(
+        A,
+        B,
+        Out,
+        PreAct,
+        PostAct,
+        activation=activation,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        colvec_scale=colvec_scale,
+        colvec_reduce=colvec_reduce,
+        swiglu_clamp_value=swiglu_clamp_value,
+    ):
+        return
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
@@ -587,40 +778,44 @@ def gemm_dgated(
     if compile_key not in cache:
         if device_capacity[0] == 9:
             GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+        gemm_kwargs = {"gather_A": gather_A}
+        if device_capacity[0] >= 10:
+            gemm_kwargs["sf_vec_size"] = sf_vec_size
         gemm_obj = GemmCls(
             acc_dtype,
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
-            gather_A=gather_A,
-            sf_vec_size=sf_vec_size,
+            **gemm_kwargs,
         )
         gemm_obj.implicit_dtype = implicit_dtype
-        cache[compile_key] = cute.compile(
+        compile_args = (
             gemm_obj,
             tensor_infos["A"].cute_tensor,
             tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,  # Out
-            tensor_infos["C"].cute_tensor,  # PreAct
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
             epi_args,
             scheduler_args,
             varlen_args,
             current_stream,
-            a_scale_cute,
-            b_scale_cute,
         )
-    cache[compile_key](
+        if device_capacity[0] >= 10:
+            compile_args += (a_scale_cute, b_scale_cute)
+        cache[compile_key] = cute.compile(*compile_args)
+    call_args = (
         tensor_infos["A"].cute_tensor,
         tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,  # Out
-        tensor_infos["C"].cute_tensor,  # PreAct
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
         epi_args,
         scheduler_args,
         varlen_args,
         current_stream,
-        a_scale_cute,
-        b_scale_cute,
     )
+    if device_capacity[0] >= 10:
+        call_args += (a_scale_cute, b_scale_cute)
+    cache[compile_key](*call_args)
 
 
 from ..cache_manager import InstrumentedCompileCache as _ICC

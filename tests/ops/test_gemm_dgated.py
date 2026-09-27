@@ -23,13 +23,46 @@ import pytest
 import torch
 
 from tests.ops.conftest import (
-    requires_blackwell, requires_quack,
+    requires_quack,
     assert_bf16_close,
     rrmse, cosine_sim,
     GEMM_SHAPES,
 )
 
-pytestmark = [requires_blackwell, requires_quack]
+def _has_sm90_plus() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9
+
+
+def _has_exact_sm90() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
+requires_sm90_plus = pytest.mark.skipif(not _has_sm90_plus(), reason="Requires SM90+ GPU")
+requires_exact_sm90 = pytest.mark.skipif(not _has_exact_sm90(), reason="Requires exact SM90 GPU")
+pytestmark = [requires_quack, requires_sm90_plus]
+
+
+def test_sm90_setup_hook_uses_hopper_signature(monkeypatch):
+    import cutlass
+    from quack.gemm_sm90 import GemmSm90
+    from sonicmoe.quack_utils.gemm_dgated import GemmDGatedSm90
+
+    instance = GemmDGatedSm90(cutlass.Float32, cutlass.BFloat16, (64, 64), (1, 1, 1))
+    assert instance.blockscaled is False
+
+    sentinel = object()
+    seen = {}
+
+    def fake_setup(self, epilogue_args):
+        seen["self"] = self
+        seen["epilogue_args"] = epilogue_args
+        return sentinel
+
+    monkeypatch.setattr(GemmSm90, "_setup_attributes", fake_setup)
+
+    assert instance._setup_attributes("epi") is sentinel
+    assert seen == {"self": instance, "epilogue_args": "epi"}
+
 
 _DGATED_SHAPES = []
 for p in GEMM_SHAPES:
@@ -86,6 +119,59 @@ def _report(actual, expected, label):
     return r, c
 
 
+def _torch_dgated_gold_gather(dout, w2, z_preact, cu_seqlens, A_idx, E):
+    total_M = A_idx.numel()
+    I_dim = w2.shape[1]
+    temp = torch.zeros(total_M, I_dim, dtype=torch.float32, device=dout.device)
+    gathered = dout[A_idx.long()].float()
+    for exp in range(E):
+        s = cu_seqlens[exp].item()
+        e = cu_seqlens[exp + 1].item()
+        if s < e:
+            temp[s:e] = gathered[s:e] @ w2[:, :, exp].float()
+
+    z_f32 = z_preact.float()
+    gate = z_f32[:, 0::2]
+    up = z_f32[:, 1::2]
+    sig = torch.sigmoid(gate)
+    dx = torch.empty(total_M, 2 * I_dim, dtype=torch.bfloat16, device=dout.device)
+    dx[:, 0::2] = (temp * up * sig * (1.0 + gate * (1.0 - sig))).to(torch.bfloat16)
+    dx[:, 1::2] = (temp * gate * sig).to(torch.bfloat16)
+    return dx
+
+
+@requires_exact_sm90
+def test_sm90_bf16_gather_uses_t_sized_source_and_a_idx(seed):
+    from sonicmoe.quack_utils.gemm_interface import gemm_dgated
+
+    source_tokens, H, I, E = 37, 128, 128, 4
+    counts = [0, 5, 1, 10]
+    cu_seqlens = torch.tensor([0, 0, 5, 6, 16], dtype=torch.int32, device="cuda")
+    A_idx = torch.randint(source_tokens, (sum(counts),), dtype=torch.int32, device="cuda")
+    dout = torch.randn(source_tokens, H, dtype=torch.bfloat16, device="cuda") * 0.02
+    w2 = torch.randn(H, I, E, dtype=torch.bfloat16, device="cuda") * 0.02
+    z_preact = torch.randn(A_idx.numel(), 2 * I, dtype=torch.bfloat16, device="cuda") * 0.02
+    gold_dx = _torch_dgated_gold_gather(dout, w2, z_preact, cu_seqlens, A_idx, E)
+
+    dx_out, _ = gemm_dgated(
+        dout,
+        w2.permute(2, 0, 1).contiguous(),
+        z_preact,
+        activation="swiglu",
+        cu_seqlens_m=cu_seqlens,
+        A_idx=A_idx,
+        dynamic_scheduler=False,
+        tuned=False,
+    )
+    torch.cuda.synchronize()
+
+    assert dout.shape == (source_tokens, H)
+    assert A_idx.numel() == sum(counts)
+    assert dx_out.shape == (A_idx.numel(), 2 * I)
+    assert_bf16_close(dx_out, gold_dx, atol=1.4e-2)
+
+
+@requires_sm90_plus
 @pytest.mark.parametrize("T,H,I,E,K", DGATED_SHAPES)
 def test_torch_vs_bf16(T, H, I, E, K, seed):
     """(1/3) BF16 CUTLASS gemm_dgated vs torch gold with detailed metrics."""
@@ -112,6 +198,7 @@ def test_torch_vs_bf16(T, H, I, E, K, seed):
         warnings.warn(f"BF16 gemm_dgated dx RRMSE={r:.6f} (>0.5% — investigate)")
 
 
+@requires_sm90_plus
 @pytest.mark.parametrize("T,H,I,E,K", DGATED_SHAPES)
 def test_bf16_deterministic(T, H, I, E, K, seed):
     """(2/3) BF16 CUTLASS gemm_dgated is deterministic across two calls."""
@@ -132,6 +219,7 @@ def test_bf16_deterministic(T, H, I, E, K, seed):
     assert max_diff < 1e-6, f"Non-deterministic: max diff={max_diff}"
 
 
+@requires_sm90_plus
 @pytest.mark.parametrize("T,H,I,E,K", DGATED_SHAPES)
 def test_bf16_postact_vs_torch(T, H, I, E, K, seed):
     """(3/3) BF16 CUTLASS gemm_dgated postact (y1s) vs torch gold SwiGLU fwd."""

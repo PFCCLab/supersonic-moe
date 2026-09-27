@@ -14,6 +14,8 @@ import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.layout_utils as layout_utils
 import quack.utils as utils
+from quack.epi_ops import _get_lane_warp_layouts
+from quack.sm90_utils import partition_for_epilogue
 import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -445,6 +447,161 @@ class BlockscaledScaleStoreDual(BlockscaledScaleStore):
                 n_sub = epi_coord
             return (param, m_abs, n_base + n_sub * Int32(2), m_limit, n_limit)
         return None
+
+
+class Sm90RawScaleStore(EpiOp):
+    """SM90 raw 1x32 UE8M0 store using the actual R2S source coordinates."""
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        state = None
+        if const_expr(param is not None):
+            coord = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+            )
+            state = (
+                param,
+                coord,
+                ctx.tile_coord_mnkl,
+                ctx.varlen_manager,
+                ctx.tidx,
+                ctx.tiled_copy_r2s,
+                ctx.epi_tile,
+                ctx.tile_M,
+                ctx.tile_N,
+            )
+        return state
+
+    def begin_loop(self, gemm, state, epi_coord):
+        result = None
+        if const_expr(state is not None):
+            param, coord, tile_coord, varlen, tidx, tiled_copy, epi_tile, tile_m, tile_n = state
+            coord_cur = cute.group_modes(coord, 3, cute.rank(coord))[
+                None, None, None, epi_coord
+            ]
+            result = (
+                param, coord_cur, tile_coord, varlen, tidx, tiled_copy,
+                epi_tile, tile_m, tile_n,
+            )
+        return result
+
+
+class Sm90RawGatedQuantMixin(GemmGatedMixin):
+    """Hopper-only raw 1x32 z/y1 quantization in the GEMM epilogue."""
+
+    _epi_ops = (
+        *GemmGatedMixin._epi_ops,
+        Sm90RawScaleStore("mZScale"),
+        Sm90RawScaleStore("mPostActScaleRaw"),
+    )
+    _extra_param_fields = (
+        *GemmGatedMixin._extra_param_fields,
+        ("postact_bf16_trunc", cutlass.Constexpr, False),
+    )
+
+    def _forced_epi_tile_n(self):
+        return 64
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
+        postact_bf16_trunc: cutlass.Constexpr[bool] = False
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mZScale: Optional[cute.Tensor] = None
+        mPostActScaleRaw: Optional[cute.Tensor] = None
+
+    @staticmethod
+    @cute.jit
+    def _quantize_fragment(values, info, half_n: cutlass.Constexpr[bool]):
+        if const_expr(info is not None):
+            param, coords, tile_coord, varlen, tidx, tiled_copy, epi_tile, tile_m, tile_n = info
+            lane_layout, warp_layout = _get_lane_warp_layouts(tiled_copy, True)
+            lanes_n = cute.size(lane_layout, mode=[1])
+            assert cute.size(warp_layout, mode=[1]) == 1
+            batch = tile_coord[3]
+            batch_start = varlen.params.cu_seqlens_m[batch] if varlen.varlen_m else Int32(0)
+            m_limit = (
+                varlen.params.cu_seqlens_m[batch + Int32(1)]
+                if varlen.varlen_m else param.shape[0]
+            )
+            values_for_quant = cute.make_rmem_tensor(values.shape, Float32)
+            values_for_quant.store(values.load())
+            for i in cutlass.range(cute.size(values), unroll_full=True):
+                coord = coords[2 * i] if half_n else coords[i]
+                m_local = coord[0]
+                n_local = coord[1]
+                n_out = n_local // Int32(2) if half_n else n_local
+                # R2S coordinates show four adjacent N lanes per row; each lane
+                # owns eight register values, covering one complete 1x32 group.
+                amax = cute.arch.fmax(
+                    values_for_quant[i], Float32(0.0) - values_for_quant[i]
+                )
+                for j in cutlass.range(cute.size(values_for_quant), unroll_full=True):
+                    other = coords[2 * j] if half_n else coords[j]
+                    other_n = other[1] // Int32(2) if half_n else other[1]
+                    same_group = (
+                        cutlass.Boolean(other[0] == m_local)
+                        & cutlass.Boolean((other_n // Int32(32)) == (n_out // Int32(32)))
+                    )
+                    other_abs = cute.arch.fmax(
+                        values_for_quant[j], Float32(0.0) - values_for_quant[j]
+                    )
+                    amax = cute.arch.fmax(amax, other_abs if same_group else Float32(0.0))
+                amax = cute.arch.warp_reduction(
+                    amax, cute.arch.fmax, threads_in_group=lanes_n
+                )
+                amax_bits = _f32_as_i32(amax)
+                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                mantissa = amax_bits & Int32(0x7FFFFF)
+                carry = Int32(1) if cutlass.Boolean(mantissa > Int32(0x600000)) else Int32(0)
+                e8m0 = biased_exp - Int32(8) + carry
+                e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
+                e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
+                qexp = Int32(254) - e8m0
+                qexp = Int32(254) if cutlass.Boolean(qexp > Int32(254)) else qexp
+                qexp = Int32(1) if cutlass.Boolean(qexp < Int32(1)) else qexp
+                values[i] = values_for_quant[i] * _i32_as_f32(qexp << Int32(23))
+                m_abs = batch_start + tile_coord[0] * tile_m + m_local
+                output_tile_n = tile_n // Int32(2) if half_n else tile_n
+                n_abs = tile_coord[1] * output_tile_n + n_out
+                if (
+                    cutlass.Boolean(m_abs < m_limit)
+                    & cutlass.Boolean(n_abs < param.shape[1] * Int32(32))
+                    & cutlass.Boolean((n_abs % Int32(32)) == Int32(0))
+                ):
+                    param[m_abs, n_abs // Int32(32)] = cutlass.Int8(e8m0)
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        postact = GemmGatedMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+        if const_expr(epi_loop_tensors["mPostActScaleRaw"] is not None):
+            if const_expr(params.postact_bf16_trunc):
+                for i in cutlass.range(cute.size(postact), unroll_full=True):
+                    postact[i] = _bf16_trunc_rne(postact[i])
+            self._quantize_fragment(postact, epi_loop_tensors["mPostActScaleRaw"], True)
+        self._quantize_fragment(tRS_rD, epi_loop_tensors["mZScale"], False)
+        return postact
+
+    @cute.jit
+    def epi_convert_postact(self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx):
+        return GemmActMixin.epi_convert_postact(
+            self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
 
 
 # ---------------------------------------------------------------------------

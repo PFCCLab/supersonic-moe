@@ -32,7 +32,12 @@ import torch
 from tests.ops.conftest import requires_blackwell, requires_quack
 
 
-pytestmark = [requires_blackwell, requires_quack]
+def _has_sm90() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
+requires_sm90 = pytest.mark.skipif(not _has_sm90(), reason="Requires exact SM90 GPU")
+pytestmark = [requires_quack]
 
 DEFAULT_CONFIG = "128,128,1,1,1,8"
 DEFAULT_CANDIDATES = [
@@ -287,6 +292,161 @@ def _time_config(case: dict, config: str, warmup: int, repeats: int) -> dict:
     }
 
 
+def _sm90_gold(case: dict, *, dtype: torch.dtype) -> torch.Tensor:
+    A = case["A"].float()
+    B = case["B"].float()
+    A_idx = case["A_idx"].long()
+    cu = case["cu"]
+    out = torch.zeros(
+        (case["E"], case["M"], case["N"]), dtype=dtype, device=case["device"]
+    )
+    for expert in range(case["E"]):
+        start = int(cu[expert].item())
+        end = int(cu[expert + 1].item())
+        if start != end:
+            out[expert] = A[:, A_idx[start:end]] @ B[start:end]
+    return out
+
+
+def _run_accumulate(case: dict, accumulator: torch.Tensor, *, tma_add: bool = False) -> None:
+    from sonicmoe.quack_utils.bf16_wgrad_gemm import (
+        bf16_wgrad_gemm_varlen_k_accumulate,
+        bf16_wgrad_gemm_varlen_k_tma_add,
+    )
+
+    fn = bf16_wgrad_gemm_varlen_k_tma_add if tma_add else bf16_wgrad_gemm_varlen_k_accumulate
+    fn(
+        case["A"],
+        case["B"],
+        case["cu"],
+        case["A_idx"],
+        accumulator=accumulator,
+        M=case["M"],
+        N=case["N"],
+        total_K=case["total_K"],
+        num_experts=case["E"],
+        device=case["device"],
+    )
+
+
+@requires_sm90
+@pytest.mark.parametrize("layout", ["contiguous", "upproj_transposed"])
+def test_sm90_fresh_output_and_noncontiguous_view(layout: str) -> None:
+    case = _make_case_from_counts(
+        M=128,
+        N=128,
+        expert_counts=[0, 7, 1, 24],
+        source_tokens=13,
+        layout=layout,
+    )
+    out, backing = _make_out(case)
+    returned = _run(case, out)
+    torch.cuda.synchronize()
+
+    assert returned.data_ptr() == out.data_ptr()
+    if layout == "upproj_transposed":
+        assert not out.is_contiguous()
+        assert backing.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(out.float(), _sm90_gold(case, dtype=torch.float32), atol=3e-2, rtol=2e-2)
+
+
+@requires_sm90
+@pytest.mark.parametrize("tma_add", [False, True], ids=["gemm-beta", "gemm-add"])
+def test_sm90_nonzero_fp32_repeated_accumulation(tma_add: bool) -> None:
+    case = _make_case_from_counts(
+        M=128,
+        N=128,
+        expert_counts=[3, 0, 17, 1],
+        source_tokens=11,
+        layout="contiguous",
+    )
+    initial = torch.randn(
+        (case["E"], case["M"], case["N"]), dtype=torch.float32, device=case["device"]
+    )
+    accumulator = initial.clone()
+    contribution = _sm90_gold(case, dtype=torch.float32)
+
+    _run_accumulate(case, accumulator, tma_add=tma_add)
+    _run_accumulate(case, accumulator, tma_add=tma_add)
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(accumulator, initial + 2 * contribution, atol=5e-2, rtol=2e-2)
+    for expert, count in enumerate(case["expert_counts"]):
+        if count == 0:
+            torch.testing.assert_close(accumulator[expert], initial[expert], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("variant", ["fresh", "accumulate", "tma_add"])
+def test_sm90_rejects_missing_native_payload(monkeypatch, variant: str) -> None:
+    from sonicmoe.quack_utils import bf16_wgrad_gemm as module
+
+    monkeypatch.setattr(module, "_resolve_sm90_wgrad_pair", lambda _a, _b: (None, None))
+    A, B, cu_seqlens_k, A_idx, out = (object() for _ in range(5))
+    with pytest.raises(RuntimeError, match="BF16/QuACK fallback is forbidden"):
+        module._run_bf16_wgrad_sm90(
+            A,
+            B,
+            cu_seqlens_k,
+            A_idx,
+            out=out,
+            C=out if variant == "accumulate" else None,
+            add_to_output=variant == "tma_add",
+        )
+
+
+@requires_sm90
+@pytest.mark.parametrize("layout", ["contiguous", "upproj_transposed"])
+@pytest.mark.parametrize("variant", ["fresh", "accumulate", "tma_add"])
+def test_sm90_first_call_disables_tuning_without_gather(
+    monkeypatch, layout: str, variant: str
+) -> None:
+    from sonicmoe.quack_utils import bf16_wgrad_gemm as module
+
+    case = _make_case_from_counts(
+        M=128, N=128, expert_counts=[2, 0, 5], source_tokens=19, layout=layout
+    )
+    if variant == "fresh":
+        out, _ = _make_out(case)
+    elif layout == "upproj_transposed":
+        backing = torch.empty(
+            (case["E"], case["N"], case["M"]), dtype=torch.float32, device=case["device"]
+        )
+        out = backing.permute(0, 2, 1)
+    else:
+        out = torch.empty(
+            (case["E"], case["M"], case["N"]), dtype=torch.float32, device=case["device"]
+        )
+    captured = {}
+
+    def fake_call(A, B, **kwargs):
+        captured.update(A=A, B=B, **kwargs)
+        return kwargs["out"]
+
+    monkeypatch.setattr(module, "gemm", fake_call)
+    monkeypatch.setattr(module, "gemm_add", fake_call)
+    if variant == "fresh":
+        returned = _run(case, out)
+        assert returned is out
+    else:
+        _run_accumulate(case, out, tma_add=variant == "tma_add")
+
+    assert captured["A"] is case["A"]
+    assert captured["A"].shape == (case["M"], 19)
+    assert captured["B"] is case["B"]
+    assert captured["A_idx"] is case["A_idx"]
+    assert captured["A_idx"].numel() == case["total_K"]
+    assert captured["cu_seqlens_k"] is case["cu"]
+    assert captured["out"] is out
+    assert captured["tuned"] is False
+    assert captured["dynamic_scheduler"] is False
+    if variant == "fresh":
+        assert "C" not in captured
+    else:
+        assert captured["C"] is out
+        assert captured["beta"] == 1.0
+
+
+@requires_blackwell
 @pytest.mark.parametrize(
     "M,N,E,tokens_per_expert,source_tokens,layout",
     [
@@ -320,6 +480,7 @@ def test_bf16_wgrad_default_correctness_and_determinism(
     torch.testing.assert_close(first.float(), _gold(case).float(), atol=3e-2, rtol=2e-2)
 
 
+@requires_blackwell
 @pytest.mark.parametrize("variant", ["beta", "tma_add"])
 def test_bf16_wgrad_rejects_transposed_w2_main_grad(variant: str) -> None:
     """Down-projection main_grad is already Sonic [E,H,I], not [E,I,H]."""
@@ -377,6 +538,7 @@ def test_bf16_wgrad_rejects_transposed_w2_main_grad(variant: str) -> None:
         )
 
 
+@requires_blackwell
 def test_bf16_wgrad_auto_large_shape_matches_reference_config() -> None:
     case = _make_case(
         M=4096,
@@ -401,6 +563,7 @@ def test_bf16_wgrad_auto_large_shape_matches_reference_config() -> None:
     _assert_byte_equal(first, reference)
 
 
+@requires_blackwell
 @pytest.mark.parametrize(
     "M,N",
     [
@@ -438,6 +601,7 @@ def _assert_config_matches_reference(case: dict, config: str) -> None:
     torch.cuda.empty_cache()
 
 
+@requires_blackwell
 def test_bf16_wgrad_2cta_large_and_skew_safety() -> None:
     if os.getenv("SONIC_MOE_RUN_BF16_WGRAD_SAFETY", "0") != "1":
         pytest.skip("Set SONIC_MOE_RUN_BF16_WGRAD_SAFETY=1 to run large safety cases")
@@ -471,6 +635,7 @@ def test_bf16_wgrad_2cta_large_and_skew_safety() -> None:
         _assert_config_matches_reference(case, "256,256,2,1,1,1")
 
 
+@requires_blackwell
 def test_bf16_wgrad_2cta_sanitizer_safety_smoke() -> None:
     if os.getenv("SONIC_MOE_RUN_BF16_WGRAD_SANITIZER", "0") != "1":
         pytest.skip("Set SONIC_MOE_RUN_BF16_WGRAD_SANITIZER=1 under compute-sanitizer")
@@ -496,6 +661,7 @@ def test_bf16_wgrad_2cta_sanitizer_safety_smoke() -> None:
         _assert_config_matches_reference(case, "256,256,2,1,1,1")
 
 
+@requires_blackwell
 def test_bf16_wgrad_config_sweep() -> None:
     if os.getenv("SONIC_MOE_RUN_BF16_WGRAD_TUNE", "0") != "1":
         pytest.skip("Set SONIC_MOE_RUN_BF16_WGRAD_TUNE=1 to run the tuning sweep")

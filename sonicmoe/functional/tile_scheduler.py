@@ -8,7 +8,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from quack.pipeline import PipelineStateWAdvance
-from quack.tile_scheduler import TileScheduler, VarlenMTileScheduler
+from quack.tile_scheduler import PersistenceMode, TileScheduler, VarlenMTileScheduler
 
 
 class SonicMoETileScheduler(TileScheduler):
@@ -25,7 +25,7 @@ class SonicMoETileScheduler(TileScheduler):
     ) -> SonicMoETileScheduler:
         """is_scheduler_warp should only be true for one warp in the whole cluster"""
         stages = 0
-        if const_expr(not params.is_persistent):
+        if const_expr(params.persistence_mode == PersistenceMode.NONE):
             cidx, cidy, _ = cute.arch.cluster_idx()
             cdimx, _, _ = cute.arch.cluster_dim()
             cluster_id = cidx + cidy * cdimx
@@ -50,7 +50,7 @@ class SonicMoETileScheduler(TileScheduler):
 
     def prefetch_next_work(self, *, advance_count: int = 1, loc=None, ip=None):
         old_current_work_linear_idx = self._current_work_linear_idx
-        if const_expr(self.params.is_persistent):
+        if const_expr(self.params.persistence_mode != PersistenceMode.NONE):
             num_persistent_clusters = cute.arch.grid_dim()[2]
             self._current_work_linear_idx += advance_count * Int32(num_persistent_clusters)
         future_tile_coord_mnkl = self.get_current_work()
@@ -73,7 +73,7 @@ class SonicMoEVarlenMTileScheduler(VarlenMTileScheduler, SonicMoETileScheduler):
         stages = 0
         _, _, bidz = cute.arch.block_idx()
         current_work_linear_idx = Int32(bidz)
-        if const_expr(params.tile_count_semaphore is not None):
+        if const_expr(params.persistence_mode != PersistenceMode.NONE):
             assert tile_count is not None
             assert scheduler_pipeline is not None
             stages = const_expr(cute.size(tile_count))
