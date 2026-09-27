@@ -56,5 +56,31 @@ from .blockscaled_fp8_gemm import (
     quantize_activation_blockscaled_fast,
 )
 from .gemm_interface import gemm_dgated, gemm_gated
+# Importing bf16_wgrad_gemm above installs the exact-SM90 down/actgrad
+# QuACK pre-dispatch handler.
+from .sm90_fp8_runtime import (
+    alias_sm90_carrier,
+    attach_sm90_carrier,
+    bind_sm90_payload,
+    claim_pending_sm90_carrier,
+    consume_sm90_payload,
+    current_sm90_invocation,
+    get_sm90_carrier,
+    get_sm90_storage_carriers,
+    has_sm90_native_carriers,
+    is_sm90_native_active,
+    is_sm90_native_carrier,
+    register_sm90_carrier,
+    release_deferred_wgrad,
+    release_sm90_carrier,
+    release_sm90_invocation,
+    replace_with_sm90_anchor,
+    retain_for_deferred_wgrad,
+    retain_sm90_carrier,
+    sm90_invocation_scope,
+    sm90_registry_stats,
+    use_sm90_invocation,
+    wrap_deferred_sm90_call,
+)
 from ._legacy.sgl_mxfp8_gemm import clear_sgl_weight_cache
 from .triton_blockscaled_gemm import clear_raw_weight_cache

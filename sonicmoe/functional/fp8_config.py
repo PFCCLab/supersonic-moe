@@ -156,6 +156,7 @@ class _FP8Config:
         "epilogue_quant", "_fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
         "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant", "fuse_y1_bf16_trunc",
         "fused_weight_layout", "situ_beta", "situ_linear_beta",
+        "activation_group_size", "weight_block_size", "fp8_backend",
     )
 
     def __init__(self) -> None:
@@ -172,6 +173,9 @@ class _FP8Config:
         self.fuse_y1_quant: bool = _use_fuse_y1_quant()
         self.fuse_y1_bf16_trunc: bool = _use_fuse_y1_bf16_trunc()
         self.fused_weight_layout: bool = _use_fused_weight_layout()
+        self.activation_group_size: int = 32
+        self.weight_block_size: int = 32
+        self.fp8_backend = None
         _active = get_active_config()
         self.swiglu_clamp_value: float = (
             _active.resolve_swiglu_clamp_value() if _active is not None else 0.0
@@ -202,6 +206,19 @@ class _FP8Config:
         else:
             self._fp8_wgrad = I >= self._WGRAD_FP8_I_THRESHOLD
 
+    def sm90_compatibility_view(self) -> "_FP8Config":
+        """Clone config while disabling legacy z storage decisions.
+
+        Native SM90 carriers retain the real immutable snapshot; this view only
+        prevents the unchanged PyLayer from consulting its SM100 global cache.
+        """
+        cfg = _FP8Config.__new__(_FP8Config)
+        for name in self.__slots__:
+            setattr(cfg, name, getattr(self, name))
+        cfg.save_z_fp8 = False
+        cfg.recompute_z = False
+        return cfg
+
     @staticmethod
     def disabled() -> "_FP8Config":
         """Return a config where everything is off (BF16 path)."""
@@ -220,6 +237,9 @@ class _FP8Config:
         cfg.fuse_y1_quant = False
         cfg.fuse_y1_bf16_trunc = False
         cfg.fused_weight_layout = False
+        cfg.activation_group_size = 32
+        cfg.weight_block_size = 32
+        cfg.fp8_backend = None
         # BF16 path never reaches a SiTU epilogue (guarded in functional/
         # __init__.py::_gemm_activation_name), but keep the slots populated so
         # ``cfg.situ_beta`` is never an AttributeError.

@@ -49,14 +49,18 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.copy_utils import sm90_get_smem_load_op
-from quack.cute_dsl_utils import ParamsBase
 from quack.layout_utils import make_acc_tensor_mn_view
 
 # return PipelineStateWAdvance instead of PipelineState
 from quack.pipeline import PipelineTmaCpAsync, make_pipeline_state
 from quack.sm90_utils import partition_for_epilogue
 from quack.tensormap_manager import TensorMapManagerSm90
-from quack.tile_scheduler import RasterOrderOption, TileSchedulerArguments, VarlenMTileSchedulerArguments
+from quack.tile_scheduler import (
+    PersistenceMode,
+    RasterOrderOption,
+    TileSchedulerArguments,
+    VarlenMTileSchedulerArguments,
+)
 
 from .tile_scheduler import SonicMoETileScheduler, SonicMoEVarlenMTileScheduler
 
@@ -942,7 +946,11 @@ class HopperWgmma_MoE_kernel:
                 raster_order=self.raster_order,
                 group_size=self.L2_group_size,
                 cluster_shape_mnk=self.cluster_shape_mnk,
-                is_persistent=self.is_persistent,
+                persistence_mode=(
+                    PersistenceMode.STATIC
+                    if self.is_persistent
+                    else PersistenceMode.NONE
+                ),
                 tile_count_semaphore=mTileCount_semaphore,
                 batch_idx_permute=mBatchIdx_schedule_order,
             )
@@ -961,7 +969,11 @@ class HopperWgmma_MoE_kernel:
                 group_size=self.L2_group_size,
                 tile_shape_mn=self.tile_shape_mnk[:2],
                 cluster_shape_mnk=self.cluster_shape_mnk,
-                is_persistent=self.is_persistent,
+                persistence_mode=(
+                    PersistenceMode.STATIC
+                    if self.is_persistent
+                    else PersistenceMode.NONE
+                ),
                 tile_count_semaphore=mTileCount_semaphore,
             )
 
@@ -1399,7 +1411,7 @@ class HopperWgmma_MoE_kernel:
         d_epi_smem_layout_staged: cute.ComposedLayout,
         y_epi_smem_layout_staged: Optional[cute.ComposedLayout],
         s_epi_smem_layout_staged: Optional[cute.Layout],
-        tile_sched_params: ParamsBase,
+        tile_sched_params: object,
         TileScheduler: cutlass.Constexpr[Callable],
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -1537,7 +1549,9 @@ class HopperWgmma_MoE_kernel:
 
         sched_pipeline = None
         tile_count = None
-        if const_expr(tile_sched_params.tile_count_semaphore is not None):
+        if const_expr(
+            tile_sched_params.persistence_mode != PersistenceMode.NONE
+        ):
             sched_pipeline = self.make_sched_pipeline(
                 cta_layout_mnk,
                 sched_pipeline_mbar_ptr=shared_storage.sched_pipeline_array_ptr.data_ptr(),
@@ -1934,7 +1948,6 @@ class HopperWgmma_MoE_kernel:
                         if k_tile + 1 < k_tile_cnt:
                             peek_ab_empty_status = mainloop_pipeline.producer_try_acquire(mainloop_producer_state)
 
-                    tile_scheduler.fetch_next_work(is_scheduler_warp=is_scheduler_warp)
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
 

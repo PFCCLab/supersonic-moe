@@ -42,6 +42,8 @@ class FP8ScaleGranularity(Enum):
 
 class FP8Backend(Enum):
     BLACKWELL = "blackwell"
+    HOPPER_NATIVE = "hopper_native"
+    HOPPER_QDQ = "hopper_qdq"
 
 
 @dataclass(frozen=True)
@@ -95,8 +97,12 @@ def validate_fp8_protocol(protocol: FP8Protocol) -> FP8Protocol:
     }:
         raise ValueError("Only 1x32 and 1x128 scale granularities are supported in the current FP8 protocol")
 
-    if protocol.backend is not FP8Backend.BLACKWELL:
-        raise ValueError("The current FP8 protocol requires SM100+")
+    if protocol.backend not in {
+        FP8Backend.BLACKWELL,
+        FP8Backend.HOPPER_NATIVE,
+        FP8Backend.HOPPER_QDQ,
+    }:
+        raise ValueError("Only Blackwell, Hopper native, and Hopper QDQ FP8 backends are supported")
 
     return protocol
 
@@ -114,13 +120,22 @@ def validate_fp8_runtime_support(
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
 
-    if not is_blackwell_device(device):
-        raise RuntimeError("The current FP8 protocol only supports SM100+ GPUs")
+    major, _ = torch.cuda.get_device_capability(device)
+    if protocol.backend is FP8Backend.BLACKWELL:
+        if major < 10:
+            raise RuntimeError("The Blackwell FP8 protocol only supports SM100+ GPUs")
+    elif major != 9:
+        backend_name = (
+            "native" if protocol.backend is FP8Backend.HOPPER_NATIVE else "QDQ"
+        )
+        raise RuntimeError(
+            f"The Hopper FP8 {backend_name} protocol requires an exact SM90 GPU"
+        )
 
     if quack_enabled is None:
         quack_enabled = is_using_quack_gemm()
 
     if protocol.requires_quack_gemm and not quack_enabled:
-        raise RuntimeError("The current FP8 protocol requires the QuACK GEMM path on SM100")
+        raise RuntimeError("The current FP8 protocol requires the QuACK GEMM path")
 
     return protocol
