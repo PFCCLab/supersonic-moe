@@ -29,7 +29,6 @@ from .sm90_fp8_runtime import (
     pop_pending_sm90_payload,
     register_sm90_carrier,
     resolve_sm90_metadata_tensor,
-    retained_sm90_invocations,
     unique_retained_sm90_invocation,
     use_sm90_invocation,
     wrap_deferred_sm90_call,
@@ -44,11 +43,29 @@ def _sm90_colwise_operand(
     gather_idx: torch.Tensor | None = None,
     invocation=None,
 ):
-    carrier_tensor = tensor
-    carrier = get_sm90_carrier(carrier_tensor, invocation=invocation)
-    if carrier is None and source is not None:
-        carrier_tensor = source
-        carrier = get_sm90_carrier(carrier_tensor, invocation=invocation)
+    source = tensor if source is None else source
+    direct = get_sm90_carrier(tensor, invocation=invocation)
+    if direct is None and source is not tensor:
+        direct = get_sm90_carrier(source, invocation=invocation)
+    compatible = {
+        id(carrier): carrier
+        for carrier in (() if direct is None else (direct,))
+        if carrier.data is not None
+        and carrier.scales is not None
+        and tuple(carrier.data.shape) == tuple(source.shape)
+        and carrier.scales.ndim == 2
+        and int(carrier.metadata.get("group_size", 0)) in (32, 128)
+        and tuple(carrier.scales.shape)
+        == (
+            int(source.shape[0]),
+            (int(source.shape[1]) + int(carrier.metadata["group_size"]) - 1)
+            // int(carrier.metadata["group_size"]),
+        )
+    }
+    if len(compatible) > 1:
+        raise RuntimeError(
+            "SM90 wgrad colwise operand has multiple compatible rowwise carriers"
+        )
     functional_package = next(
         name
         for name in (
@@ -58,7 +75,16 @@ def _sm90_colwise_operand(
         if name in sys.modules
     )
     functional = sys.modules[functional_package]
-    source = tensor if source is None else source
+    if compatible:
+        carrier = next(iter(compatible.values()))
+        group_size = int(carrier.metadata["group_size"])
+        return functional.sm90_reference.quantize_wgrad_colwise_sm90(
+            carrier.data,
+            cu_seqlens_k,
+            gather_idx=gather_idx,
+            source_scales=carrier.scales,
+            source_group=group_size,
+        )
     return functional.sm90_reference.quantize_wgrad_colwise_sm90(
         source, cu_seqlens_k, gather_idx=gather_idx
     )
@@ -295,25 +321,40 @@ def _sm90_gemm_pre_dispatch(operation, original, args, kwargs):
     if A.ndim != 2 or B.ndim != 3:
         return None
     a_k = int(a_carrier.data.shape[-1])
+    expected_b_shape = (int(B.shape[0]), int(out.shape[-1]), a_k)
+    compatible_data_shapes = {expected_b_shape, tuple(map(int, B.shape))}
     candidates = [
         candidate
         for candidate in find_sm90_storage_carriers(B)
         if candidate.invocation_id == a_carrier.invocation_id
         and candidate.data is not None
-        and int(candidate.data.shape[-1]) == a_k
+        and tuple(map(int, candidate.data.shape)) in compatible_data_shapes
+        and candidate.scales is not None
+        and candidate.scales.ndim == 3
     ]
-    if int(b_carrier.data.shape[-1]) != a_k:
+    b_compatible = (
+        b_carrier.data.ndim == 3
+        and tuple(map(int, b_carrier.data.shape)) in compatible_data_shapes
+        and b_carrier.scales is not None
+        and b_carrier.scales.ndim == 3
+    )
+    if not b_compatible:
         if len(candidates) != 1:
             return None
         b_carrier = candidates[0]
+    b_data = b_carrier.data
+    b_scales = b_carrier.scales
+    if tuple(map(int, b_data.shape)) == tuple(map(int, B.shape)):
+        b_data = b_data.permute(0, 2, 1)
+        b_scales = b_scales.permute(0, 2, 1)
     C = kwargs.get("C") if operation == "gemm_out" else args[3]
     beta = kwargs.get("beta", 1.0)
     add_to_output = bool(kwargs.get("add_to_output", False))
     if kwargs.get("bias") is not None or kwargs.get("alpha", 1.0) != 1.0:
         return None
     invocation = a_carrier.metadata["invocation"]
-    activation_group = int(a_carrier.metadata.get("group_size", 32))
-    weight_block = int(b_carrier.metadata.get("block_size", 32))
+    activation_group = int(a_carrier.metadata.get("group_size", invocation.activation_group_size))
+    weight_block = int(invocation.weight_block_size)
     if activation_group != weight_block:
         a_carrier.materialize()
         functional_package = next(
@@ -348,10 +389,10 @@ def _sm90_gemm_pre_dispatch(operation, original, args, kwargs):
     with use_sm90_invocation(invocation):
         sm90_scaled_gemm(
             a_data,
-            b_carrier.data,
+            b_data,
             kernel_out,
             a_scales,
-            b_carrier.scales,
+            b_scales,
             C=kernel_c,
             beta=beta,
             add_to_output=add_to_output,
@@ -359,6 +400,7 @@ def _sm90_gemm_pre_dispatch(operation, original, args, kwargs):
             A_idx=kwargs.get("A_idx"),
             activation_group=activation_group,
             weight_block=weight_block,
+            activation_scale_order="source",
         )
     if copy_back:
         out.copy_(kernel_out)
@@ -390,7 +432,14 @@ def _carrier_from_pending(tensor: torch.Tensor, invocation):
     )
 
 
-def _resolve_sm90_wgrad_invocation(A: torch.Tensor, B: torch.Tensor):
+def _resolve_sm90_wgrad_invocation(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    invocation=None,
+):
+    if invocation is not None:
+        return invocation
     active = current_sm90_invocation()
     if active is not None:
         return active
@@ -416,18 +465,22 @@ def _resolve_sm90_wgrad_invocation(A: torch.Tensor, B: torch.Tensor):
         )
     if candidate_ids:
         return None
-    retained = retained_sm90_invocations()
-    compatible = tuple(
-        invocation
-        for invocation in retained
-        if int(invocation.activation_group_size) in (32, 128)
-    )
-    return compatible[-1] if compatible else None
+    invocation = unique_retained_sm90_invocation()
+    if invocation is None:
+        return None
+    if int(invocation.activation_group_size) not in (32, 128):
+        return None
+    return invocation
 
 
-def _resolve_sm90_wgrad_pair(A: torch.Tensor, B: torch.Tensor):
+def _resolve_sm90_wgrad_pair(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    invocation=None,
+):
     A_t = getattr(A, "mT", None)
-    invocation = _resolve_sm90_wgrad_invocation(A, B)
+    invocation = _resolve_sm90_wgrad_invocation(A, B, invocation=invocation)
     if invocation is not None:
         a_carrier = get_sm90_carrier(A, invocation=invocation)
         if a_carrier is None and A_t is not None:
@@ -479,8 +532,9 @@ def _run_bf16_wgrad_sm90(
     C: Optional[torch.Tensor],
     add_to_output: bool,
     beta: float = 1.0,
+    invocation=None,
 ) -> torch.Tensor:
-    a_carrier, b_carrier = _resolve_sm90_wgrad_pair(A, B)
+    a_carrier, b_carrier = _resolve_sm90_wgrad_pair(A, B, invocation=invocation)
     if a_carrier is None or b_carrier is None:
         raise RuntimeError(
             "SM90 varlen-K wgrad lost its invocation-scoped native FP8 "
@@ -633,6 +687,8 @@ def _run_bf16_wgrad_varlen_k(
     epi_args,
     add_to_output: bool = False,
     config: Optional[GemmConfig] = None,
+    sm90_invocation=None,
+    sm90_wgrad: bool | None = None,
 ) -> torch.Tensor:
     _validate_problem(
         A,
@@ -648,15 +704,43 @@ def _run_bf16_wgrad_varlen_k(
     )
     device_capacity = get_device_capacity(device)
     if device_capacity[0] == 9:
-        invocation = _resolve_sm90_wgrad_invocation(A, B)
-        a_carrier, b_carrier = _resolve_sm90_wgrad_pair(A, B)
-        native_expected = a_carrier is not None or b_carrier is not None
-        if native_expected:
-            if invocation is None:
+        if sm90_wgrad is False:
+            call = gemm_add if add_to_output else gemm
+            kwargs = dict(
+                out=out,
+                cu_seqlens_k=cu_seqlens_k,
+                A_idx=A_idx,
+                dynamic_scheduler=False,
+                tuned=False,
+            )
+            if C is not None or add_to_output:
+                kwargs.update(C=out if C is None else C, beta=1.0)
+            return call(A, B, **kwargs)
+        invocation = _resolve_sm90_wgrad_invocation(
+            A, B, invocation=sm90_invocation
+        )
+        a_carrier, b_carrier = _resolve_sm90_wgrad_pair(
+            A, B, invocation=sm90_invocation
+        )
+        native_expected = sm90_wgrad is True or (
+            a_carrier is not None or b_carrier is not None
+        )
+        if native_expected and invocation is None:
+            if sm90_wgrad is True:
                 raise RuntimeError(
                     "SM90 native wgrad operands span multiple live invocations; "
                     "BF16/QuACK fallback is forbidden"
                 )
+            # sm90_wgrad is None here (the caller passes fp8_wgrad only when the
+            # SM90 QDQ fp8 path is active, else None), so this is a genuine BF16
+            # wgrad with no fp8 intent. The only reason carriers matched is that a
+            # completed invocation's storage carriers are still registered and a
+            # fresh BF16 operand reused that storage before the owner finalizer ran
+            # (GC/registry timing race, observed without a CUDA sync). Binding that
+            # dead communication payload would be wrong, so fall back to the plain
+            # BF16 GEMM rather than raising.
+            native_expected = False
+        if native_expected:
             if a_carrier is None or b_carrier is None:
                 raise RuntimeError(
                     "SM90 varlen-K wgrad lost its invocation-scoped native FP8 "
@@ -671,6 +755,7 @@ def _run_bf16_wgrad_varlen_k(
                 C=None if add_to_output else C,
                 add_to_output=add_to_output,
                 beta=1.0 if C is not None else 0.0,
+                invocation=invocation,
             )
         call = gemm_add if add_to_output else gemm
         kwargs = dict(
@@ -853,6 +938,8 @@ def bf16_wgrad_gemm_varlen_k(
     total_K: int,
     num_experts: int,
     device: torch.device,
+    sm90_invocation=None,
+    sm90_wgrad: bool | None = None,
 ) -> torch.Tensor:
     return _run_bf16_wgrad_varlen_k(
         A,
@@ -870,6 +957,8 @@ def bf16_wgrad_gemm_varlen_k(
         compile_cache=_COMPILE_CACHE_BF16_VK,
         fast_cache=_GEMM_FAST_PATH_BF16_VK,
         epi_args=GemmDefaultSm100.EpilogueArguments(),
+        sm90_invocation=sm90_invocation,
+        sm90_wgrad=sm90_wgrad,
     )
 
 
@@ -885,6 +974,8 @@ def bf16_wgrad_gemm_varlen_k_accumulate(
     total_K: int,
     num_experts: int,
     device: torch.device,
+    sm90_invocation=None,
+    sm90_wgrad: bool | None = None,
 ) -> None:
     _run_bf16_wgrad_varlen_k(
         A,
@@ -902,6 +993,8 @@ def bf16_wgrad_gemm_varlen_k_accumulate(
         compile_cache=_COMPILE_CACHE_BF16_VK_ACCUM,
         fast_cache=_GEMM_FAST_PATH_BF16_VK_ACCUM,
         epi_args=GemmDefaultSm100.EpilogueArguments(beta=Float32(1.0)),
+        sm90_invocation=sm90_invocation,
+        sm90_wgrad=sm90_wgrad,
     )
 
 
@@ -917,6 +1010,8 @@ def bf16_wgrad_gemm_varlen_k_tma_add(
     total_K: int,
     num_experts: int,
     device: torch.device,
+    sm90_invocation=None,
+    sm90_wgrad: bool | None = None,
 ) -> None:
     _run_bf16_wgrad_varlen_k(
         A,
@@ -935,4 +1030,6 @@ def bf16_wgrad_gemm_varlen_k_tma_add(
         fast_cache=_GEMM_FAST_PATH_BF16_VK_TMA_ADD,
         epi_args=GemmDefaultSm100.EpilogueArguments(add_to_output=True),
         add_to_output=True,
+        sm90_invocation=sm90_invocation,
+        sm90_wgrad=sm90_wgrad,
     )

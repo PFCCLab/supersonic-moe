@@ -34,9 +34,7 @@ from .functional.utils import enable_fp8
 from .functional.fp8_protocol import FP8Backend
 from .functional.sm90_reference import is_sm90_device
 from .quack_utils.sm90_fp8_runtime import (
-    release_sm90_invocation,
     register_sm90_carrier,
-    retain_sm90_invocation,
     sm90_invocation_scope,
 )
 
@@ -335,6 +333,7 @@ def run_sonic_moe(
             prequant_activation_payload=fp8_hidden_states,
             fp8_config=pylayer_fp8_config,
             sm90_qdq=sm90_qdq,
+            sm90_invocation=sm90_invocation,
         )
         if release_fp8_weights and not fp8_config.recompute_z and not exact_sm90_fp8:
             transposed_fp8 = getattr(w1, "transposed_fp8", None)
@@ -368,14 +367,9 @@ def run_sonic_moe(
             router_score_source,
             router_score_src_idx,
             sm90_qdq,
+            sm90_invocation,
         )
         hidden_states = _DownProjection.apply(*down_args)
-        if sm90_invocation is not None:
-            needs_backward = not hidden_states.stop_gradient
-            if needs_backward:
-                retain_sm90_invocation(sm90_invocation, owner=hidden_states)
-            else:
-                release_sm90_invocation(sm90_invocation)
         if release_fp8_weights and not exact_sm90_fp8:
             transposed_fp8 = getattr(w2, "transposed_fp8", None)
             if (

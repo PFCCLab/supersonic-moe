@@ -117,23 +117,7 @@ def _make_forced_epi_tile_fn(orig_fn, target_n: int):
 
 
 def _make_postact_r2s_tiled_copy(gemm, copy_atom_postact_r2s, tiled_copy_r2s, params):
-    """Build the register->smem tiled copy for the half-N gated postact SMEM.
-
-    This is QuACK's stock ``make_tiled_copy_S(aux_atom, tiled_copy_r2s)``: that
-    copy inherits D's full-N tiler and over-emits 2x into the half-N postact
-    smem, but for the (4,1) epilogue-warp shape the over-emission has warp-N
-    stride 0 (a harmless self-overwrite), so it is correct.
-
-    The silent corruption of Dao-AILab/sonic-moe issue #63 / quack PR #133 only
-    appears under the (2,2) tmem epilogue-warp shape, which QuACK produces only
-    when ``cta_tile_m == 64 and use_2cta_instrs``. Our ``default_config`` pins
-    the dgated/gated tile to ``tile_m=128`` (route-level padding is only
-    guaranteed 128-aligned), so ``use_2cta_instrs`` is never set (it requires
-    ``mma_tiler_m == 256``) and ``cta_tile_m`` stays 128 with the (4,1) warp
-    shape. The (2,2) path is therefore unreachable by construction and no
-    epilogue-copy override is needed. Kept as a single seam so the PR#133 TV
-    copy can be slotted back in if a future config ever enables 256-tile 2-CTA.
-    """
+    """Build the register-to-smem tiled copy for gated postact output."""
     return cute.make_tiled_copy_S(copy_atom_postact_r2s, tiled_copy_r2s)
 
 
@@ -295,6 +279,8 @@ class GemmGatedMixin(GemmActMixin):
         d["swiglu_clamp_value"] = args.swiglu_clamp_value
         if hasattr(args, "postact_bf16_trunc"):
             d["postact_bf16_trunc"] = args.postact_bf16_trunc
+        if hasattr(args, "mPostActOutput"):
+            d["mPostActOutput"] = args.mPostActOutput
         return self.EpilogueParams(**d)
 
     @cute.jit
@@ -503,6 +489,7 @@ class Sm90RawGatedQuantMixin(GemmGatedMixin):
     _extra_param_fields = (
         *GemmGatedMixin._extra_param_fields,
         ("postact_bf16_trunc", cutlass.Constexpr, False),
+        ("mPostActOutput", object, None),
     )
 
     def _forced_epi_tile_n(self):
@@ -522,6 +509,30 @@ class Sm90RawGatedQuantMixin(GemmGatedMixin):
         sr_seed: Optional[Int32 | cute.Tensor] = None
         mZScale: Optional[cute.Tensor] = None
         mPostActScaleRaw: Optional[cute.Tensor] = None
+        mPostActOutput: Optional[cute.Tensor] = None
+
+    def epi_setup_postact(
+        self,
+        params,
+        epi_smem_tensors,
+        tiled_copy_r2s,
+        tiled_copy_t2r,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        if const_expr(self.postact_dtype.width == 8):
+            return None
+        return GemmActMixin.epi_setup_postact(
+            self,
+            params,
+            epi_smem_tensors,
+            tiled_copy_r2s,
+            tiled_copy_t2r,
+            tile_coord_mnkl,
+            varlen_manager,
+            tidx,
+        )
 
     @staticmethod
     @cute.jit
@@ -594,6 +605,21 @@ class Sm90RawGatedQuantMixin(GemmGatedMixin):
                 for i in cutlass.range(cute.size(postact), unroll_full=True):
                     postact[i] = _bf16_trunc_rne(postact[i])
             self._quantize_fragment(postact, epi_loop_tensors["mPostActScaleRaw"], True)
+            info = epi_loop_tensors["mPostActScaleRaw"]
+            param, coords, tile_coord, varlen, _, _, _, tile_m, tile_n = info
+            batch = tile_coord[3]
+            batch_start = varlen.params.cu_seqlens_m[batch] if varlen.varlen_m else Int32(0)
+            m_limit = (
+                varlen.params.cu_seqlens_m[batch + Int32(1)]
+                if varlen.varlen_m else param.shape[0]
+            )
+            output = params.mPostActOutput
+            for i in cutlass.range(cute.size(postact), unroll_full=True):
+                coord = coords[2 * i]
+                m_abs = batch_start + tile_coord[0] * tile_m + coord[0]
+                n_abs = tile_coord[1] * (tile_n // Int32(2)) + coord[1] // Int32(2)
+                if cutlass.Boolean(m_abs < m_limit) & cutlass.Boolean(n_abs < output.shape[1]):
+                    output[m_abs, n_abs] = postact[i].to(self.postact_dtype)
         self._quantize_fragment(tRS_rD, epi_loop_tensors["mZScale"], False)
         return postact
 

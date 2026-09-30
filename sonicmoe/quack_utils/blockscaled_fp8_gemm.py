@@ -565,6 +565,9 @@ def quantize_activation_blockscaled_fast(
 
     TILE_ROWS = 128  # Larger tile: fewer CTAs, better wave occupancy
     TILE_COLS = min(K, 256)
+    TILE_COLS = max(group_size, (TILE_COLS // group_size) * group_size)
+    if K % TILE_COLS:
+        TILE_COLS = group_size
     # INT32 overflow guard
     _max_stride = max(x.stride(0), fp8_out.stride(0))
     _needs_int64 = int((M - 1) * _max_stride > 2**31 - 1)

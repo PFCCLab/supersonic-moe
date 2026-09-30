@@ -485,21 +485,19 @@ def claim_pending_sm90_carrier(
     invocation: SM90Invocation,
 ) -> SM90Carrier | None:
     """Promote an unscoped communication payload into its operand invocation."""
-    carrier = get_sm90_carrier(tensor, invocation=invocation)
-    if carrier is not None:
-        return carrier
     pending = consume_sm90_payload(tensor, invocation=invocation)
-    if pending is None:
-        return None
-    data, scales, group_size, role, metadata = pending
-    return register_sm90_carrier(
-        tensor,
-        data=data,
-        scales=scales,
-        role=role,
-        metadata={"group_size": group_size, **metadata},
-        invocation=invocation,
-    )
+    if pending is not None:
+        data, scales, group_size, role, metadata = pending
+        return register_sm90_carrier(
+            tensor,
+            data=data,
+            scales=scales,
+            role=role,
+            metadata={"group_size": group_size, **metadata},
+            invocation=invocation,
+            replace=True,
+        )
+    return get_sm90_carrier(tensor, invocation=invocation)
 
 
 def _is_native_invocation(invocation: SM90Invocation | None) -> bool:
