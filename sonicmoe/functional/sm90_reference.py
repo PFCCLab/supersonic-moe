@@ -116,6 +116,7 @@ def blockscaled_fp8_gemm_zeromat_bf16(
             A_idx=A_idx,
             activation_group=invocation.activation_group_size,
             weight_block=invocation.weight_block_size,
+            activation_scale_order="route",
             z_mode="recompute_z_only",
         )
     return z_bf16_out
@@ -247,6 +248,28 @@ def dequantize_activation_sm90(
     return restored.reshape(rows, cols).to(torch.bfloat16)
 
 
+def materialize_activation_sm90(
+    data: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Materialize an SM90 rowwise payload as contiguous BF16."""
+    if group_size not in _SM90_QDQ_GROUP_SIZES:
+        raise ValueError(f"SM90 activation group size must be 32 or 128, got {group_size}")
+    if data.ndim != 2 or data.shape[1] % group_size:
+        raise ValueError(
+            "SM90 activation materialization expects a rank-2 tensor whose hidden "
+            f"dimension is divisible by {group_size}, got {tuple(data.shape)}"
+        )
+    rows, cols = (int(data.shape[0]), int(data.shape[1]))
+    raw_scales = _raw_activation_scales(scales, rows, cols // group_size)
+    restored = (
+        data.float().reshape(rows, cols // group_size, group_size)
+        * _decode_ue8m0(raw_scales).unsqueeze(-1)
+    )
+    return restored.reshape(rows, cols).to(torch.bfloat16).contiguous()
+
+
 def quantize_activation_sm90(
     x: torch.Tensor, group_size: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -279,23 +302,62 @@ def quantize_activation_sm90(
                     },
                     invocation=invocation,
                 )
+    replacement_invocation = None
     if existing is not None:
-        if existing.data is not None:
+        existing_group_size = int(existing.metadata.get("group_size", group_size))
+        if (
+            existing.data is not None
+            and tuple(existing.data.shape) != tuple(x.shape)
+        ):
+            replacement_invocation = existing.metadata["invocation"]
+            existing = None
+        elif existing.data is not None and existing_group_size == int(group_size):
             existing.metadata["quantize_hits"] = int(existing.metadata.get("quantize_hits", 0)) + 1
             return existing.data, existing.scales, x
+        elif existing_group_size != int(group_size):
+            existing.materialize()
+            if existing.data is not None:
+                raw_scales = _raw_activation_scales(
+                    existing.scales,
+                    int(existing.data.shape[0]),
+                    int(existing.data.shape[1]) // existing_group_size,
+                )
+                restored = (
+                    existing.data.float()
+                    .reshape(
+                        int(existing.data.shape[0]),
+                        -1,
+                        existing_group_size,
+                    )
+                    * _decode_ue8m0(raw_scales).unsqueeze(-1)
+                ).reshape(existing.data.shape).to(torch.bfloat16)
+                x = restored
+            replacement_invocation = existing.metadata["invocation"]
+            existing = None
         # Do not force an unrelated deferred recipe merely to attach wgrad
         # metadata; the dispatcher can materialize the independent colwise
         # recipe directly.
-        if existing.recipe is None:
+        if existing is not None and existing.recipe is None:
             existing.materialize()
             if existing.data is not None:
                 return existing.data, existing.scales, x
     data, scales = quantize_activation_blockscaled_fast(
         x.contiguous(), group_size=group_size
     )
+    if existing is not None:
+        register_sm90_carrier(
+            x,
+            data=data,
+            scales=scales,
+            role="activation",
+            metadata={"group_size": int(group_size), "quantize_hits": 1},
+            invocation=existing.metadata["invocation"],
+            replace=True,
+        )
+        return data, scales, x
     invocation = current_sm90_invocation()
     if invocation is None:
-        invocation = unique_retained_sm90_invocation()
+        invocation = replacement_invocation or unique_retained_sm90_invocation()
     if invocation is not None:
         register_sm90_carrier(
             x,
@@ -304,6 +366,7 @@ def quantize_activation_sm90(
             role="activation",
             metadata={"group_size": int(group_size), "quantize_hits": 1},
             invocation=invocation,
+            replace=True,
         )
         return data, scales, x
     if has_sm90_native_carriers():

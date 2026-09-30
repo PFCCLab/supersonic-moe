@@ -329,6 +329,134 @@ def _run_accumulate(case: dict, accumulator: torch.Tensor, *, tma_add: bool = Fa
     )
 
 
+def _dequantize_sm90_colwise(torch, data, scales):
+    values = data.float().reshape(data.shape[0], -1, 32)
+    decoded = torch.exp((scales.float() - 127.0) * 0.6931471805599453).unsqueeze(-1)
+    return (values * decoded).flatten(1)
+
+
+def _native_wgrad_case(torch, seed: int) -> dict:
+    import importlib
+    from sonicmoe.functional import sm90_reference as ref
+
+    quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
+    source_rows, route_rows, M, N = 181, 160, 256, 192
+    offsets = torch.tensor([0, 35, 35, 112, route_rows], dtype=torch.int32, device="cuda")
+    gather = ((torch.arange(route_rows, device="cuda") * 47 + seed) % source_rows).to(torch.int32)
+    row = torch.arange(source_rows, device="cuda", dtype=torch.float32)[:, None]
+    a_col = torch.arange(M, device="cuda", dtype=torch.float32)[None, :]
+    b_row = torch.arange(route_rows, device="cuda", dtype=torch.float32)[:, None]
+    b_col = torch.arange(N, device="cuda", dtype=torch.float32)[None, :]
+    a_source = (torch.sin((row + 1) * (a_col + 3) * 0.0013) * torch.exp((((row + a_col) % 7) - 5) * 0.6931471805599453)).to(torch.bfloat16)
+    b_source = (torch.cos((b_row + 2) * (b_col + 5) * 0.0011) * torch.exp((((b_row + b_col) % 6) - 4) * 0.6931471805599453)).to(torch.bfloat16)
+    a_rowwise, a_row_scales = quant.quantize_activation_blockscaled_fast(
+        a_source, 32
+    )
+    b_rowwise, b_row_scales = quant.quantize_activation_blockscaled_fast(
+        b_source, 32
+    )
+    a_payload = ref.quantize_wgrad_colwise_sm90(
+        a_rowwise, offsets, gather_idx=gather,
+        source_scales=a_row_scales, source_group=32,
+    )
+    b_payload = ref.quantize_wgrad_colwise_sm90(
+        b_rowwise, offsets, source_scales=b_row_scales, source_group=32,
+    )
+    return {"M": M, "N": N, "E": 4, "cu": offsets, "A_idx": gather,
+            "a_source": a_source, "b_source": b_source,
+            "a_payload": a_payload, "b_payload": b_payload}
+
+
+@requires_sm90
+def test_sm90_native_wgrad_payload_tiles_and_accumulation() -> None:
+    from sonicmoe.quack_utils import gemm_sm90_scaled as scaled
+
+    cases = [_native_wgrad_case(torch, 6101), _native_wgrad_case(torch, 6203)]
+    contributions = []
+    for case in cases:
+        a, sa, a_offsets = case["a_payload"]
+        b, sb, b_offsets = case["b_payload"]
+        assert int((a_offsets != b_offsets).sum().item()) == 0
+        expected_offsets = torch.tensor([0, 64, 64, 160, 224], dtype=torch.int32, device="cuda")
+        assert int((a_offsets != expected_offsets).sum().item()) == 0
+        a_deq = _dequantize_sm90_colwise(torch, a, sa)
+        b_deq = _dequantize_sm90_colwise(torch, b, sb)
+        host_offsets = a_offsets.cpu().tolist()
+        expected = torch.stack([
+            a_deq[:, left:right] @ b_deq[:, left:right].T
+            for left, right in zip(host_offsets, host_offsets[1:])
+        ])
+        direct = torch.empty_like(expected)
+        scaled.sm90_scaled_wgrad_varlen_k(a, b, direct, sa, sb, a_offsets)
+        diagnostics = []
+        for expert in range(case["E"]):
+            for row in range(0, case["M"], 64):
+                for col in range(0, case["N"], 128):
+                    lhs = direct[expert, row:row + 64, col:col + 128]
+                    rhs = expected[expert, row:row + 64, col:col + 128]
+                    denominator = (lhs.square() + rhs.square()).sum()
+                    diff = 0.0 if float(denominator.item()) == 0.0 else float(
+                        (1 - 2 * (lhs * rhs).sum() / denominator).item()
+                    )
+                    diagnostics.append(
+                        f"expert={expert} WG={row // 64} N={col // 128} diff={diff} "
+                        f"direct_norm={float(lhs.norm().item())} expected_norm={float(rhs.norm().item())}"
+                    )
+        assert max(float(item.split("diff=")[1].split()[0]) for item in diagnostics) < 5e-5, "\n".join(diagnostics)
+        contributions.append(expected)
+
+    initial = torch.randn((4, 256, 192), dtype=torch.float32, device="cuda")
+    for mode in ("beta", "add"):
+        accumulator = initial.clone()
+        for step, (case, contribution) in enumerate(zip(cases, contributions), 1):
+            a, sa, offsets = case["a_payload"]
+            b, sb, _ = case["b_payload"]
+            if mode == "beta":
+                out = torch.empty_like(accumulator)
+                scaled.sm90_scaled_wgrad_varlen_k(
+                    a, b, out, sa, sb, offsets, C=accumulator, beta=1.0
+                )
+                accumulator.copy_(out)
+            else:
+                scaled.sm90_scaled_wgrad_varlen_k(
+                    a, b, accumulator, sa, sb, offsets, add_to_output=True
+                )
+            expected_acc = initial + sum(contributions[:step])
+            torch.testing.assert_close(accumulator, expected_acc, atol=0.4, rtol=0.15)
+
+
+def test_sm90_wgrad_invocation_rejects_ambiguous_retained_runtime(monkeypatch) -> None:
+    from sonicmoe.quack_utils import bf16_wgrad_gemm as module
+
+    A, B = object(), object()
+    monkeypatch.setattr(module, "current_sm90_invocation", lambda: None)
+    monkeypatch.setattr(module, "find_sm90_operand_invocations", lambda _tensor: ())
+    monkeypatch.setattr(module, "unique_retained_sm90_invocation", lambda: None)
+
+    monkeypatch.setattr(module, "_validate_problem", lambda *args, **kwargs: None)
+    monkeypatch.setattr(module, "get_device_capacity", lambda _device: (9, 0))
+    assert module._resolve_sm90_wgrad_invocation(A, B) is None
+    with pytest.raises(RuntimeError, match="multiple live invocations"):
+        module._run_bf16_wgrad_varlen_k(
+            A,
+            B,
+            object(),
+            object(),
+            out=object(),
+            C=None,
+            M=1,
+            N=1,
+            total_K=1,
+            num_experts=1,
+            device=torch.device("cuda"),
+            variant="fresh",
+            compile_cache={},
+            fast_cache={},
+            epi_args=None,
+            sm90_wgrad=True,
+        )
+
+
 @requires_sm90
 @pytest.mark.parametrize("layout", ["contiguous", "upproj_transposed"])
 def test_sm90_fresh_output_and_noncontiguous_view(layout: str) -> None:
@@ -380,7 +508,11 @@ def test_sm90_nonzero_fp32_repeated_accumulation(tma_add: bool) -> None:
 def test_sm90_rejects_missing_native_payload(monkeypatch, variant: str) -> None:
     from sonicmoe.quack_utils import bf16_wgrad_gemm as module
 
-    monkeypatch.setattr(module, "_resolve_sm90_wgrad_pair", lambda _a, _b: (None, None))
+    monkeypatch.setattr(
+        module,
+        "_resolve_sm90_wgrad_pair",
+        lambda _a, _b, **_kwargs: (None, None),
+    )
     A, B, cu_seqlens_k, A_idx, out = (object() for _ in range(5))
     with pytest.raises(RuntimeError, match="BF16/QuACK fallback is forbidden"):
         module._run_bf16_wgrad_sm90(

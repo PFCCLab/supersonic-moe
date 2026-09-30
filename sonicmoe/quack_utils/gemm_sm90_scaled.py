@@ -1338,15 +1338,21 @@ class _GemmSm90RawScaledBase:
                         + (mma_group_tidx % 32) // 4
                         + ((value_m // 2) % 2) * 8
                     )
-                    col_in_atom = (i % 2) + ((i // 2) % 2) * 8 + (mma_group_tidx % 4) * 2
+                    col_in_atom = (i % 2) + ((i // 4) % 2) * 8 + (mma_group_tidx % 4) * 2
+                    if const_expr(not varlen_k):
+                        col_in_atom = (
+                            (i % 2) + ((i // 2) % 2) * 8 + (mma_group_tidx % 4) * 2
+                        )
                     m_abs = (
                         scale_m_offset
                         + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                        + warp_group_idx * (64 // self.atom_layout_mnk[1])
                         + (mma_group_tidx // 32) * 16
                         + row_in_atom
                     )
                     n_abs = (
                         tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+                        + warp_group_idx * (64 if self.atom_layout_mnk[1] > 1 else 0)
                         + col_in_atom
                         + (i // 8) * 16
                     )
@@ -1375,20 +1381,31 @@ class _GemmSm90RawScaledBase:
                         scale_a_raw = mSFA_raw[m_safe, scale_k_group, batch_idx]
                     else:
                         scale_a_raw = mSFA_raw[m_safe, scale_k_group]
+                    b_coord = n_safe
+                    if const_expr(varlen_k):
+                        # The second WGMMA operand is the logical output-N scale.
+                        # For varlen-K its accumulator coordinate follows the
+                        # transposed MMA value layout while A remains output-M.
+                        b_coord = (
+                            tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+                            + col_in_atom
+                            + (i // 8) * 16
+                        )
+                        b_coord = b_coord if b_coord < mSFB_raw.shape[0] else Int32(0)
                     if const_expr(cute.rank(mSFB_raw) == 3):
                         scale_b_k = (
                             scale_k_group
                             if scale_k_group < mSFB_raw.shape[1]
                             else mSFB_raw.shape[1] - 1
                         )
-                        scale_b_raw = mSFB_raw[n_safe, scale_b_k, batch_idx]
+                        scale_b_raw = mSFB_raw[b_coord, scale_b_k, batch_idx]
                     else:
                         scale_b_k = (
                             scale_k_group
                             if scale_k_group < mSFB_raw.shape[1]
                             else mSFB_raw.shape[1] - 1
                         )
-                        scale_b_raw = mSFB_raw[n_safe, scale_b_k]
+                        scale_b_raw = mSFB_raw[b_coord, scale_b_k]
                     scale = self.decode_ue8m0(scale_a_raw) * self.decode_ue8m0(scale_b_raw)
                     acc_slow[i] = acc_slow[i] + acc[i] * scale
             ab_pipeline.consumer_release(ab_release_state)
@@ -2325,6 +2342,22 @@ class Sm90ScaledGatedRawQuant(Sm90RawGatedQuantMixin, _GemmSm90RawScaledBase):
         super().__init__(*args, **kwargs)
         self.blockscaled = False
 
+    @staticmethod
+    def _sm90_compute_tile_shape_or_override(
+        cta_tile_shape_mnk,
+        atom_layout_mnk,
+        element_type=None,
+        epi_tile_override=None,
+    ):
+        tile_m, _ = _GemmSm90RawScaledBase._sm90_compute_tile_shape_or_override(
+            cta_tile_shape_mnk,
+            atom_layout_mnk,
+            element_type,
+            epi_tile_override,
+        )
+        assert cta_tile_shape_mnk[1] >= 64
+        return (tile_m, 64)
+
     def _setup_attributes(self, epilogue_args):
         return _GemmSm90RawScaledBase._setup_attributes(self, epilogue_args)
 
@@ -2462,7 +2495,7 @@ def _run_scaled(
     weight_block=32, tile_shape=(128, 128), cluster_shape=(1, 1, 1),
     pingpong=False, persistent=True, activation=None, activation_clamp=0.0,
     z_mode="bf16", y1_quant=False, fp8_preact=False, accumulate="fresh",
-    implicit_dtype=None, max_swizzle_size=8,
+    implicit_dtype=None, max_swizzle_size=8, activation_scale_order=None,
 ):
     _validate_public(A, B, D, a_scales, b_scales, activation_group, weight_block)
     if D is None and not issubclass(GemmCls, GemmGatedMixin):
@@ -2497,16 +2530,21 @@ def _run_scaled(
     if gather:
         expected_scale_rows = A_idx.numel()
         if cu_seqlens_k is None:
-            if a_scales.shape[0] == A.shape[0]:
-                # Gathered varlen-M reads A through A_idx, so its raw activation
-                # scales must follow the same routed-row order.  Materialize only
-                # the compact scale matrix; the E4M3 operand remains ungathered.
-                a_scales = a_scales[A_idx.to(torch.int64)].contiguous()
-            elif a_scales.shape[0] != expected_scale_rows:
+            if activation_scale_order not in ("source", "route"):
                 raise ValueError(
-                    f"gather A scales need {expected_scale_rows} routed rows or "
-                    f"{A.shape[0]} source rows, got {a_scales.shape[0]}"
+                    "gathered SM90 scaled GEMM requires activation_scale_order="
+                    "'source' or 'route'"
                 )
+            expected_rows = A.shape[0] if activation_scale_order == "source" else expected_scale_rows
+            if a_scales.shape[0] != expected_rows:
+                raise ValueError(
+                    f"{activation_scale_order}-ordered A scales require {expected_rows} rows, "
+                    f"got {a_scales.shape[0]}"
+                )
+            if activation_scale_order == "source":
+                # A is read through A_idx, so source-row scales must follow the
+                # same explicit gather even when source and route row counts match.
+                a_scales = a_scales[A_idx.to(torch.int64)].contiguous()
     if torch.float8_e4m3fn not in torch2cute_dtype_map:
         torch2cute_dtype_map[torch.float8_e4m3fn] = cutlass.Float8E4M3FN
     validate_D = D
@@ -2663,6 +2701,7 @@ def sm90_scaled_gated(
             quack.activation.swiglu_precise,
             mZScale=_epi_tensor(z_scale_out, varlen_m=True),
             mPostActScaleRaw=_epi_tensor(postact_scale_out, varlen_m=True),
+            mPostActOutput=postact_cute,
             **common,
         )
     else:
@@ -2888,6 +2927,7 @@ def sm90_scaled_recompute_z(
     A, B, D, a_scales, b_scales, cu_seqlens_m, A_idx, *, z_scale_out=None, **kwargs
 ):
     """Gather + varlen-M recompute with BF16 or direct E4M3/raw-scale output."""
+    kwargs.setdefault("activation_scale_order", "source")
     if D.dtype == torch.float8_e4m3fn:
         if z_scale_out is None:
             raise ValueError("E4M3 recompute output requires raw z_scale_out")

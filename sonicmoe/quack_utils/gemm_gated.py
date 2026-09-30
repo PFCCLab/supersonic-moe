@@ -824,6 +824,7 @@ def _recompute_z_payload(
         A_idx,
         activation_group=group_size,
         weight_block=block_size,
+        activation_scale_order="source",
     )
     return z, None
 
@@ -872,7 +873,7 @@ def _try_sm90_native_gated(
     cfg = invocation.fp8_config
     recompute_z = cfg.recompute_z
     save_z_fp8 = cfg.save_z_fp8 and not recompute_z
-    fuse_y1 = cfg.fuse_y1_quant
+    fuse_y1 = cfg.fuse_y1_quant and group_size == 32
     epilogue_quant = cfg.epilogue_quant
     if recompute_z:
         pass
@@ -924,6 +925,7 @@ def _try_sm90_native_gated(
             A_idx=A_idx,
             activation_group=group_size,
             weight_block=block_size,
+            activation_scale_order="source",
         )
         if recompute_z:
             carrier = register_sm90_carrier(
@@ -1012,12 +1014,23 @@ def _try_sm90_native_gated(
             )
             replace_with_sm90_anchor(original_postact)
         else:
+            sm90_reference = _sm90_reference_module()
+            data, scales = sm90_reference.quantize_activation_blockscaled_fast(
+                original_postact.contiguous(), group_size=32
+            )
             register_sm90_carrier(
                 original_postact,
+                data=data,
+                scales=scales,
                 role="y1",
-                metadata={"group_size": group_size, "mode": "bf16"},
+                metadata={
+                    "group_size": 32,
+                    "mode": "fp8",
+                    "quant_source": "standalone_native",
+                },
                 replace=True,
             )
+            replace_with_sm90_anchor(original_postact)
     # BF16 outputs remain materialized until quantize_activation_sm90 binds
     # their independent FP8 payload. Anchoring them here would make that
     # idempotent quantizer read zeros. FP8 compatibility tensors are themselves

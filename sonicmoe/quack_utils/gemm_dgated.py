@@ -446,11 +446,29 @@ def _try_sm90_native_dgated(
     invocation = current_sm90_invocation() or unique_retained_sm90_invocation()
     if invocation is None:
         return False
-    a_carrier = get_sm90_carrier(A, invocation=invocation)
+    a_carrier = claim_pending_sm90_carrier(A, invocation)
     b_carrier = get_sm90_carrier(B, invocation=invocation)
+    if a_carrier is not None:
+        a_carrier.materialize()
     if a_carrier is not None and b_carrier is None:
         b_carrier = get_sm90_carrier(B, invocation=invocation)
         if b_carrier is None:
+            a_k = int(a_carrier.data.shape[-1])
+            candidates = [
+                candidate
+                for candidate in get_sm90_storage_carriers(B, invocation=invocation)
+                if candidate.data is not None
+                and int(candidate.data.shape[-1]) == a_k
+            ]
+            if len(candidates) == 1:
+                b_carrier = candidates[0]
+    if a_carrier is not None and b_carrier is not None:
+        b_carrier.materialize()
+        if (
+            a_carrier.data is not None
+            and b_carrier.data is not None
+            and int(a_carrier.data.shape[-1]) != int(b_carrier.data.shape[-1])
+        ):
             a_k = int(a_carrier.data.shape[-1])
             candidates = [
                 candidate
@@ -482,17 +500,17 @@ def _try_sm90_native_dgated(
     a_carrier.materialize()
     b_carrier.materialize()
     kernel_out, kernel_postact = Out, PostAct
-    if int(Out.shape[-1]) == 2 * int(PostAct.shape[-1]):
-        kernel_out = Out.view(torch.float32)
-    elif Out.dtype not in (torch.bfloat16, torch.float16) or PostAct.dtype != Out.dtype:
+    if Out.dtype not in (torch.bfloat16, torch.float16) or PostAct.dtype != Out.dtype:
         kernel_out = torch.empty_like(Out, dtype=torch.bfloat16)
         kernel_postact = torch.empty_like(PostAct, dtype=torch.bfloat16)
-    group_size = int(a_carrier.metadata.get("group_size", 32))
-    block_size = int(b_carrier.metadata.get("block_size", group_size))
+    invocation = a_carrier.metadata["invocation"]
+    group_size = int(invocation.activation_group_size)
+    block_size = int(invocation.weight_block_size)
+    if int(a_carrier.metadata.get("group_size", group_size)) != group_size:
+        return False
     preact, preact_scales = _native_preact_payload(PreAct)
     if preact_scales is None and preact.dtype != Out.dtype:
         preact = preact.to(Out.dtype)
-    invocation = a_carrier.metadata["invocation"]
     with use_sm90_invocation(invocation):
         sm90_scaled_dgated(
             a_carrier.data,
@@ -511,6 +529,7 @@ def _try_sm90_native_dgated(
             A_idx=A_idx,
             activation_group=group_size,
             weight_block=block_size,
+            activation_scale_order="source",
         )
         if kernel_out is not Out and kernel_out.dtype == torch.bfloat16:
             Out.copy_(kernel_out.to(Out.dtype))
