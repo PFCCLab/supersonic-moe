@@ -625,7 +625,9 @@ class Sm90RawGatedQuantMixin(GemmGatedMixin):
 
     @cute.jit
     def epi_convert_postact(self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx):
-        return GemmActMixin.epi_convert_postact(
+        # Only reached for a 16-bit PostAct (stored through STSM), which needs
+        # the gated register permute like the plain gated epilogue.
+        return GemmGatedMixin.epi_convert_postact(
             self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
         )
 

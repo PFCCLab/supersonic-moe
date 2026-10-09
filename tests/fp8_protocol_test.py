@@ -35,6 +35,7 @@ from sonicmoe.functional.fp8_quant import (
     quantize_activation_blockwise,
     round_scale_to_e8m0,
 )
+from sonicmoe.functional.fp8_protocol import FP8Backend, resolve_fp8_backend
 from sonicmoe.quack_utils import blockscaled_fp8_gemm, clear_blockscaled_fp8_weight_cache, prefetch_blockscaled_w2_fp8
 from sonicmoe.quack_utils.gemm_interface import gemm_dgated
 from sonicmoe.utils import convert_torch_tensor_to_cute_tensor
@@ -46,6 +47,37 @@ _SEED = 42
 
 
 class FP8ProtocolTest(TestCommons):
+    def test_backend_defaults_follow_device(self) -> None:
+        for major, expected in ((9, FP8Backend.HOPPER_NATIVE), (10, FP8Backend.BLACKWELL), (11, FP8Backend.BLACKWELL)):
+            with self.subTest(major=major), patch(
+                "torch.cuda.get_device_capability", return_value=(major, 0)
+            ):
+                resolution = resolve_fp8_backend(device=torch.device("cuda"))
+                self.assertIs(resolution.backend, expected)
+                self.assertEqual(resolution.is_native_hopper, major == 9)
+                self.assertEqual(resolution.routing_block_size, 128)
+
+    def test_backend_explicit_request_must_match_device(self) -> None:
+        with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
+            resolution = resolve_fp8_backend("hopper_native", torch.device("cuda"))
+            self.assertTrue(resolution.is_native_hopper)
+            with self.assertRaisesRegex(RuntimeError, "only supports SM100"):
+                resolve_fp8_backend(FP8Backend.BLACKWELL, torch.device("cuda"))
+            with self.assertRaisesRegex(ValueError, "Unsupported FP8 backend"):
+                resolve_fp8_backend("hopper_qdq", torch.device("cuda"))
+        with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
+            with self.assertRaisesRegex(RuntimeError, "requires an exact SM90"):
+                resolve_fp8_backend(FP8Backend.HOPPER_NATIVE, torch.device("cuda"))
+
+    def test_backend_rejects_unsupported_device(self) -> None:
+        with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
+            with self.assertRaisesRegex(RuntimeError, "supports exact SM90 and SM100"):
+                resolve_fp8_backend(device=torch.device("cuda"))
+        with self.assertRaisesRegex(RuntimeError, "requires a CUDA device"):
+            resolve_fp8_backend(device=torch.device("cpu"))
+        with self.assertRaisesRegex(ValueError, "Unsupported FP8 backend"):
+            resolve_fp8_backend("invalid", torch.device("cuda"))
+
     def test_blackwell_fp8_protocol_defaults(self) -> None:
         protocol = validate_fp8_protocol(get_default_fp8_protocol())
 

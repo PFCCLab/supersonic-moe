@@ -3,10 +3,8 @@
 # ********************************************************************************
 
 import os
-import sys
 from functools import lru_cache, partial
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Callable, NamedTuple, Optional, Tuple
 
 import cutlass
@@ -60,16 +58,6 @@ from .activation_situ import (
     resolve_gate_fn,
 )
 
-from .sm90_fp8_runtime import (
-    get_sm90_carrier,
-    is_sm90_native_active,
-    is_sm90_native_carrier,
-    register_sm90_carrier,
-    replace_with_sm90_anchor,
-    use_sm90_invocation,
-)
-from . import gemm_sm90_scaled as _sm90_scaled
-from .gemm_sm90_scaled import sm90_scaled_gated
 from .gemm_sm100_fp8_zeromat import (
     GemmGatedSm100ZeroMat,
     GemmGatedSm100ZeroMatBlockscaledQuant,
@@ -82,18 +70,6 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 _SONIC_QUACK_UTILS_DIR = Path(__file__).resolve().parent
 if _SONIC_QUACK_UTILS_DIR not in EXTRA_SOURCE_DIRS:
     EXTRA_SOURCE_DIRS.append(_SONIC_QUACK_UTILS_DIR)
-
-
-def _sm90_reference_module():
-    package_root = __package__.split(".quack_utils", 1)[0]
-    for module_name in (
-        f"{package_root}.functional.sm90_reference",
-        "paddlefleet_ops.sonicmoe.functional.sm90_reference",
-    ):
-        module = sys.modules.get(module_name)
-        if module is not None:
-            return module
-    raise RuntimeError("SM90 reference helpers were not loaded by sonicmoe.functional")
 
 
 def _raw_stream_id(stream) -> Optional[int]:
@@ -782,262 +758,6 @@ def try_gemm_gated_tvm_ffi_sonic_fast(
     return True
 
 
-def _carrier_view_for_kernel(carrier, tensor):
-    del tensor
-    carrier.materialize()
-    return carrier.data
-
-
-def _recompute_z_payload(
-    output, save_fp8, a_carrier, b_carrier, A, B, cu_seqlens_m, A_idx,
-    group_size, block_size,
-):
-    if save_fp8:
-        from ..functional.sm90_reference import blockscaled_fp8_gemm_zeromat_quant
-
-        z_fp8 = torch.empty(
-            output.shape, dtype=torch.float8_e4m3fn, device=output.device
-        )
-        z_scales = torch.empty(
-            (output.shape[0], output.shape[1] // 32),
-            dtype=torch.uint8,
-            device=output.device,
-        )
-        return blockscaled_fp8_gemm_zeromat_quant(
-            _carrier_view_for_kernel(a_carrier, A),
-            _carrier_view_for_kernel(b_carrier, B),
-            cu_seqlens_m,
-            A_idx,
-            a_carrier.scales,
-            b_carrier.scales,
-            z_fp8_out=z_fp8,
-            z_scale_out=z_scales,
-        )
-    z = torch.empty(output.shape, dtype=torch.bfloat16, device=output.device)
-    _sm90_scaled.sm90_scaled_recompute_z(
-        _carrier_view_for_kernel(a_carrier, A),
-        _carrier_view_for_kernel(b_carrier, B),
-        z,
-        a_carrier.scales,
-        b_carrier.scales,
-        cu_seqlens_m,
-        A_idx,
-        activation_group=group_size,
-        weight_block=block_size,
-        activation_scale_order="source",
-    )
-    return z, None
-
-
-def _try_sm90_native_gated(
-    A, B, D, C, PostAct, *, activation, cu_seqlens_m, A_idx,
-    rowvec_bias, colvec_bias, z_scale_out, postact_scale_out,
-    swiglu_clamp_value, postact_bf16_trunc,
-):
-    a_carrier = get_sm90_carrier(A)
-    b_carrier = get_sm90_carrier(B)
-    if a_carrier is not None and b_carrier is None:
-        invocation = a_carrier.metadata.get("invocation")
-        if invocation is not None:
-            b_carrier = get_sm90_carrier(B, invocation=invocation)
-    if b_carrier is not None and a_carrier is None:
-        invocation = b_carrier.metadata.get("invocation")
-        if invocation is not None:
-            a_carrier = get_sm90_carrier(A, invocation=invocation)
-    if a_carrier is None or b_carrier is None:
-        return False
-    if not (
-        is_sm90_native_active()
-        or (is_sm90_native_carrier(a_carrier) and is_sm90_native_carrier(b_carrier))
-    ):
-        return False
-    if rowvec_bias is not None or colvec_bias is not None or D is None:
-        return False
-    if C is not None:
-        return False
-    if activation != "swiglu":
-        raise NotImplementedError(
-            "native SM90 FP8 carrier gated GEMM supports only swiglu; "
-            f"got activation={activation!r}. Refusing to read compatibility anchors."
-        )
-    if float(swiglu_clamp_value) != 0.0:
-        raise NotImplementedError(
-            "native SM90 FP8 carrier gated GEMM does not support "
-            f"swiglu_clamp_value={swiglu_clamp_value}. Refusing to read compatibility anchors."
-        )
-    a_carrier.materialize()
-    b_carrier.materialize()
-    invocation = a_carrier.metadata["invocation"]
-    group_size = invocation.activation_group_size
-    block_size = invocation.weight_block_size
-    cfg = invocation.fp8_config
-    recompute_z = cfg.recompute_z
-    save_z_fp8 = cfg.save_z_fp8 and not recompute_z
-    fuse_y1 = cfg.fuse_y1_quant and group_size == 32
-    epilogue_quant = cfg.epilogue_quant
-    if recompute_z:
-        pass
-    elif save_z_fp8 and epilogue_quant:
-        pass
-    elif D.dtype != torch.bfloat16:
-        return False
-    if fuse_y1 and epilogue_quant:
-        pass
-    elif PostAct.dtype != torch.bfloat16:
-        return False
-    original_D = D
-    original_postact = PostAct
-    kernel_D = D
-    kernel_postact = PostAct
-    z_scales = z_scale_out
-    y1_scales = postact_scale_out
-    if recompute_z:
-        kernel_D = None
-        z_scales = None
-    elif save_z_fp8 and epilogue_quant:
-        kernel_D = torch.empty(D.shape, dtype=torch.float8_e4m3fn, device=D.device)
-        z_scales = torch.empty(
-            (D.shape[0], D.shape[1] // 32), dtype=torch.uint8, device=D.device
-        )
-    if fuse_y1 and epilogue_quant:
-        kernel_postact = torch.empty(
-            PostAct.shape, dtype=torch.float8_e4m3fn, device=PostAct.device
-        )
-        y1_scales = torch.empty(
-            (PostAct.shape[0], PostAct.shape[1] // 32),
-            dtype=torch.uint8,
-            device=PostAct.device,
-        )
-    with use_sm90_invocation(invocation):
-        sm90_scaled_gated(
-            _carrier_view_for_kernel(a_carrier, A),
-            _carrier_view_for_kernel(b_carrier, B),
-            kernel_D,
-            kernel_postact,
-            a_carrier.scales,
-            b_carrier.scales,
-            activation=activation,
-            z_scale_out=z_scales,
-            postact_scale_out=y1_scales,
-            swiglu_clamp_value=swiglu_clamp_value,
-            postact_bf16_trunc=postact_bf16_trunc,
-            cu_seqlens_m=cu_seqlens_m,
-            A_idx=A_idx,
-            activation_group=group_size,
-            weight_block=block_size,
-            activation_scale_order="source",
-        )
-        if recompute_z:
-            carrier = register_sm90_carrier(
-                original_D,
-                role="z",
-                recipe=lambda: _recompute_z_payload(
-                    original_D,
-                    cfg.save_z_fp8,
-                    a_carrier,
-                    b_carrier,
-                    A,
-                    B,
-                    cu_seqlens_m,
-                    A_idx,
-                    group_size,
-                    block_size,
-                ),
-                metadata={
-                    "group_size": 32 if cfg.save_z_fp8 else group_size,
-                    "mode": "recipe",
-                    "recompute_output": "fp8" if cfg.save_z_fp8 else "bf16",
-                    "scale_abi": "raw_ue8m0_1x32" if cfg.save_z_fp8 else None,
-                },
-                replace=True,
-            )
-            replace_with_sm90_anchor(original_D)
-        elif save_z_fp8 and epilogue_quant:
-            register_sm90_carrier(
-                original_D,
-                data=kernel_D,
-                scales=z_scales,
-                role="z",
-                metadata={
-                    "group_size": group_size,
-                    "mode": "fp8",
-                    "quant_source": "epilogue",
-                },
-                replace=True,
-            )
-            replace_with_sm90_anchor(original_D)
-        elif save_z_fp8:
-            sm90_reference = _sm90_reference_module()
-
-            data, scales = sm90_reference.quantize_activation_blockscaled_fast(
-                original_D.contiguous(), group_size=group_size
-            )
-            register_sm90_carrier(
-                original_D, data=data, scales=scales, role="z",
-                metadata={
-                    "group_size": group_size,
-                    "mode": "fp8",
-                    "quant_source": "standalone_native",
-                },
-                replace=True,
-            )
-            replace_with_sm90_anchor(original_D)
-        elif D is not None:
-            if D.dtype == torch.float8_e4m3fn:
-                if z_scale_out is None:
-                    raise RuntimeError("native SM90 FP8 z output requires scales")
-                register_sm90_carrier(
-                    original_D, data=kernel_D, scales=z_scales, role="z",
-                    metadata={"group_size": group_size, "mode": "fp8", "quant_source": "epilogue"},
-                    replace=True,
-                )
-                replace_with_sm90_anchor(original_D)
-            else:
-                register_sm90_carrier(
-                    original_D, role="z",
-                    metadata={"group_size": group_size, "mode": "bf16"}, replace=True,
-                )
-        if fuse_y1:
-            register_sm90_carrier(
-                original_postact,
-                data=kernel_postact,
-                scales=y1_scales,
-                role="y1",
-                metadata={
-                    "group_size": 32,
-                    "mode": "fp8",
-                    "quant_source": "epilogue",
-                    "epilogue_fused": True,
-                    "scale_abi": "raw_ue8m0_1x32",
-                },
-                replace=True,
-            )
-            replace_with_sm90_anchor(original_postact)
-        else:
-            sm90_reference = _sm90_reference_module()
-            data, scales = sm90_reference.quantize_activation_blockscaled_fast(
-                original_postact.contiguous(), group_size=32
-            )
-            register_sm90_carrier(
-                original_postact,
-                data=data,
-                scales=scales,
-                role="y1",
-                metadata={
-                    "group_size": 32,
-                    "mode": "fp8",
-                    "quant_source": "standalone_native",
-                },
-                replace=True,
-            )
-            replace_with_sm90_anchor(original_postact)
-    # BF16 outputs remain materialized until quantize_activation_sm90 binds
-    # their independent FP8 payload. Anchoring them here would make that
-    # idempotent quantizer read zeros. FP8 compatibility tensors are themselves
-    # payload storage and likewise must not be rebound.
-    return True
-
-
 def gemm_gated(
     A: Tensor,  # (l, m, k) or (total_m, k) if varlen_m or (whatever, k) if gather_A with varlen_m
     B: Tensor,  # (l, n, k)
@@ -1073,8 +793,7 @@ def gemm_gated(
         swiglu_clamp_value = 0.0
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
-        if not (get_sm90_carrier(A) is not None and get_sm90_carrier(B) is not None):
-            assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
+        assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
         if D is not None:
             assert D.stride(-1) == 1, "varlen_m requires D to be n-major"
         assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
@@ -1122,23 +841,6 @@ def gemm_gated(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    if device_capacity[0] == 9 and _try_sm90_native_gated(
-        A,
-        B,
-        D,
-        C,
-        PostAct,
-        activation=activation,
-        cu_seqlens_m=cu_seqlens_m,
-        A_idx=A_idx,
-        rowvec_bias=rowvec_bias,
-        colvec_bias=colvec_bias,
-        z_scale_out=z_scale_out,
-        postact_scale_out=postact_scale_out,
-        swiglu_clamp_value=swiglu_clamp_value,
-        postact_bf16_trunc=postact_bf16_trunc,
-    ):
-        return
     # Use zero-materialization kernel when gather_A + blockscaled (FP8 with A_idx)
     blockscaled_runtime = a_scales is not None and b_scales is not None
     epilogue_quant = z_scale_out is not None

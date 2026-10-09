@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-from contextlib import nullcontext
 import paddle
 
 from .enums import ActivationType
@@ -31,12 +30,7 @@ from .functional import (
     attach_preallocated_gated_outputs,
 )
 from .functional.utils import enable_fp8
-from .functional.fp8_protocol import FP8Backend
-from .functional.sm90_reference import is_sm90_device
-from .quack_utils.sm90_fp8_runtime import (
-    register_sm90_carrier,
-    sm90_invocation_scope,
-)
+from .functional.fp8_protocol import resolve_fp8_backend
 
 try:
     from .quack_utils.blockscaled_fp8_gemm import (
@@ -112,15 +106,11 @@ def run_sonic_moe(
 
     fp8_scale_packed = None
     gated_outputs = ()
-    exact_sm90 = fp8 and is_sm90_device(hidden_states.device)
-    backend = getattr(fp8_config, "fp8_backend", None)
-    backend_value = getattr(backend, "value", backend)
-    if backend_value is None and exact_sm90:
-        backend = FP8Backend.HOPPER_NATIVE
-        backend_value = backend.value
-    exact_sm90_fp8 = exact_sm90 and backend_value == "hopper_native"
-    sm90_qdq = exact_sm90 and backend_value in {"hopper_native", "hopper_qdq"}
-    if sm90_qdq:
+    backend_resolution = (
+        resolve_fp8_backend(fp8_config, hidden_states.device) if fp8 else None
+    )
+    is_sm90 = backend_resolution is not None and backend_resolution.is_hopper
+    if is_sm90:
         (
             expert_frequency_offset,
             x_gather_idx,
@@ -137,7 +127,7 @@ def run_sonic_moe(
             topk_scores,
             tokens_per_expert,
             E,
-            block=128,
+            block=backend_resolution.routing_block_size,
             sync_free_sizing=sync_free_sizing,
         )
     elif (
@@ -163,7 +153,7 @@ def run_sonic_moe(
                 E,
                 fp8_scale,
                 int(hidden_states.shape[1]),
-                block=128,
+                block=backend_resolution.routing_block_size,
                 gated_output_prototype=hidden_states,
                 gated_n=gated_n,
                 gated_preact_bf16=not gated_z_quant,
@@ -178,7 +168,7 @@ def run_sonic_moe(
                 E,
                 fp8_scale,
                 int(hidden_states.shape[1]),
-                block=128,
+                block=backend_resolution.routing_block_size,
                 sync_free_sizing=sync_free_sizing,
             )
         (
@@ -272,48 +262,7 @@ def run_sonic_moe(
     #     w1_sonic = w1.permute([1, 2, 0])
     #     w2_sonic = w2.permute([1, 2, 0])
 
-    runtime_fp8_config = fp8_config
-    pylayer_fp8_config = (
-        fp8_config.sm90_compatibility_view() if exact_sm90_fp8 else fp8_config
-    )
-    scope = (
-        sm90_invocation_scope(
-            runtime_fp8_config,
-            activation_type,
-            backend=backend,
-            device=hidden_states.device,
-        )
-        if exact_sm90_fp8
-        else nullcontext(None)
-    )
-    with scope as sm90_invocation, enable_fp8(fp8):
-        if sm90_invocation is not None:
-            block_size = int(fp8_config.weight_block_size)
-            for weight, role in ((w1, "w1"), (w2, "w2")):
-                for attr, orientation in (
-                    ("fp8", "identity"),
-                    ("transposed_fp8", "transposed"),
-                ):
-                    payload = getattr(weight, attr, None)
-                    carrier = getattr(
-                        weight,
-                        "sm90_qdq_transposed" if orientation == "transposed" else "sm90_qdq",
-                        None,
-                    )
-                    if payload is not None and carrier is not None:
-                        register_sm90_carrier(
-                            carrier,
-                            data=payload[0],
-                            scales=payload[1],
-                            role=role,
-                            orientation=orientation,
-                            metadata={
-                                "block_size": block_size,
-                                "source_version": getattr(
-                                    weight, "_sm90_qdq_source_version", None
-                                ),
-                            },
-                        )
+    with enable_fp8(fp8):
         y1, z = _UpProjection.apply(
             hidden_states,
             w1,
@@ -331,11 +280,11 @@ def run_sonic_moe(
             is_inference_mode_enabled=False,
             use_low_precision_postact_buffer=False,
             prequant_activation_payload=fp8_hidden_states,
-            fp8_config=pylayer_fp8_config,
-            sm90_qdq=sm90_qdq,
-            sm90_invocation=sm90_invocation,
+            fp8_config=fp8_config,
         )
-        if release_fp8_weights and not fp8_config.recompute_z and not exact_sm90_fp8:
+        # SM90 weights are quantized and owned by PaddleFleet's moe_expert;
+        # they must not be released per call.
+        if release_fp8_weights and not fp8_config.recompute_z and not is_sm90:
             transposed_fp8 = getattr(w1, "transposed_fp8", None)
             if (
                 transposed_fp8 is None
@@ -363,14 +312,19 @@ def run_sonic_moe(
             activation_type,
             None,
             fp8_combine_grad_handle,
-            pylayer_fp8_config,
-            router_score_source,
-            router_score_src_idx,
-            sm90_qdq,
-            sm90_invocation,
         )
-        hidden_states = _DownProjection.apply(*down_args)
-        if release_fp8_weights and not exact_sm90_fp8:
+        if router_score_source is not None:
+            hidden_states = _DownProjection.apply(
+                *down_args,
+                fp8_config,
+                router_score_source,
+                router_score_src_idx,
+            )
+        else:
+            hidden_states = _DownProjection.apply(
+                *down_args, fp8_config=fp8_config
+            )
+        if release_fp8_weights and not is_sm90:
             transposed_fp8 = getattr(w2, "transposed_fp8", None)
             if (
                 transposed_fp8 is None

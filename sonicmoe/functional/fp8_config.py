@@ -206,19 +206,6 @@ class _FP8Config:
         else:
             self._fp8_wgrad = I >= self._WGRAD_FP8_I_THRESHOLD
 
-    def sm90_compatibility_view(self) -> "_FP8Config":
-        """Clone config while disabling legacy z storage decisions.
-
-        Native SM90 carriers retain the real immutable snapshot; this view only
-        prevents the unchanged PyLayer from consulting its SM100 global cache.
-        """
-        cfg = _FP8Config.__new__(_FP8Config)
-        for name in self.__slots__:
-            setattr(cfg, name, getattr(self, name))
-        cfg.save_z_fp8 = False
-        cfg.recompute_z = False
-        return cfg
-
     @staticmethod
     def disabled() -> "_FP8Config":
         """Return a config where everything is off (BF16 path)."""
