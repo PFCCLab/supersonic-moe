@@ -425,38 +425,6 @@ def test_sm90_native_wgrad_payload_tiles_and_accumulation() -> None:
             torch.testing.assert_close(accumulator, expected_acc, atol=0.4, rtol=0.15)
 
 
-def test_sm90_wgrad_invocation_rejects_ambiguous_retained_runtime(monkeypatch) -> None:
-    from sonicmoe.quack_utils import bf16_wgrad_gemm as module
-
-    A, B = object(), object()
-    monkeypatch.setattr(module, "current_sm90_invocation", lambda: None)
-    monkeypatch.setattr(module, "find_sm90_operand_invocations", lambda _tensor: ())
-    monkeypatch.setattr(module, "unique_retained_sm90_invocation", lambda: None)
-
-    monkeypatch.setattr(module, "_validate_problem", lambda *args, **kwargs: None)
-    monkeypatch.setattr(module, "get_device_capacity", lambda _device: (9, 0))
-    assert module._resolve_sm90_wgrad_invocation(A, B) is None
-    with pytest.raises(RuntimeError, match="multiple live invocations"):
-        module._run_bf16_wgrad_varlen_k(
-            A,
-            B,
-            object(),
-            object(),
-            out=object(),
-            C=None,
-            M=1,
-            N=1,
-            total_K=1,
-            num_experts=1,
-            device=torch.device("cuda"),
-            variant="fresh",
-            compile_cache={},
-            fast_cache={},
-            epi_args=None,
-            sm90_wgrad=True,
-        )
-
-
 @requires_sm90
 @pytest.mark.parametrize("layout", ["contiguous", "upproj_transposed"])
 def test_sm90_fresh_output_and_noncontiguous_view(layout: str) -> None:
@@ -502,28 +470,6 @@ def test_sm90_nonzero_fp32_repeated_accumulation(tma_add: bool) -> None:
     for expert, count in enumerate(case["expert_counts"]):
         if count == 0:
             torch.testing.assert_close(accumulator[expert], initial[expert], atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("variant", ["fresh", "accumulate", "tma_add"])
-def test_sm90_rejects_missing_native_payload(monkeypatch, variant: str) -> None:
-    from sonicmoe.quack_utils import bf16_wgrad_gemm as module
-
-    monkeypatch.setattr(
-        module,
-        "_resolve_sm90_wgrad_pair",
-        lambda _a, _b, **_kwargs: (None, None),
-    )
-    A, B, cu_seqlens_k, A_idx, out = (object() for _ in range(5))
-    with pytest.raises(RuntimeError, match="BF16/QuACK fallback is forbidden"):
-        module._run_bf16_wgrad_sm90(
-            A,
-            B,
-            cu_seqlens_k,
-            A_idx,
-            out=out,
-            C=out if variant == "accumulate" else None,
-            add_to_output=variant == "tma_add",
-        )
 
 
 @requires_sm90

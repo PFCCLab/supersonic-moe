@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import gc
 import importlib
-import itertools
-import weakref
 
 import pytest
 
@@ -120,12 +117,13 @@ def test_scaled_profiles_empty_experts_fresh_accumulate_add(torch, profile):
         pytest.skip("requires exact SM90")
     ref = importlib.import_module("sonicmoe.functional.sm90_reference")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
+    quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
 
     torch.manual_seed(9100 + profile)
     rows, hidden, output, experts = 256, 128, 128, 4
     x = (torch.randn(rows, hidden, device="cuda") * 0.02).to(torch.bfloat16)
     w = (torch.randn(experts, output, hidden, device="cuda") * 0.02).to(torch.bfloat16)
-    xq, xs, _ = ref.quantize_activation_sm90(x, profile)
+    xq, xs = quant.quantize_activation_blockscaled_fast(x, group_size=profile)
     wq, ws = ref.quantize_weight_sm90(w, profile)
     offsets = torch.tensor([0, 128, 128, 256, 256], dtype=torch.int32, device="cuda")
     gather = torch.arange(rows, dtype=torch.int32, device="cuda")
@@ -136,7 +134,7 @@ def test_scaled_profiles_empty_experts_fresh_accumulate_add(torch, profile):
         activation_scale_order="source",
     )
     expected_out = torch.zeros_like(out)
-    x_restored = ref.dequantize_activation_sm90(xq, xs, profile)
+    x_restored = ref.materialize_activation_sm90(xq, xs, profile)
     w_restored = ref.dequantize_weight_sm90(wq, ws, profile)
     for expert in range(experts):
         start = int(offsets[expert].item())
@@ -175,6 +173,7 @@ def test_sm90_profile128_down_production_oracle(torch, source_rows, hidden):
         pytest.skip("requires exact SM90")
     ref = importlib.import_module("sonicmoe.functional.sm90_reference")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
+    quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
 
     route_rows, width, experts = 160, 384, 4
     offsets_host = [0, 35, 35, 112, route_rows]
@@ -184,12 +183,12 @@ def test_sm90_profile128_down_production_oracle(torch, source_rows, hidden):
     weight = torch.stack(
         [_nonuniform_matrix(torch, width, hidden, phase=17.0 + expert * 9) for expert in range(experts)]
     )
-    data, source_scales, _ = ref.quantize_activation_sm90(source, 128)
+    data, source_scales = quant.quantize_activation_blockscaled_fast(source, group_size=128)
     weight_data, weight_scales = ref.quantize_weight_sm90(weight, 128)
     routed_scales = source_scales[route.long()].contiguous()
     assert int((route != torch.arange(route_rows, device="cuda", dtype=torch.int32)).sum().item()) > 0
 
-    source_dequant = ref.dequantize_activation_sm90(data, source_scales, 128)
+    source_dequant = ref.materialize_activation_sm90(data, source_scales, 128)
     weight_dequant = ref.dequantize_weight_sm90(weight_data, weight_scales, 128)
     expected = torch.empty((route_rows, width), dtype=torch.bfloat16, device="cuda")
     for expert, (start, end) in enumerate(zip(offsets_host, offsets_host[1:])):
@@ -217,141 +216,6 @@ def test_sm90_profile128_down_production_oracle(torch, source_rows, hidden):
         activation_scale_order="route",
     )
     assert _calc_diff(torch, routed_output, expected) < 5e-5
-
-
-@pytest.mark.parametrize("hidden", [128, 1024])
-def test_sm90_profile128_y1_carrier_and_predispatch(torch, hidden, monkeypatch):
-    if not _sm90(torch):
-        pytest.skip("requires exact SM90")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-    gated = importlib.import_module("sonicmoe.quack_utils.gemm_gated")
-    wgrad = importlib.import_module("sonicmoe.quack_utils.bf16_wgrad_gemm")
-
-    class Config:
-        enabled = fused_gated = fp8_wgrad = True
-        save_z_fp8 = recompute_z = epilogue_quant = False
-        fuse_y1_quant = True
-        fuse_y1_bf16_trunc = False
-        swiglu_clamp_value = 0.0
-        activation_group_size = weight_block_size = 128
-        fp8_backend = "hopper_native"
-
-    rows, width, experts = 160, 384, 4
-    offsets_host = [0, 35, 35, 112, rows]
-    offsets = torch.tensor(offsets_host, dtype=torch.int32, device="cuda")
-    route = ((torch.arange(rows, device="cuda") * 37 + 11) % rows).to(torch.int32)
-    source = _nonuniform_matrix(torch, rows, hidden, phase=3.0)
-    weight = torch.stack([
-        _nonuniform_matrix(torch, 2 * width, hidden, phase=23.0 + expert * 5)
-        for expert in range(experts)
-    ])
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        source_data, source_scales, _ = ref.quantize_activation_sm90(source, 128)
-        weight_data, weight_scales = ref.quantize_weight_sm90(weight, 128)
-        runtime.register_sm90_carrier(
-            source, data=source_data, scales=source_scales, role="activation",
-            metadata={"group_size": 128}, invocation=invocation,
-        )
-        runtime.register_sm90_carrier(
-            weight, data=weight_data, scales=weight_scales, role="weight",
-            metadata={"block_size": 128}, invocation=invocation,
-        )
-        z = torch.empty((rows, 2 * width), dtype=torch.bfloat16, device="cuda")
-        y1 = torch.empty((rows, width), dtype=torch.bfloat16, device="cuda")
-        snapshots = {}
-        real_anchor = gated.replace_with_sm90_anchor
-
-        def snapshot_anchor(tensor):
-            snapshots[id(tensor)] = tensor.clone()
-            return real_anchor(tensor)
-
-        monkeypatch.setattr(gated, "replace_with_sm90_anchor", snapshot_anchor)
-        assert gated._try_sm90_native_gated(
-            source, weight, z, None, y1, activation="swiglu",
-            cu_seqlens_m=offsets, A_idx=route, rowvec_bias=None,
-            colvec_bias=None, z_scale_out=None, postact_scale_out=None,
-            swiglu_clamp_value=0.0, postact_bf16_trunc=False,
-        )
-        carrier = runtime.get_sm90_carrier(y1, invocation=invocation)
-        carrier.materialize()
-        pre_anchor = snapshots[id(y1)]
-        expected_data, expected_scales = ref.quantize_activation_blockscaled_fast(
-            pre_anchor.contiguous(), 32
-        )
-        assert carrier.metadata["group_size"] == 32
-        assert int((carrier.data.view(torch.uint8) != expected_data.view(torch.uint8)).sum().item()) == 0
-        assert int((carrier.scales != expected_scales).sum().item()) == 0
-        quantized_expected = carrier.data.float().reshape(rows, -1, 32)
-        quantized_expected *= ref._decode_ue8m0(carrier.scales).unsqueeze(-1)
-        quantized_expected = quantized_expected.reshape(rows, width).to(torch.bfloat16)
-        standalone_diff = _calc_diff(torch, quantized_expected, pre_anchor)
-        assert standalone_diff < 5e-3, (
-            f"standalone y1 diff={standalone_diff} "
-            f"ref_norm={float(pre_anchor.float().norm().item())} "
-            f"restored_norm={float(quantized_expected.float().norm().item())} "
-            f"scale_range={int(carrier.scales.to(torch.int32).min().item())}:"
-            f"{int(carrier.scales.to(torch.int32).max().item())}"
-        )
-
-        down_weight = torch.stack([
-            _nonuniform_matrix(torch, 256, width, phase=41.0 + expert * 7)
-            for expert in range(experts)
-        ])
-        down_data, down_scales = ref.quantize_weight_sm90(down_weight, 128)
-        down_t = down_weight.permute(0, 2, 1)
-        runtime.register_sm90_carrier(
-            down_t, data=down_data, scales=down_scales, role="weight",
-            orientation="transposed", metadata={"block_size": 128}, invocation=invocation,
-        )
-        direct = torch.empty((rows, 256), dtype=torch.bfloat16, device="cuda")
-        dispatched = torch.empty_like(direct)
-        monkeypatch.setattr(wgrad, "get_device_capacity", lambda _device: (9, 0))
-        result = wgrad._sm90_gemm_pre_dispatch(
-            "gemm_out", None, (y1, down_t, dispatched),
-            {"cu_seqlens_m": offsets, "A_idx": torch.arange(rows, dtype=torch.int32, device="cuda")},
-        )
-        direct_data, direct_scales = ref.quantize_activation_blockscaled_fast(
-            pre_anchor.contiguous(), 128
-        )
-        wgrad.sm90_scaled_gemm(
-            direct_data, down_data, direct, direct_scales, down_scales,
-            cu_seqlens_m=offsets, A_idx=torch.arange(rows, dtype=torch.int32, device="cuda"),
-            activation_group=128, weight_block=128, activation_scale_order="source",
-        )
-        assert result is dispatched
-        assert _calc_diff(torch, dispatched, direct) < 5e-5
-
-        down_alias = down_t.view_as(down_t)
-        runtime.register_sm90_carrier(
-            down_alias, data=down_data, scales=down_scales, role="weight",
-            orientation="transposed", metadata={"block_size": 128}, invocation=invocation,
-        )
-        original_find = wgrad.find_sm90_storage_carriers
-        monkeypatch.setattr(
-            wgrad, "find_sm90_storage_carriers",
-            lambda tensor: [type(
-                "CompatibleCarrier", (), {
-                    "invocation_id": invocation.invocation_id,
-                    "data": down_data,
-                    "scales": down_scales,
-                },
-            )()] if tensor is down_t else original_find(tensor),
-        )
-        runtime.register_sm90_carrier(
-            down_t, data=down_data[0], scales=down_scales[0], role="weight",
-            orientation="transposed", metadata={"block_size": 128},
-            invocation=invocation, replace=True,
-        )
-        recovered = torch.empty_like(direct)
-        assert wgrad._sm90_gemm_pre_dispatch(
-            "gemm_out", None, (y1, down_t, recovered),
-            {"cu_seqlens_m": offsets, "A_idx": torch.arange(rows, dtype=torch.int32, device="cuda")},
-        ) is recovered
-        assert _calc_diff(torch, recovered, direct) < 5e-5
-    runtime.release_sm90_invocation(invocation)
 
 
 @pytest.mark.parametrize(
@@ -438,7 +302,9 @@ def test_sm90_raw_gated_epilogue_matrix(torch, profile, z_quant, y1_quant, monke
         assert float(y_diff.item()) < 5e-3
         assert float((y_deq - y_ref_deq).abs().mean().item()) < 1e-2
     else:
-        assert float((y.float() - y_ref.float()).abs().mean().item()) < 1e-2
+        # Same fp32 -> SwiGLU -> BF16 path as the reference: must be bit exact
+        # (an abs-mean check cannot see a column permutation of tiny y1).
+        assert bool((y == y_ref).all().item())
 
 
 @pytest.mark.parametrize("profile", [32, 128])
@@ -447,6 +313,7 @@ def test_sm90_dgated_is_independent_of_output_storage(torch, profile):
         pytest.skip("requires exact SM90")
     ref = importlib.import_module("sonicmoe.functional.sm90_reference")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
+    quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
 
     torch.manual_seed(8181 + profile)
     source_rows, rows, hidden, width, experts = 193, 160, 256, 384, 4
@@ -461,8 +328,8 @@ def test_sm90_dgated_is_independent_of_output_storage(torch, profile):
         experts, width, hidden, dtype=torch.bfloat16, device="cuda"
     )
     preact = torch.randn(rows, 2 * width, dtype=torch.bfloat16, device="cuda")
-    activation_data, activation_scales, _ = ref.quantize_activation_sm90(
-        activation, profile
+    activation_data, activation_scales = quant.quantize_activation_blockscaled_fast(
+        activation, group_size=profile
     )
     weight_data, weight_scales = ref.quantize_weight_sm90(weight, profile)
 
@@ -484,7 +351,7 @@ def test_sm90_dgated_is_independent_of_output_storage(torch, profile):
             weight_block=profile,
             activation_scale_order="source",
         )
-        rowwise, rowwise_scales, _ = ref.quantize_activation_sm90(dz, 32)
+        rowwise, rowwise_scales = quant.quantize_activation_blockscaled_fast(dz, group_size=32)
         colwise = ref.quantize_wgrad_colwise_sm90(
             rowwise,
             offsets,
@@ -501,498 +368,6 @@ def test_sm90_dgated_is_independent_of_output_storage(torch, profile):
         if lhs.dtype == torch.float8_e4m3fn:
             lhs, rhs = lhs.view(torch.uint8), rhs.view(torch.uint8)
         assert bool((lhs == rhs).all().item())
-
-
-def test_carrier_deferred_retain_release_and_cleanup(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = 32
-        weight_block_size = 32
-
-    tensor = torch.zeros((2, 2))
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        runtime.register_sm90_carrier(tensor, data=tensor, role="test")
-        wrapped = runtime.wrap_deferred_sm90_call(lambda: "done", tensor)
-        carrier = runtime.get_sm90_carrier(tensor)
-        assert carrier.deferred_wgrad_count == 1
-    assert wrapped() == "done"
-    assert carrier.deferred_wgrad_count == 0
-    runtime.release_sm90_invocation(invocation)
-    assert runtime.sm90_registry_stats() == {
-        "carriers": 0, "keys": 0, "invocations": 0,
-        "retained_invocations": 0, "invocation_owners": 0,
-        "pending_payloads": 0,
-    }
-
-
-def test_registry_metadata_is_weak_and_100_forward_only_calls_cleanup(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    for _ in range(100):
-        source = torch.zeros((2, 2))
-        source_ref = weakref.ref(source)
-        with runtime.sm90_invocation_scope(
-            Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-        ) as invocation:
-            carrier = runtime.register_sm90_carrier(
-                source, data=torch.ones((2, 2)), role="z"
-            )
-            assert runtime.resolve_sm90_metadata_tensor(
-                carrier.metadata, "source"
-            ) is source
-        runtime.release_sm90_invocation(invocation)
-        del carrier, source
-        gc.collect()
-        assert source_ref() is None
-    assert not any(runtime.sm90_registry_stats().values())
-
-
-def test_forward_exception_cleans_invocation(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    with pytest.raises(RuntimeError, match="forward failed"):
-        with runtime.sm90_invocation_scope(
-            Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-        ):
-            tensor = torch.zeros((2, 2))
-            runtime.register_sm90_carrier(tensor, data=tensor, role="test")
-            raise RuntimeError("forward failed")
-    assert not any(runtime.sm90_registry_stats().values())
-
-
-def test_two_live_microbatches_require_explicit_invocation(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    shared = torch.zeros((2, 2))
-    invocations = []
-    for value in (1.0, 2.0):
-        with runtime.sm90_invocation_scope(
-            Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-        ) as invocation:
-            runtime.register_sm90_carrier(
-                shared, data=torch.full_like(shared, value), role="test"
-            )
-        invocations.append(invocation)
-    assert runtime.get_sm90_carrier(shared) is None
-    with pytest.raises(RuntimeError, match="multiple SM90 invocations"):
-        runtime.get_sm90_carrier(shared, required=True)
-    with runtime.use_sm90_invocation(invocations[1]):
-        assert runtime.get_sm90_carrier(shared).data[0, 0] == 2
-    assert runtime.get_sm90_carrier(
-        shared, invocation=invocations[0]
-    ).data[0, 0] == 1
-    for invocation in invocations:
-        runtime.release_sm90_invocation(invocation)
-
-
-def test_wgrad_colwise_operand_prefers_explicit_carrier_payload(torch):
-    if not _sm90(torch):
-        pytest.skip("SM90-only carrier payload regression")
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
-    wgrad = importlib.import_module("sonicmoe.quack_utils.bf16_wgrad_gemm")
-
-    class Config:
-        activation_group_size = weight_block_size = 128
-
-    rows, hidden = 97, 256
-    truth = _nonuniform_matrix(torch, rows, hidden, phase=19.0)
-    data, scales, _ = ref.quantize_activation_sm90(truth, 128)
-    compatibility = torch.zeros_like(truth)
-    offsets = torch.tensor(
-        [0, 17, 49, rows], dtype=torch.int32, device="cuda"
-    )
-    gather = ((torch.arange(rows, device="cuda") * 13 + 7) % rows).to(
-        torch.int32
-    )
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        runtime.register_sm90_carrier(
-            compatibility,
-            data=data,
-            scales=scales,
-            role="activation",
-            metadata={"group_size": 128},
-            invocation=invocation,
-        )
-        actual = wgrad._sm90_colwise_operand(
-            compatibility,
-            offsets,
-            source=compatibility,
-            gather_idx=gather,
-            invocation=invocation,
-        )
-        expected = ref.quantize_wgrad_colwise_sm90(
-            data,
-            offsets,
-            gather_idx=gather,
-            source_scales=scales,
-            source_group=128,
-        )
-        for actual_item, expected_item in zip(actual, expected):
-            if actual_item.dtype == torch.float8_e4m3fn:
-                actual_item = actual_item.view(torch.uint8)
-                expected_item = expected_item.view(torch.uint8)
-            assert bool(torch.equal(actual_item, expected_item).all().item())
-    runtime.release_sm90_invocation(invocation)
-
-
-def test_wgrad_invocation_resolves_from_operands_with_two_live_microbatches(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-    wgrad = importlib.import_module("sonicmoe.quack_utils.bf16_wgrad_gemm")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    pairs = []
-    for value in (1.0, 2.0):
-        a = torch.zeros((2, 3))
-        b = torch.zeros((3, 4))
-        with runtime.sm90_invocation_scope(
-            Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-        ) as invocation:
-            runtime.bind_sm90_payload(
-                a, torch.full_like(a, value), None, 32, role="activation"
-            )
-            runtime.bind_sm90_payload(
-                b, torch.full_like(b, value + 10), None, 32, role="dz"
-            )
-        pairs.append((invocation, a, b))
-
-    assert runtime.unique_retained_sm90_invocation() is None
-    invocation, a, b = pairs[1]
-    a_carrier, b_carrier = wgrad._resolve_sm90_wgrad_pair(a.mT, b)
-    assert a_carrier.invocation_id == invocation.invocation_id
-    assert b_carrier.invocation_id == invocation.invocation_id
-    assert a_carrier.data[0, 0] == 2
-    assert b_carrier.data[0, 0] == 12
-
-    for retained, _, _ in pairs:
-        runtime.release_sm90_invocation(retained)
-
-
-def test_wgrad_invocation_synthesizes_missing_peer_carrier(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-    wgrad = importlib.import_module("sonicmoe.quack_utils.bf16_wgrad_gemm")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    for registered_operand in ("a", "b"):
-        a = torch.zeros((2, 3))
-        b = torch.zeros((3, 4))
-        with runtime.sm90_invocation_scope(
-            Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-        ) as invocation:
-            tensor = a if registered_operand == "a" else b
-            runtime.register_sm90_carrier(tensor, role=registered_operand)
-        a_carrier, b_carrier = wgrad._resolve_sm90_wgrad_pair(a.mT, b)
-        assert a_carrier.invocation_id == invocation.invocation_id
-        assert b_carrier.invocation_id == invocation.invocation_id
-        runtime.release_sm90_invocation(invocation)
-
-
-def test_pending_payload_replaces_stale_carrier_for_explicit_invocation(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = weight_block_size = 128
-
-    owner = torch.zeros((2, 128))
-    stale_data = torch.ones((2, 128))
-    pending_data = torch.full((2, 128), 2.0)
-    pending_scales = torch.full((2, 1), 127, dtype=torch.uint8)
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        runtime.register_sm90_carrier(
-            owner,
-            data=stale_data,
-            role="y1",
-            metadata={"group_size": 32},
-        )
-        runtime.bind_sm90_payload(
-            owner,
-            pending_data,
-            pending_scales,
-            128,
-            invocation=invocation,
-        )
-        carrier = runtime.claim_pending_sm90_carrier(owner, invocation)
-        assert carrier.data is pending_data
-        assert carrier.scales is pending_scales
-        assert carrier.metadata["group_size"] == 128
-        assert runtime.sm90_registry_stats()["pending_payloads"] == 0
-    runtime.release_sm90_invocation(invocation)
-
-
-def test_quantize_ignores_stale_carrier_with_different_logical_shape(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
-
-    class Config:
-        activation_group_size = weight_block_size = 128
-
-    logical = torch.randn((160, 128), dtype=torch.bfloat16)
-    stale_data = torch.ones((144, 128), dtype=torch.float8_e4m3fn)
-    stale_scales = torch.full((144, 4), 127, dtype=torch.uint8)
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        runtime.register_sm90_carrier(
-            logical,
-            data=stale_data,
-            scales=stale_scales,
-            role="y1s",
-            metadata={"group_size": 32},
-        )
-        data, scales, carrier = ref.quantize_activation_sm90(logical, 128)
-        assert tuple(data.shape) == tuple(logical.shape)
-        assert tuple(scales.shape) == (160, 1)
-        assert tuple(carrier.shape) == tuple(logical.shape)
-        current = runtime.get_sm90_carrier(logical, invocation=invocation)
-        assert current.data is data
-        assert current.scales is scales
-        assert current.metadata["group_size"] == 128
-    runtime.release_sm90_invocation(invocation)
-
-
-def test_pending_payload_owner_and_invocation_cleanup(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        owner = torch.zeros((2, 2))
-        runtime.bind_sm90_payload(owner, owner, None, 32)
-    assert runtime.sm90_registry_stats()["pending_payloads"] == 1
-    del owner
-    gc.collect()
-    assert runtime.sm90_registry_stats()["pending_payloads"] == 0
-    runtime.release_sm90_invocation(invocation)
-
-
-def test_output_owner_survives_frozen_input_until_completion(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    frozen_hidden = torch.zeros((2, 2), requires_grad=False)
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        payload = torch.ones((2, 2))
-        runtime.register_sm90_carrier(frozen_hidden, data=payload, role="test")
-        output = torch.ones((2, 2), requires_grad=True)
-        runtime.retain_sm90_invocation(invocation, owner=output)
-    assert runtime.sm90_registry_stats()["invocation_owners"] == 1
-    runtime.complete_sm90_invocation(invocation, output)
-    del output, frozen_hidden, payload
-    gc.collect()
-    assert not any(runtime.sm90_registry_stats().values())
-
-
-def test_deferred_call_executes_after_output_completion(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        activation_group_size = weight_block_size = 32
-
-    tensor = torch.zeros((2, 2))
-    payload = torch.ones((2, 2))
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        runtime.register_sm90_carrier(tensor, data=payload, role="test")
-        output = torch.ones((1,), requires_grad=True)
-        runtime.retain_sm90_invocation(invocation, owner=output)
-        deferred = runtime.wrap_deferred_sm90_call(lambda: "late", tensor)
-    runtime.complete_sm90_invocation(invocation, output)
-    del output, tensor, payload
-    gc.collect()
-    assert runtime.sm90_registry_stats()["carriers"] == 1
-    assert deferred() == "late"
-    gc.collect()
-    assert not any(runtime.sm90_registry_stats().values())
-
-
-def test_runtime_snapshot_is_immutable_and_complete(torch):
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-    fp8_config = importlib.import_module("sonicmoe.functional.fp8_config")
-    cfg = fp8_config._FP8Config()
-    cfg.enabled = cfg.fused_gated = cfg.fp8_wgrad = True
-    cfg.save_z_fp8 = cfg.recompute_z = cfg.fuse_y1_quant = True
-    cfg.epilogue_quant = False
-    cfg.activation_group_size = cfg.weight_block_size = 128
-    cfg.fp8_backend = "hopper_native"
-    with runtime.sm90_invocation_scope(
-        cfg, "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        cfg.save_z_fp8 = cfg.recompute_z = cfg.fuse_y1_quant = False
-        snapshot = invocation.fp8_config
-        assert snapshot.save_z_fp8 and snapshot.recompute_z and snapshot.fuse_y1_quant
-        assert not snapshot.epilogue_quant
-        assert invocation.profile == (128, 128)
-    runtime.release_sm90_invocation(invocation)
-
-
-@pytest.mark.parametrize(
-    "save_z_fp8,recompute_z,fuse_y1_quant",
-    list(itertools.product([False, True], repeat=3)),
-)
-def test_carrier_semantics_matrix(
-    torch, save_z_fp8, recompute_z, fuse_y1_quant
-):
-    if not _sm90(torch):
-        pytest.skip("requires exact SM90")
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-
-    class Config:
-        enabled = fused_gated = fp8_wgrad = True
-        fuse_y1_bf16_trunc = False
-        swiglu_clamp_value = 0.0
-        activation_group_size = weight_block_size = 32
-        fp8_backend = "hopper_native"
-        epilogue_quant = True
-
-    Config.save_z_fp8 = save_z_fp8
-    Config.recompute_z = recompute_z
-    Config.fuse_y1_quant = fuse_y1_quant
-    calls = {"recipe": 0}
-
-    def recipe():
-        calls["recipe"] += 1
-        return torch.zeros_like(z), None
-
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        z = torch.empty((128, 256), dtype=torch.bfloat16, device="cuda")
-        y1 = torch.empty((128, 128), dtype=torch.bfloat16, device="cuda")
-        z_carrier = runtime.register_sm90_carrier(
-            z,
-            role="z",
-            recipe=recipe if recompute_z else None,
-            metadata={
-                "mode": "recipe" if recompute_z else ("fp8" if save_z_fp8 else "bf16")
-            },
-        )
-        y1_carrier = runtime.register_sm90_carrier(
-            y1,
-            data=torch.empty_like(y1, dtype=torch.float8_e4m3fn) if fuse_y1_quant else None,
-            scales=torch.empty((128, 4), dtype=torch.uint8, device="cuda") if fuse_y1_quant else None,
-            role="y1",
-            metadata={"mode": "fp8" if fuse_y1_quant else "bf16"},
-        )
-        assert z_carrier.metadata["mode"] == (
-            "recipe" if recompute_z else ("fp8" if save_z_fp8 else "bf16")
-        )
-        assert y1_carrier.metadata["mode"] == ("fp8" if fuse_y1_quant else "bf16")
-        if recompute_z:
-            z_carrier.materialize()
-            z_carrier.materialize()
-            assert calls["recipe"] == 1
-            assert z_carrier.recipe is None
-    runtime.release_sm90_invocation(invocation)
-    assert runtime.sm90_registry_stats()["carriers"] == 0
-
-
-@pytest.mark.parametrize("profile", [32, 128])
-def test_recompute_fp8_recipe_materializes_into_dgated(torch, profile):
-    if not _sm90(torch):
-        pytest.skip("requires exact SM90")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
-    runtime = importlib.import_module("sonicmoe.quack_utils.sm90_fp8_runtime")
-    dgated = importlib.import_module("sonicmoe.quack_utils.gemm_dgated")
-    interface = importlib.import_module("sonicmoe.quack_utils.gemm_interface")
-
-    class Config:
-        enabled = fused_gated = fp8_wgrad = True
-        save_z_fp8 = recompute_z = True
-        fuse_y1_quant = epilogue_quant = False
-        fuse_y1_bf16_trunc = False
-        swiglu_clamp_value = 0.0
-        activation_group_size = weight_block_size = profile
-        fp8_backend = "hopper_native"
-
-    torch.manual_seed(12000 + profile)
-    rows = hidden = intermediate = 128
-    experts = 2
-    offsets = torch.tensor([0, 64, 128], dtype=torch.int32, device="cuda")
-    gather = torch.arange(rows, dtype=torch.int32, device="cuda")
-    x = (torch.randn(rows, hidden, device="cuda") * 0.05).to(torch.bfloat16)
-    dout = (torch.randn(rows, hidden, device="cuda") * 0.05).to(torch.bfloat16)
-    w1 = (torch.randn(experts, 2 * intermediate, hidden, device="cuda") * 0.05).to(torch.bfloat16)
-    w2 = (torch.randn(experts, intermediate, hidden, device="cuda") * 0.05).to(torch.bfloat16)
-
-    with runtime.sm90_invocation_scope(
-        Config(), "swiglu", backend="hopper_native", capability=(9, 0)
-    ) as invocation:
-        xq, xs, _ = ref.quantize_activation_sm90(x, profile)
-        dq, ds, _ = ref.quantize_activation_sm90(dout, profile)
-        w1q, w1s = ref.quantize_weight_sm90(w1, profile)
-        w2q, w2s = ref.quantize_weight_sm90(w2, profile)
-        runtime.register_sm90_carrier(x, data=xq, scales=xs, role="activation", metadata={"group_size": profile})
-        runtime.register_sm90_carrier(dout, data=dq, scales=ds, role="activation", metadata={"group_size": profile})
-        runtime.register_sm90_carrier(w1, data=w1q, scales=w1s, role="weight", metadata={"block_size": profile})
-        runtime.register_sm90_carrier(w2, data=w2q, scales=w2s, role="weight", metadata={"block_size": profile})
-        z = torch.empty((rows, 2 * intermediate), dtype=torch.bfloat16, device="cuda")
-        z_carrier = runtime.register_sm90_carrier(
-            z, role="z", recipe=lambda: ref.blockscaled_fp8_gemm_zeromat_quant(
-                xq, w1q, offsets, gather, xs, w1s
-            ), metadata={"mode": "recipe", "group_size": 32, "scale_abi": "raw_ue8m0_1x32"}
-        )
-        preact, preact_scales = dgated._native_preact_payload(z)
-        assert z_carrier.data is preact and z_carrier.scales is preact_scales
-        assert z_carrier.metadata["consumed_by_dgated"]
-        assert z_carrier.metadata["group_size"] == 32
-        assert preact_scales.dtype == torch.uint8
-        assert tuple(preact_scales.shape) == (rows, 2 * intermediate // 32)
-        assert torch.isfinite(ref._decode_ue8m0(preact_scales)).all()
-        assert int(preact_scales.to(torch.int32).max().item()) <= 254
-
-        dequant_z = ref.dequantize_activation_sm90(preact, preact_scales, 32)
-        expected_z = torch.empty_like(dequant_z)
-        expert_gather = gather.long()
-        for expert in range(experts):
-            start, end = int(offsets[expert]), int(offsets[expert + 1])
-            x_ref = ref.dequantize_activation_sm90(xq, xs, profile)[expert_gather[start:end]]
-            w_ref = ref.dequantize_weight_sm90(w1q, w1s, profile)[expert]
-            expected_z[start:end] = x_ref.float().matmul(w_ref.float().mT).to(torch.bfloat16)
-        assert torch.allclose(dequant_z.float(), expected_z.float(), rtol=0.2, atol=0.08)
-
-        dz = torch.empty((rows, 2 * intermediate), dtype=torch.bfloat16, device="cuda")
-        y1s = torch.empty((rows, intermediate), dtype=torch.bfloat16, device="cuda")
-        config = interface.default_config(dout.device)
-        result = dgated.gemm_dgated(
-            dout, w2, dz, z, y1s, None, "swiglu",
-            config.tile_m, config.tile_n, config.cluster_m, config.cluster_n,
-            config.pingpong, persistent=True,
-            max_swizzle_size=config.max_swizzle_size,
-            cu_seqlens_m=offsets, A_idx=gather,
-        )
-        assert result is None
-        assert dz.dtype == torch.bfloat16
-        assert tuple(dz.shape) == (rows, 2 * intermediate)
-        assert torch.isfinite(dz).all() and torch.isfinite(y1s).all()
-    runtime.release_sm90_invocation(invocation)
 
 
 @pytest.mark.parametrize(

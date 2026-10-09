@@ -70,6 +70,7 @@ from .enums import KernelBackendMoE
 from .functional import (
     FP8ActivationDType,
     FP8Backend,
+    FP8BackendResolution,
     apply_activation_fp8_protocol_cutely_fused,
     apply_preact_activation_fp8_protocol_cutely_fused,
     FP8Protocol,
@@ -82,6 +83,7 @@ from .functional import (
     enable_quack_gemm,
     get_default_fp8_protocol,
     is_blackwell_device,
+    resolve_fp8_backend,
     moe_general_routing_inputs,
     moe_TC_softmax_topk_layer,
     quantize_activation_reference,
