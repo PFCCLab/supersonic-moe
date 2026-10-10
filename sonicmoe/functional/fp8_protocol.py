@@ -42,7 +42,7 @@ class FP8ScaleGranularity(Enum):
 
 class FP8Backend(Enum):
     BLACKWELL = "blackwell"
-    HOPPER_NATIVE = "hopper_native"
+    HOPPER = "hopper"
 
 
 @dataclass(frozen=True)
@@ -78,16 +78,12 @@ class FP8BackendResolution:
         return self.capability_major == 9
 
     @property
-    def is_native_hopper(self) -> bool:
-        return self.backend is FP8Backend.HOPPER_NATIVE
-
-    @property
     def is_blackwell(self) -> bool:
         return self.capability_major >= 10
 
     @property
     def routing_block_size(self) -> int:
-        # Both native Hopper profiles and the Blackwell blockscaled path use
+        # Both Hopper profiles and the Blackwell blockscaled path use
         # the 128-row metadata contract.  The activation/weight profile remains
         # in the FP8 config and is not a routing decision.
         return 128
@@ -110,7 +106,7 @@ def resolve_fp8_backend(
 ) -> FP8BackendResolution:
     """Resolve an optional backend request against the actual CUDA device.
 
-    Exact SM90 resolves to native Hopper and SM100+ defaults to Blackwell.
+    Exact SM90 resolves to Hopper and SM100+ defaults to Blackwell.
     Other architectures are rejected rather than silently entering a
     mismatched kernel path.
     """
@@ -127,7 +123,7 @@ def resolve_fp8_backend(
 
     major, _ = torch.cuda.get_device_capability(device)
     if major == 9:
-        default = FP8Backend.HOPPER_NATIVE
+        default = FP8Backend.HOPPER
     elif major >= 10:
         default = FP8Backend.BLACKWELL
     else:
@@ -138,9 +134,9 @@ def resolve_fp8_backend(
     resolved = default if requested is None else requested
     if resolved is FP8Backend.BLACKWELL and major < 10:
         raise RuntimeError("The Blackwell FP8 backend only supports SM100+ GPUs")
-    if resolved is FP8Backend.HOPPER_NATIVE and major != 9:
+    if resolved is FP8Backend.HOPPER and major != 9:
         raise RuntimeError(
-            f"The Hopper FP8 native backend requires an exact SM90 GPU, got SM{major}"
+            f"The Hopper FP8 backend requires an exact SM90 GPU, got SM{major}"
         )
     return FP8BackendResolution(resolved, major)
 
@@ -177,9 +173,9 @@ def validate_fp8_protocol(protocol: FP8Protocol) -> FP8Protocol:
 
     if protocol.backend not in {
         FP8Backend.BLACKWELL,
-        FP8Backend.HOPPER_NATIVE,
+        FP8Backend.HOPPER,
     }:
-        raise ValueError("Only Blackwell and Hopper native FP8 backends are supported")
+        raise ValueError("Only Blackwell and Hopper FP8 backends are supported")
 
     return protocol
 

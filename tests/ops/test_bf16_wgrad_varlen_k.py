@@ -337,7 +337,7 @@ def _dequantize_sm90_colwise(torch, data, scales):
 
 def _native_wgrad_case(torch, seed: int) -> dict:
     import importlib
-    from sonicmoe.functional import sm90_reference as ref
+    from sonicmoe.quack_utils import sm90_funcs as ref
 
     quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
     source_rows, route_rows, M, N = 181, 160, 256, 192

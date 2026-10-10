@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dump real dz tensors from the SonicMoE bwd dGated path for iso32 audit.
 
-Hooks ``sonicmoe.functional.__init__.gemm_dgated_kernel`` so that the first
+Hooks ``sonicmoe.quack_utils.sm100_funcs.gemm_dgated_kernel`` so that the first
 N kernel invocations after warmup save their ``dz`` output to disk. We then
 have authentic gradient-domain bf16 tensors with which to compare 1×32
 vs 32×32 quant fidelity, including downstream-GEMM error.
@@ -54,11 +54,13 @@ def main() -> None:
         SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches,
     )
     import sonicmoe.functional as functional
+    from sonicmoe.quack_utils import sm100_funcs
 
     # Patch the dGated kernel call site by wrapping the imported alias inside
-    # ``sonicmoe.functional``.  We capture ``dz`` (the 3rd positional output
-    # tensor written in-place by the kernel) right after the call returns.
-    fmod = functional
+    # ``sonicmoe.quack_utils.sm100_funcs`` (the SM100 FP8 backend).  We capture
+    # ``dz`` (the 3rd positional output tensor written in-place by the kernel)
+    # right after the call returns.
+    fmod = sm100_funcs
     orig = fmod.gemm_dgated_kernel
     state = {"backward_idx": 0, "saved": 0}
     n_captures = args.captures

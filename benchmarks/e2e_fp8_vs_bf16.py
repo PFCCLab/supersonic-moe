@@ -4,7 +4,7 @@
 Usage:
     # Standard benchmark (aligned segments, production-like shape)
     CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-        SONIC_MOE_FP8_FUSED_SWIGLU_QUANT=1 SONIC_MOE_FP8_SAVE_Z_FP8=1 \
+        SONIC_MOE_FP8_SAVE_Z_FP8=1 \
         python benchmarks/e2e_fp8_vs_bf16.py
 
     # With zero-sync mode (production)
@@ -104,7 +104,6 @@ def main():
     print("=" * 80)
     print(f"Device: {torch.cuda.get_device_name()}")
     print(f"FP8 mode: {os.getenv('SONIC_MOE_FP8_MODE', 'off')}")
-    print(f"Fused SwiGLU+quant: {os.getenv('SONIC_MOE_FP8_FUSED_SWIGLU_QUANT', '0')}")
     print(f"Save z FP8: {os.getenv('SONIC_MOE_FP8_SAVE_Z_FP8', '0')}")
     print(f"Assume aligned: {os.getenv('SONIC_MOE_FP8_ASSUME_ALIGNED', '0')}")
     print()

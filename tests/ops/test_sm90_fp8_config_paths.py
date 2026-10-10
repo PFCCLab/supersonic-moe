@@ -50,7 +50,7 @@ def _calc_diff(torch, actual, expected):
 
 def _problem(torch, profile):
     quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     torch.manual_seed(7300 + profile)
     source_rows, rows, hidden, width, experts = 193, 160, 256, 512, 4
     offsets = torch.tensor([0, 35, 35, 112, rows], dtype=torch.int32, device="cuda")
@@ -68,7 +68,7 @@ def _problem(torch, profile):
 
 def _gated(torch, K, p, cfg):
     F = importlib.import_module("sonicmoe.functional")
-    return K.gated_forward(
+    return K.gemm_gated(
         None, p["w1"], p["offsets"], p["route"],
         x_fp8_pre=(p["x_fp8"], p["x_scales"]),
         w1_fp8=p["w1_fp8"], cfg=cfg, current_stream=None,
@@ -82,7 +82,7 @@ def modules(torch):
     F = importlib.import_module("sonicmoe.functional")
     K = importlib.import_module("sonicmoe.functional.fp8_kernels")
     quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     return F, K, quant, ref
 
 
@@ -90,24 +90,24 @@ def modules(torch):
 def test_sm90_gated_forward_config_variants(torch, modules, profile):
     F, K, quant, ref = modules
     p = _problem(torch, profile)
-    F._PREQUANTIZED_SCALES.pop("z_fp8", None)
-    z_ref, y1_ref, y1q_ref, y1s_ref = _gated(torch, K, p, _cfg(profile))
+    z_ref, y1_ref, y1q_ref, y1s_ref, z_payload = _gated(torch, K, p, _cfg(profile))
     assert tuple(z_ref.stride()) != (0, 0) and tuple(y1_ref.stride()) != (0, 0)
-    assert "z_fp8" not in F._PREQUANTIZED_SCALES
+    assert z_payload is None
     z_expected, zs_expected = quant.quantize_activation_blockscaled_fast(z_ref)
 
     # recompute_z: z not materialized, y1 identical.
-    z, y1, y1q, y1s = _gated(torch, K, p, _cfg(profile, recompute_z=True, save_z_fp8=True,
-                                                epilogue_quant=True))
+    z, y1, y1q, y1s, z_payload = _gated(torch, K, p, _cfg(profile, recompute_z=True, save_z_fp8=True,
+                                                           epilogue_quant=True))
     assert tuple(z.stride()) == (0, 0) and tuple(z.shape) == tuple(z_ref.shape)
-    assert "z_fp8" not in F._PREQUANTIZED_SCALES
+    assert z_payload is None
     assert bool((y1 == y1_ref).all().item())
     assert bool((y1q.view(torch.uint8) == y1q_ref.view(torch.uint8)).all().item())
 
-    # epilogue_quant + save_z_fp8: E4M3 z + raw 1x32 scales published.
-    z, y1, _, _ = _gated(torch, K, p, _cfg(profile, save_z_fp8=True, epilogue_quant=True))
+    # epilogue_quant + save_z_fp8: E4M3 z + raw 1x32 scales returned.
+    z, y1, _, _, z_payload = _gated(torch, K, p, _cfg(profile, save_z_fp8=True, epilogue_quant=True))
     assert tuple(z.stride()) == (0, 0)
-    z_fp8, z_scales = F._PREQUANTIZED_SCALES.pop("z_fp8")
+    assert z_payload is not None
+    z_fp8, z_scales = z_payload
     assert z_fp8.dtype == torch.float8_e4m3fn and tuple(z_scales.shape) == (p["rows"], p["width"] // 32)
     # Epilogue scales come from the fp32 accumulator, the reference from the
     # BF16-rounded z: only amax values sitting on a power-of-2 edge may differ.
@@ -118,7 +118,7 @@ def test_sm90_gated_forward_config_variants(torch, modules, profile):
     assert bool((y1 == y1_ref).all().item())
 
     # fuse_y1_quant: fused only for G == 32 (down GEMM consumes y1 in the G layout).
-    z, y1, y1q, y1s = _gated(torch, K, p, _cfg(profile, fuse_y1_quant=True))
+    z, y1, y1q, y1s, _ = _gated(torch, K, p, _cfg(profile, fuse_y1_quant=True))
     assert bool((z == z_ref).all().item())
     if profile == 32:
         assert tuple(y1.stride()) == (0, 0)
@@ -139,8 +139,7 @@ def test_sm90_recompute_z_matches_forward(torch, modules, profile, prequant):
     F, K, quant, ref = modules
     p = _problem(torch, profile)
     cfg = _cfg(profile)
-    F._PREQUANTIZED_SCALES.pop("z_fp8", None)
-    z_ref, _, _, _ = _gated(torch, K, p, cfg)
+    z_ref, _, _, _, _ = _gated(torch, K, p, cfg)
     if prequant:
         args = (None, p["w1"], p["offsets"], p["route"], p["x_fp8"], p["x_scales"], p["w1_fp8"])
     else:
@@ -150,8 +149,9 @@ def test_sm90_recompute_z_matches_forward(torch, modules, profile, prequant):
     assert bool((z == z_ref).all().item())
 
     z_fp8, z_scales = K.recompute_z(*args, cfg=cfg, fp8=True)
-    _gated(torch, K, p, _cfg(profile, save_z_fp8=True, epilogue_quant=True))
-    epi_fp8, epi_scales = F._PREQUANTIZED_SCALES.pop("z_fp8")
+    epi_fp8, epi_scales = _gated(
+        torch, K, p, _cfg(profile, save_z_fp8=True, epilogue_quant=True)
+    )[4]
     assert bool((z_scales == epi_scales).all().item())
     assert bool((z_fp8.view(torch.uint8) == epi_fp8.view(torch.uint8)).all().item())
 
@@ -178,10 +178,10 @@ def test_sm90_dgated_fp8_preact_matches_dequantized_bf16(torch, modules, profile
         expert_frequency_offset=p["offsets"], x_gather_idx=p["route"],
         activation="swiglu", cfg=cfg,
     )
-    dz_b, y1s_b, ds_b = K.dgated(
+    dz_b, y1s_b, ds_b = K.gemm_dgated(
         dout_fp8, dout_scales, preact=z_deq, preact_fp8=None, preact_scales=None, **common
     )
-    dz_f, y1s_f, ds_f = K.dgated(
+    dz_f, y1s_f, ds_f = K.gemm_dgated(
         dout_fp8, dout_scales, preact=None, preact_fp8=z_fp8,
         preact_scales=z_scales.view(torch.uint8), **common,
     )

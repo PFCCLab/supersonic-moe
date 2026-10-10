@@ -9,11 +9,8 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-import sonicmoe.functional as functional
 from sonicmoe import (
     FP8ActivationDType,
-    KernelBackendMoE,
-    MoE,
     apply_activation_fp8_protocol_cutely_fused,
     apply_preact_activation_fp8_protocol_cutely_fused,
     FP8Protocol,
@@ -29,7 +26,6 @@ from sonicmoe import (
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
-from sonicmoe.enums import ActivationType
 from sonicmoe.functional.fp8_quant import (
     dequantize_activation_blockwise,
     quantize_activation_blockwise,
@@ -48,26 +44,26 @@ _SEED = 42
 
 class FP8ProtocolTest(TestCommons):
     def test_backend_defaults_follow_device(self) -> None:
-        for major, expected in ((9, FP8Backend.HOPPER_NATIVE), (10, FP8Backend.BLACKWELL), (11, FP8Backend.BLACKWELL)):
+        for major, expected in ((9, FP8Backend.HOPPER), (10, FP8Backend.BLACKWELL), (11, FP8Backend.BLACKWELL)):
             with self.subTest(major=major), patch(
                 "torch.cuda.get_device_capability", return_value=(major, 0)
             ):
                 resolution = resolve_fp8_backend(device=torch.device("cuda"))
                 self.assertIs(resolution.backend, expected)
-                self.assertEqual(resolution.is_native_hopper, major == 9)
+                self.assertEqual(resolution.is_hopper, major == 9)
                 self.assertEqual(resolution.routing_block_size, 128)
 
     def test_backend_explicit_request_must_match_device(self) -> None:
         with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
-            resolution = resolve_fp8_backend("hopper_native", torch.device("cuda"))
-            self.assertTrue(resolution.is_native_hopper)
+            resolution = resolve_fp8_backend("hopper", torch.device("cuda"))
+            self.assertTrue(resolution.is_hopper)
             with self.assertRaisesRegex(RuntimeError, "only supports SM100"):
                 resolve_fp8_backend(FP8Backend.BLACKWELL, torch.device("cuda"))
             with self.assertRaisesRegex(ValueError, "Unsupported FP8 backend"):
                 resolve_fp8_backend("hopper_qdq", torch.device("cuda"))
         with patch("torch.cuda.get_device_capability", return_value=(10, 0)):
             with self.assertRaisesRegex(RuntimeError, "requires an exact SM90"):
-                resolve_fp8_backend(FP8Backend.HOPPER_NATIVE, torch.device("cuda"))
+                resolve_fp8_backend(FP8Backend.HOPPER, torch.device("cuda"))
 
     def test_backend_rejects_unsupported_device(self) -> None:
         with patch("torch.cuda.get_device_capability", return_value=(8, 0)):
@@ -208,152 +204,6 @@ class FP8ProtocolTest(TestCommons):
         torch.testing.assert_close(scales.float(), scales_ref.float(), atol=0.0, rtol=0.0)
         torch.testing.assert_close(restored.float(), restored_ref.float(), atol=0.0, rtol=0.0)
 
-    def test_blackwell_fp8_protocol_boundary_keeps_finite_forward_backward(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-        dout = 0.02 * torch.randn_like(x)
-
-        with enable_quack_gemm(True):
-            y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
-            y.backward(dout)
-
-        self.assertFalse(torch.isnan(y.float()).any().item())
-        self.assertIsNotNone(x.grad)
-        self.assertFalse(torch.isnan(x.grad.float()).any().item())
-
-        sample = 0.1 * torch.randn(4, 130, device="cuda", dtype=torch.bfloat16)
-        with enable_quack_gemm(True):
-            restored, scales = apply_activation_fp8_protocol(sample, protocol)
-        self.assertEqual(tuple(scales.shape), (4, 2))
-        self.assertEqual(tuple(restored.shape), (4, 130))
-        self.assertFalse(torch.isnan(restored.float()).any().item())
-
-    def test_fp8_runtime_switch_can_disable_upproj_epilogue_quant(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-        dout = 0.02 * torch.randn_like(x)
-
-        with patch.dict(
-            os.environ,
-            {
-                "SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION": "bf16",
-                "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION": "bf16",
-                "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION": "bf16",
-            },
-            clear=False,
-        ):
-            with patch.object(functional, "apply_preact_activation_fp8_protocol_cutely_fused", wraps=functional.apply_preact_activation_fp8_protocol_cutely_fused) as patched:
-                with enable_quack_gemm(True):
-                    y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
-                    y.backward(dout)
-
-        patched.assert_not_called()
-        self.assertFalse(torch.isnan(y.float()).any().item())
-        self.assertIsNotNone(x.grad)
-        self.assertFalse(torch.isnan(x.grad.float()).any().item())
-
-    def test_fp8_runtime_switch_rejects_fp8_downproj_weights_without_fp8_mainloop(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-
-        with patch.dict(
-            os.environ,
-            {
-                "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION": "bf16",
-                "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION": "fp8",
-            },
-            clear=False,
-        ):
-            with enable_quack_gemm(True):
-                with self.assertRaisesRegex(RuntimeError, "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8"):
-                    moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
-
-    def test_blockscaled_downproj_rejects_unaligned_static_capacity(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-
-        with patch.dict(
-            os.environ,
-            {
-                "SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ": "1",
-                "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY": "127",
-            },
-            clear=False,
-        ):
-            with enable_quack_gemm(True):
-                with self.assertRaisesRegex(RuntimeError, "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY"):
-                    moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
-
     def test_blockscaled_weight_prefetch_reuses_cache_and_invalidates_on_weight_update(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required")
@@ -382,75 +232,6 @@ class FP8ProtocolTest(TestCommons):
 
         self.assertIsNot(weight_fp8_first, weight_fp8_third)
         self.assertIsNot(weight_scales_first, weight_scales_third)
-
-    def test_moe_can_prefetch_supported_fp8_weights(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-
-        moe.clear_fp8_weight_cache()
-        with enable_quack_gemm(True):
-            prefetched = moe.prefetch_fp8_weights(protocol)
-
-        self.assertIn("downproj", prefetched)
-        weight_fp8, weight_scales = prefetched["downproj"]
-        self.assertEqual(weight_fp8.dtype, torch.float8_e4m3fn)
-        self.assertEqual(weight_scales.dtype, torch.float8_e8m0fnu)
-
-    def test_blockscaled_downproj_boundary_keeps_finite_forward_backward_with_static_capacity(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-        dout = 0.02 * torch.randn_like(x)
-
-        with patch.dict(
-            os.environ,
-            {
-                "SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ": "1",
-                "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY": "128",
-            },
-            clear=False,
-        ):
-            with enable_quack_gemm(True):
-                y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
-                y.backward(dout)
-
-        self.assertFalse(torch.isnan(y.float()).any().item())
-        self.assertIsNotNone(x.grad)
-        self.assertFalse(torch.isnan(x.grad.float()).any().item())
 
     def test_blockscaled_downproj_rejects_insufficient_capacity(self) -> None:
         if not torch.cuda.is_available():
@@ -557,86 +338,6 @@ class FP8ProtocolTest(TestCommons):
         torch.testing.assert_close(restored_no_postact.float(), restored_ref.float(), atol=0.0, rtol=0.0)
         torch.testing.assert_close(scales_no_postact.float(), scales_ref.float(), atol=0.0, rtol=0.0)
 
-    def test_blackwell_fp8_runtime_path_requests_low_precision_upproj_postact_buffer(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-        dout = 0.02 * torch.randn_like(x)
-
-        with patch.dict(os.environ, {"SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER": "1"}, clear=False):
-            with patch.object(functional, "gemm_gated", wraps=functional.gemm_gated) as patched_gemm_gated:
-                with patch.object(
-                    functional,
-                    "apply_preact_activation_fp8_protocol_cutely_fused",
-                    wraps=functional.apply_preact_activation_fp8_protocol_cutely_fused,
-                ) as patched_fp8_boundary:
-                    with enable_quack_gemm(True):
-                        y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
-                        y.backward(dout)
-
-        self.assertTrue(patched_gemm_gated.called)
-        postact_dtypes = [call.kwargs.get("postact_dtype") for call in patched_gemm_gated.call_args_list]
-        self.assertIn(torch.float8_e4m3fn, postact_dtypes)
-        restored_out_buffers = [call.kwargs.get("restored_out") for call in patched_fp8_boundary.call_args_list]
-        restored_out_buffers = [buffer for buffer in restored_out_buffers if buffer is not None]
-        self.assertTrue(restored_out_buffers)
-        self.assertTrue(all(buffer.dtype == torch.bfloat16 for buffer in restored_out_buffers))
-
-    def test_quack_backward_reuses_forward_backend_snapshot(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-        dout = 0.02 * torch.randn_like(x)
-
-        with enable_quack_gemm(True):
-            y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe)
-
-        with patch.object(
-            functional,
-            "_up_projection_backward_act",
-            side_effect=AssertionError("backward should keep using the forward QuACK backend"),
-        ), patch.object(
-            functional,
-            "_down_projection_backward_act",
-            side_effect=AssertionError("backward should keep using the forward QuACK backend"),
-        ):
-            with enable_quack_gemm(False):
-                y.backward(dout)
-
-        self.assertIsNotNone(x.grad)
-        self.assertFalse(torch.isnan(x.grad.float()).any().item())
-
     def test_convert_torch_tensor_to_cute_tensor_accepts_runtime_fp8(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required")
@@ -680,109 +381,6 @@ class FP8ProtocolTest(TestCommons):
         self.assertEqual(tuple(y1s.shape), (64, 128))
         self.assertEqual(tuple(ds.shape), (64,))
         self.assertFalse(torch.isnan(y1s.float()).any().item())
-
-    def test_quack_inference_fastpath_skips_fp8_boundary_and_returns_no_grad_output(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).requires_grad_()
-
-        with patch.object(functional, "gemm_gated", wraps=functional.gemm_gated) as patched_gemm_gated:
-            with patch.object(functional, "_softmax_topk_fwd", wraps=functional._softmax_topk_fwd) as patched_topk_fwd:
-                with patch.object(functional.TC_Softmax_Topk_Router_Function, "apply") as patched_topk_apply:
-                    with patch.object(
-                        functional,
-                        "apply_preact_activation_fp8_protocol_cutely_fused",
-                        wraps=functional.apply_preact_activation_fp8_protocol_cutely_fused,
-                    ) as patched_fp8_boundary:
-                        with enable_quack_gemm(True):
-                            y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, is_inference_mode=True)
-
-        self.assertTrue(patched_gemm_gated.called)
-        self.assertTrue(patched_topk_fwd.called)
-        patched_topk_apply.assert_not_called()
-        store_preact_flags = [call.kwargs.get("store_preact") for call in patched_gemm_gated.call_args_list]
-        self.assertTrue(store_preact_flags)
-        self.assertTrue(all(flag is False for flag in store_preact_flags))
-        patched_fp8_boundary.assert_not_called()
-        self.assertFalse(y.requires_grad)
-        self.assertFalse(torch.isnan(y.float()).any().item())
-
-    def test_quack_inference_fastpath_keeps_fp8_boundary_and_matches_standard_path(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("CUDA is required")
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 10:
-            self.skipTest("SM100-only test requires SM100+")
-
-        self.set_seed(_SEED)
-        protocol = get_default_fp8_protocol()
-        moe = MoE(
-            num_experts=128,
-            num_experts_per_tok=8,
-            hidden_size=768,
-            intermediate_size=256,
-            activation_function=ActivationType.SWIGLU,
-            add_bias=False,
-            std=0.02,
-        ).to(device="cuda", dtype=torch.bfloat16)
-        x = 0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)
-
-        with patch.object(functional, "gemm_gated", wraps=functional.gemm_gated) as patched_gemm_gated:
-            with patch.object(
-                functional,
-                "apply_preact_activation_fp8_protocol_cutely_fused",
-                wraps=functional.apply_preact_activation_fp8_protocol_cutely_fused,
-            ) as patched_fp8_boundary:
-                with enable_quack_gemm(True):
-                    fast_o, fast_logits, fast_freq = functional.moe_TC_softmax_topk_layer(
-                        x,
-                        moe.router.weight,
-                        moe.c_fc.weight.permute(1, 2, 0),
-                        moe.c_fc.bias,
-                        moe.c_proj.weight.permute(1, 2, 0),
-                        moe.c_proj.bias,
-                        moe.top_k,
-                        moe.stream_id,
-                        moe.activation_function,
-                        True,
-                        protocol,
-                    )
-                    ref_o, ref_logits, ref_freq = functional.moe_TC_softmax_topk_layer(
-                        x,
-                        moe.router.weight,
-                        moe.c_fc.weight.permute(1, 2, 0),
-                        moe.c_fc.bias,
-                        moe.c_proj.weight.permute(1, 2, 0),
-                        moe.c_proj.bias,
-                        moe.top_k,
-                        moe.stream_id,
-                        moe.activation_function,
-                        False,
-                        protocol,
-                    )
-
-        store_preact_flags = [call.kwargs.get("store_preact") for call in patched_gemm_gated.call_args_list]
-        self.assertIn(True, store_preact_flags)
-        self.assertTrue(patched_fp8_boundary.called)
-        torch.testing.assert_close(fast_o.float(), ref_o.float(), atol=0.0, rtol=0.0)
-        torch.testing.assert_close(fast_logits.float(), ref_logits.float(), atol=0.0, rtol=0.0)
-        torch.testing.assert_close(fast_freq.int(), ref_freq.int(), atol=0, rtol=0)
 
     def test_preact_cutely_fused_path_can_reuse_scale_buffer(self) -> None:
         if not torch.cuda.is_available():

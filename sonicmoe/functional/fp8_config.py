@@ -57,14 +57,6 @@ def _use_epilogue_quant() -> bool:
     return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
-def _use_fused_swiglu_quant() -> bool:
-    """Check if fused SwiGLU+quantize kernels are enabled (default: enabled)."""
-    cfg = get_active_config()
-    if cfg is not None and cfg.fused_swiglu_quant is not None:
-        return cfg.fused_swiglu_quant
-    return os.getenv("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1").lower() in {"1", "true", "yes", "on"}
-
-
 def _use_fp8_wgrad() -> bool | None:
     """Check if FP8 weight gradients are enabled.
 
@@ -95,14 +87,6 @@ def _recompute_z() -> bool:
     if cfg is not None and cfg.recompute_z is not None:
         return cfg.recompute_z
     return os.getenv("SONIC_MOE_FP8_RECOMPUTE_Z", "0").lower() in {"1", "true", "yes", "on"}
-
-
-def _use_fused_blockscaled_gated() -> bool:
-    """Check if fused gemm_gated + blockscaled FP8 is enabled (default: enabled)."""
-    cfg = get_active_config()
-    if cfg is not None and cfg.fused_gated is not None:
-        return cfg.fused_gated
-    return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fuse_y1_quant() -> bool:
@@ -152,7 +136,7 @@ class _FP8Config:
     Instances are cheap (no tensors), picklable, stored on autograd ctx.
     """
     __slots__ = (
-        "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
+        "enabled", "save_z_fp8", "recompute_z",
         "epilogue_quant", "_fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
         "iso32_weight", "swiglu_clamp_value", "fuse_y1_quant", "fuse_y1_bf16_trunc",
         "fused_weight_layout", "situ_beta", "situ_linear_beta",
@@ -161,10 +145,8 @@ class _FP8Config:
 
     def __init__(self) -> None:
         self.enabled: bool = _fp8_enabled()
-        self.fused_gated: bool = _use_fused_blockscaled_gated()
         self.save_z_fp8: bool = _save_z_fp8()
         self.recompute_z: bool = _recompute_z()
-        self.fused_swiglu_quant: bool = _use_fused_swiglu_quant()
         self.epilogue_quant: bool = _use_epilogue_quant()
         self._fp8_wgrad_setting = _use_fp8_wgrad()  # True/False/None
         self._fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
@@ -211,10 +193,8 @@ class _FP8Config:
         """Return a config where everything is off (BF16 path)."""
         cfg = _FP8Config.__new__(_FP8Config)
         cfg.enabled = False
-        cfg.fused_gated = False
         cfg.save_z_fp8 = False
         cfg.recompute_z = False
-        cfg.fused_swiglu_quant = False
         cfg.epilogue_quant = False
         cfg.fp8_wgrad = False
         cfg._fp8_wgrad_setting = False

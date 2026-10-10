@@ -82,8 +82,7 @@ def run_nsys(shape: Shape, gpu: int, warmup: int, iters: int, out_dir: Path) -> 
     env["USE_QUACK_GEMM"] = "1"
     env["SONIC_MOE_FP8_MODE"] = "perf"
     env["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
-    # Frontier knobs (epilogue maingrad add + fused swiglu quant + fp8 wgrad on by default).
-    env.setdefault("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1")
+    # Frontier knobs (epilogue maingrad add + fp8 wgrad on by default).
     env.setdefault("SONIC_MOE_FP8_SAVE_Z_FP8", "1")
     env.setdefault("SONIC_MOE_FP8_ASSUME_ALIGNED", "1")
     # Defensive: drop paddle distributed envs.

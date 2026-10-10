@@ -75,7 +75,7 @@ def _nonuniform_matrix(torch, rows, cols, *, phase):
 def test_non_aligned_wgrad_segments_fresh_add_beta(torch):
     if not _sm90(torch):
         pytest.skip("requires exact SM90")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
 
     torch.manual_seed(9191)
@@ -115,7 +115,7 @@ def test_non_aligned_wgrad_segments_fresh_add_beta(torch):
 def test_scaled_profiles_empty_experts_fresh_accumulate_add(torch, profile):
     if not _sm90(torch):
         pytest.skip("requires exact SM90")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
     quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
 
@@ -171,7 +171,7 @@ def test_scaled_profiles_empty_experts_fresh_accumulate_add(torch, profile):
 def test_sm90_profile128_down_production_oracle(torch, source_rows, hidden):
     if not _sm90(torch):
         pytest.skip("requires exact SM90")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
     quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
 
@@ -247,7 +247,7 @@ def test_sm90_raw_gated_epilogue_matrix(torch, profile, z_quant, y1_quant, monke
         pytest.skip("requires exact SM90")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
     quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
-    reference = importlib.import_module("sonicmoe.functional.sm90_reference")
+    reference = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     rows, hidden, width = 128, 128, 256
     torch.manual_seed(8000 + profile + z_quant * 3 + y1_quant)
     a_bf16 = torch.randn((rows, hidden), device="cuda", dtype=torch.bfloat16)
@@ -311,7 +311,7 @@ def test_sm90_raw_gated_epilogue_matrix(torch, profile, z_quant, y1_quant, monke
 def test_sm90_dgated_is_independent_of_output_storage(torch, profile):
     if not _sm90(torch):
         pytest.skip("requires exact SM90")
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
     quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
 
@@ -379,7 +379,76 @@ def test_sm90_dgated_is_independent_of_output_storage(torch, profile):
     ],
 )
 def test_colwise_offsets_contract(torch, offsets, total_k, error):
-    ref = importlib.import_module("sonicmoe.functional.sm90_reference")
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
     tensor = torch.tensor(offsets, dtype=torch.int32)
     with pytest.raises(ValueError, match=error):
         ref._validated_colwise_offsets(tensor, total_k)
+
+
+def test_dynamic_shapes_compile_once(torch, monkeypatch):
+    """T, TK and packed wgrad K change every MoE step; each kernel compiles once."""
+    if not _sm90(torch):
+        pytest.skip("requires exact SM90")
+    monkeypatch.delenv("SONIC_MOE_DISABLE_SM90_SCALED_TVM_FFI", raising=False)
+    ref = importlib.import_module("sonicmoe.quack_utils.sm90_funcs")
+    scaled = importlib.import_module("sonicmoe.quack_utils.gemm_sm90_scaled")
+    quant = importlib.import_module("sonicmoe.quack_utils.blockscaled_fp8_gemm")
+    compiled = scaled._compile_sm90_scaled_tvm_ffi
+    keys = lambda name: {key for key in compiled.cache if key[0] == name}
+    gemm_keys, gated_keys, wgrad_keys = (
+        keys(name) for name in ("Sm90ScaledGemm", "Sm90ScaledGated", "Sm90ScaledWgradVarlenK")
+    )
+
+    hidden, width, experts = 256, 256, 4
+    weight = torch.stack(
+        [_nonuniform_matrix(torch, width, hidden, phase=5.0 + e * 7) for e in range(experts)]
+    )
+    weight_data, weight_scales = ref.quantize_weight_sm90(weight, 32)
+    weight_dequant = ref.dequantize_weight_sm90(weight_data, weight_scales, 32)
+    for step, (tokens, counts) in enumerate(
+        [(271, [35, 0, 77, 48]), (160, [1, 64, 3, 129]), (513, [200, 200, 0, 100])]
+    ):
+        offsets_host = [0]
+        for count in counts:
+            offsets_host.append(offsets_host[-1] + count)
+        routed = offsets_host[-1]
+        offsets = torch.tensor(offsets_host, dtype=torch.int32, device="cuda")
+        route = ((torch.arange(routed, device="cuda") * 37 + step) % tokens).to(torch.int32)
+        source = _nonuniform_matrix(torch, tokens, hidden, phase=3.0 + step)
+        data, scales = quant.quantize_activation_blockscaled_fast(source, group_size=32)
+        source_dequant = ref.materialize_activation_sm90(data, scales, 32)
+        expected = torch.zeros((routed, width), dtype=torch.float32, device="cuda")
+        for expert, (start, end) in enumerate(zip(offsets_host, offsets_host[1:])):
+            if start != end:
+                expected[start:end] = (
+                    source_dequant[route[start:end].long()].float() @ weight_dequant[expert].float().mT
+                )
+        output = torch.empty((routed, width), dtype=torch.bfloat16, device="cuda")
+        scaled.sm90_scaled_gemm(
+            data, weight_data, output, scales, weight_scales, cu_seqlens_m=offsets, A_idx=route,
+            activation_group=32, weight_block=32, activation_scale_order="source",
+        )
+        assert _calc_diff(torch, output, expected) < 5e-5
+
+        z = torch.empty((routed, width), dtype=torch.bfloat16, device="cuda")
+        y1 = torch.empty((routed, width // 2), dtype=torch.bfloat16, device="cuda")
+        scaled.sm90_scaled_gated(
+            data, weight_data, z, y1, scales, weight_scales, cu_seqlens_m=offsets, A_idx=route,
+            activation_group=32, weight_block=32, activation_scale_order="source",
+        )
+        assert _calc_diff(torch, z, expected) < 5e-5
+
+        a_source = _nonuniform_matrix(torch, routed, 64, phase=11.0 + step)
+        b_source = _nonuniform_matrix(torch, routed, 96, phase=13.0 + step)
+        a, sa, packed = ref.quantize_wgrad_colwise_sm90(a_source, offsets)
+        b, sb, _ = ref.quantize_wgrad_colwise_sm90(b_source, offsets)
+        d = torch.empty((experts, 64, 96), dtype=torch.float32, device="cuda")
+        scaled.sm90_scaled_wgrad_varlen_k(a, b, d, sa, sb, packed)
+        _assert_wgrad_close(torch, d, _wgrad_reference(torch, a, b, sa, sb, packed))
+
+    for name, before in (
+        ("Sm90ScaledGemm", gemm_keys), ("Sm90ScaledGated", gated_keys),
+        ("Sm90ScaledWgradVarlenK", wgrad_keys),
+    ):
+        assert len(keys(name) - before) <= 1, f"{name} recompiled for new shapes"
+        assert keys(name), f"{name} did not use the TVM-FFI compile cache"

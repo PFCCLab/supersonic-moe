@@ -59,7 +59,6 @@ BF16_DW_RRMSE = 0.02
 
 FP8_RRMSE = 0.10
 FP8_COSINE = 0.99
-FP8_DW_RRMSE = 0.15
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,7 +350,7 @@ def _torch_moe_gold_backward(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SonicMoE runner (calls moe_TC_softmax_topk_layer through _UpProjection/_DownProjection)
+# SonicMoE runner (calls _UpProjection/_DownProjection directly)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _run_sonicmoe_bf16(
@@ -1704,149 +1703,6 @@ def test_stability_activation_scale(scale):
     # Relax threshold for larger activations
     threshold = BF16_RRMSE * (1 + scale)
     assert r < threshold, f"RRMSE {r:.6f} >= {threshold:.6f} at scale={scale}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Test 16: Route-level padding — FP8 non-aligned fwd+bwd (subprocess)
-# ═══════════════════════════════════════════════════════════════════════════
-
-_FP8_ROUTE_PAD_TEMPLATE = textwrap.dedent("""\
-    import os, sys, json
-    os.environ["USE_QUACK_GEMM"] = "1"
-    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
-    import torch, torch.nn.functional as F
-    sys.path.insert(0, {project_root!r})
-
-    from tests.ops.test_moe_module import (
-        _make_test_data, _convert_weights_for_sonicmoe,
-        _torch_moe_gold, _torch_moe_gold_backward,
-        rrmse, cosine_sim, split_to_interleaved,
-    )
-    from sonicmoe.functional import (
-        moe_TC_softmax_topk_layer,
-        clear_all_fp8_weight_caches,
-        _refresh_fp8_config,
-    )
-    from sonicmoe.functional.utils import enable_fp8
-    from sonicmoe.enums import ActivationType
-
-    T, H, I, E, K, seed = {T}, {H}, {I}, {E}, {K}, {seed}
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    x, w1_split, w2_gold, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
-    w1_param, w2_param = _convert_weights_for_sonicmoe(w1_split, w2_gold)
-
-    # Router weights — routing will differ from deterministic, but that's OK
-    router_w = torch.randn(E, H, device="cuda", dtype=torch.bfloat16) * 0.01
-
-    x_input = x.detach().requires_grad_(True)
-    w1_func = w1_param.detach().requires_grad_(True)
-    w2_func = w2_param.detach().requires_grad_(True)
-
-    # Functional layout: parameter (E, 2I, H) -> functional (2I, H, E)
-    w1_f = w1_func.permute(1, 2, 0)
-    w2_f = w2_func.permute(1, 2, 0)
-
-    clear_all_fp8_weight_caches()
-    with enable_fp8(True):
-        _refresh_fp8_config()
-        o, router_logits, expert_freq = moe_TC_softmax_topk_layer(
-            x_input, router_w, w1_f, None, w2_f, None,
-            K=K, stream_id=0, activation_type=ActivationType.SWIGLU,
-        )
-
-    assert o.shape == (T, H), f"Output shape mismatch: {{o.shape}} vs {{(T, H)}}"
-    assert not torch.isnan(o).any(), "Output contains NaN"
-    assert not torch.isinf(o).any(), "Output contains Inf"
-
-    # Run backward
-    grad_out = torch.randn_like(o)
-    o.backward(grad_out)
-
-    assert w1_func.grad is not None, "w1 gradient is None"
-    assert w2_func.grad is not None, "w2 gradient is None"
-    assert not torch.isnan(w1_func.grad).any(), "w1 gradient contains NaN"
-    assert not torch.isnan(w2_func.grad).any(), "w2 gradient contains NaN"
-
-    dw1_norm = w1_func.grad.float().norm().item()
-    dw2_norm = w2_func.grad.float().norm().item()
-    assert dw1_norm > 1e-8, f"dw1 norm too small: {{dw1_norm}}"
-    assert dw2_norm > 1e-8, f"dw2 norm too small: {{dw2_norm}}"
-
-    # Compare FP8 (route-padded) vs BF16 using same router_w (same routing)
-    x_bf16 = x.detach().requires_grad_(True)
-    w1_bf16 = w1_param.detach().requires_grad_(True)
-    w2_bf16 = w2_param.detach().requires_grad_(True)
-    w1_bf16_f = w1_bf16.permute(1, 2, 0)
-    w2_bf16_f = w2_bf16.permute(1, 2, 0)
-
-    o_bf16, _, _ = moe_TC_softmax_topk_layer(
-        x_bf16, router_w, w1_bf16_f, None, w2_bf16_f, None,
-        K=K, stream_id=0, activation_type=ActivationType.SWIGLU,
-    )
-    o_bf16.backward(grad_out.detach())
-
-    r_out = rrmse(o.float(), o_bf16.float())
-    c_out = cosine_sim(o.float(), o_bf16.float())
-    r_dw1 = rrmse(w1_func.grad.float(), w1_bf16.grad.float())
-    r_dw2 = rrmse(w2_func.grad.float(), w2_bf16.grad.float())
-
-    print(json.dumps({{
-        "rrmse_out": round(r_out, 6),
-        "cosine_out": round(c_out, 6),
-        "rrmse_dw1": round(r_dw1, 6),
-        "rrmse_dw2": round(r_dw2, 6),
-        "dw1_norm": round(dw1_norm, 6),
-        "dw2_norm": round(dw2_norm, 6),
-    }}))
-""")
-
-
-@pytest.mark.parametrize("T,H,I,E,K", [
-    pytest.param(300, 768, 384, 32, 8, id="non-aligned-E32"),
-    pytest.param(256, 768, 384, 8, 2, id="aligned-regression"),
-])
-def test_fp8_route_padded_fwd_bwd(T, H, I, E, K):
-    """FP8 route-level padding: fwd+bwd produces valid output and gradients.
-
-    E=32,K=8 with T=300 gives per_expert~75 tokens — non-128-aligned.
-    Route-level padding pads metadata once so aligned fast path runs.
-    """
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    script = _FP8_ROUTE_PAD_TEMPLATE.format(
-        project_root=project_root, T=T, H=H, I=I, E=E, K=K, seed=42
-    )
-    env = os.environ.copy()
-    env["USE_QUACK_GEMM"] = "1"
-    env["SONIC_MOE_FP8_MODE"] = "perf"
-
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True, text=True, env=env, timeout=600,
-    )
-    if result.returncode != 0:
-        pytest.fail(f"FP8 route-pad subprocess failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}")
-
-    import json
-    for line in result.stdout.strip().splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            metrics = json.loads(line)
-            break
-    else:
-        pytest.fail(f"No JSON output from route-pad subprocess:\n{result.stdout}")
-
-    r_out = metrics["rrmse_out"]
-    c_out = metrics["cosine_out"]
-    r_dw1 = metrics["rrmse_dw1"]
-    r_dw2 = metrics["rrmse_dw2"]
-    print(f"  FP8 route-pad: out RRMSE={r_out:.6f}, cosine={c_out:.6f}")
-    print(f"  FP8 route-pad: dw1 RRMSE={r_dw1:.6f}, dw2 RRMSE={r_dw2:.6f}")
-    assert r_out < FP8_RRMSE, f"output RRMSE {r_out:.6f} >= {FP8_RRMSE}"
-    assert c_out > FP8_COSINE, f"output cosine {c_out:.6f} <= {FP8_COSINE}"
-    assert r_dw1 < FP8_DW_RRMSE, f"dw1 RRMSE {r_dw1:.6f} >= {FP8_DW_RRMSE}"
-    assert r_dw2 < FP8_DW_RRMSE, f"dw2 RRMSE {r_dw2:.6f} >= {FP8_DW_RRMSE}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

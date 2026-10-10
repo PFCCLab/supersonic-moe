@@ -2,8 +2,10 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/hopper/dense_gemm.py
 
 import enum
+import os
 import threading
 import time
+from pathlib import Path
 from typing import Tuple, Type, Callable, Optional, Union, Literal, NamedTuple
 from functools import partial
 import math
@@ -28,7 +30,10 @@ from cutlass.utils import LayoutEnum
 
 from dataclasses import dataclass
 
+import quack.cache_utils as cache_utils
+from quack.cache_utils import EXTRA_SOURCE_DIRS, jit_cache
 from quack.cute_dsl_utils import ParamsBase
+from quack.gemm_tvm_ffi_utils import make_fake_scheduler_args, make_scheduler_args, make_varlen_args
 from quack.tile_scheduler import (
     TileSchedulerOptions,
     TileSchedulerArguments,
@@ -1313,9 +1318,26 @@ class _GemmSm90RawScaledBase:
         peek = Boolean(True)
         if 0 < k_tile_cnt:
             peek = ab_pipeline.consumer_try_wait(ab_read_state)
+        # Accumulator element i of this thread lies in
+        #   row = (i // 64) * 8 + ((i // 2) % 2) * 8 + lane_row
+        #   col span (i // 8) * 16 + lane_col   (outside varlen-K)
+        # Outside varlen-K a partial therefore needs only 2 * ceil(n / 64) A
+        # scales and one B scale per weight block touched (weight_block >= 32).
+        num_acc = const_expr(cute.size(acc))
+        num_a_scales = const_expr(2 * cute.ceil_div(num_acc, 64))
+        # When the warpgroup's column span starts on a weight-block boundary,
+        # the 16-column groups of one weight block share a single B scale.
+        b_block_aligned = const_expr(
+            self.atom_layout_mnk[1] == 1
+            and self.cta_tile_shape_mnk[1] % self.weight_block == 0
+        )
+        num_b_scales = const_expr(
+            cute.ceil_div((num_acc // 8) * 16, self.weight_block)
+            if b_block_aligned
+            else num_acc // 8
+        )
         for k_tile in cutlass.range(k_tile_cnt, unroll=1):
             ab_pipeline.consumer_wait(ab_read_state, peek)
-            k_group = k_tile
             for inst in cutlass.range_constexpr(self.scale_partials_per_tile):
                 acc.fill(0.0)
                 warpgroup.fence()
@@ -1329,85 +1351,110 @@ class _GemmSm90RawScaledBase:
                     acc,
                 )
                 warpgroup.commit_group()
-                warpgroup.wait_group(0)
-                for i in cutlass.range_constexpr(cute.size(acc)):
-                    value = i % 64
-                    value_m = (i % 4) + (i // 64) * 4
-                    row_in_atom = (
-                        (value_m // 4) * 8
-                        + (mma_group_tidx % 32) // 4
-                        + ((value_m // 2) % 2) * 8
+                if const_expr(varlen_k):
+                    # Wgrad: every K=32 partial has its own scale column
+                    # (scale_k_offset is expert_start/32), and A/B scales are
+                    # per output row/column, so each element reads its own pair.
+                    warpgroup.wait_group(0)
+                    scale_a_k = scale_k_offset + k_tile * self.scale_partials_per_tile + inst
+                    scale_a_k = (
+                        scale_a_k if scale_a_k < mSFA_raw.shape[1] else mSFA_raw.shape[1] - 1
                     )
-                    col_in_atom = (i % 2) + ((i // 4) % 2) * 8 + (mma_group_tidx % 4) * 2
-                    if const_expr(not varlen_k):
-                        col_in_atom = (
-                            (i % 2) + ((i // 2) % 2) * 8 + (mma_group_tidx % 4) * 2
-                        )
-                    m_abs = (
-                        scale_m_offset
-                        + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
-                        + warp_group_idx * (64 // self.atom_layout_mnk[1])
-                        + (mma_group_tidx // 32) * 16
-                        + row_in_atom
+                    scale_b_k = (
+                        scale_a_k if scale_a_k < mSFB_raw.shape[1] else mSFB_raw.shape[1] - 1
                     )
-                    n_abs = (
-                        tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
-                        + warp_group_idx * (64 if self.atom_layout_mnk[1] > 1 else 0)
-                        + col_in_atom
-                        + (i // 8) * 16
+                    for i_hi in cutlass.range_constexpr(num_acc // 8):
+                        for i_lo in cutlass.range_constexpr(8):
+                            i = i_hi * 8 + i_lo
+                            row_in_atom = (
+                                (i // 64) * 8 + (mma_group_tidx % 32) // 4 + ((i // 2) % 2) * 8
+                            )
+                            col_in_atom = (
+                                (i % 2) + ((i // 4) % 2) * 8 + (mma_group_tidx % 4) * 2
+                            )
+                            m_abs = (
+                                scale_m_offset
+                                + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                                + warp_group_idx * (64 // self.atom_layout_mnk[1])
+                                + (mma_group_tidx // 32) * 16
+                                + row_in_atom
+                            )
+                            m_safe = m_abs if m_abs < mSFA_raw.shape[0] else Int32(0)
+                            # The second WGMMA operand is the logical output-N
+                            # scale; its accumulator coordinate follows the
+                            # transposed MMA value layout.
+                            b_coord = (
+                                tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+                                + col_in_atom
+                                + (i // 8) * 16
+                            )
+                            b_safe = b_coord if b_coord < mSFB_raw.shape[0] else Int32(0)
+                            scale = self.decode_ue8m0(
+                                mSFA_raw[m_safe, scale_a_k]
+                            ) * self.decode_ue8m0(mSFB_raw[b_safe, scale_b_k])
+                            acc_slow[i] = acc_slow[i] + acc[i] * scale
+                else:
+                    # Scale loads are issued while the WGMMA is in flight; all K=32
+                    # partials of a profile-128 K tile share one scale column.
+                    scale_a_k = scale_k_offset + k_tile
+                    scale_a_k = (
+                        scale_a_k if scale_a_k < mSFA_raw.shape[1] else mSFA_raw.shape[1] - 1
+                    )
+                    scale_b_k = (
+                        scale_a_k if scale_a_k < mSFB_raw.shape[1] else mSFB_raw.shape[1] - 1
                     )
                     # Manual scale LDGs are not TMA-predicated. Phantom rows or
                     # columns in skewed edge tiles therefore use a safe scale;
                     # the corresponding D element is discarded by the epilogue.
-                    m_safe = m_abs if m_abs < mSFA_raw.shape[0] else Int32(0)
-                    n_block = n_abs
-                    if const_expr(not varlen_k):
-                        n_block = n_abs // self.weight_block
-                    n_safe = n_block if n_block < mSFB_raw.shape[0] else Int32(0)
-                    # Wgrad scale columns are native WGMMA K=32 groups and
-                    # scale_k_offset is expert_start/32. Other profile-128 GEMMs
-                    # retain one scale for all four partials in their K=128 tile.
-                    scale_k_group = scale_k_offset + k_group
-                    if const_expr(varlen_k):
-                        scale_k_group = (
-                            scale_k_offset + k_group * self.scale_partials_per_tile + inst
+                    a_scales = []
+                    for r in cutlass.range_constexpr(num_a_scales):
+                        m_abs = (
+                            scale_m_offset
+                            + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                            + warp_group_idx * (64 // self.atom_layout_mnk[1])
+                            + (mma_group_tidx // 32) * 16
+                            + (r // 2) * 8
+                            + (mma_group_tidx % 32) // 4
+                            + (r % 2) * 8
                         )
-                    scale_k_group = (
-                        scale_k_group
-                        if scale_k_group < mSFA_raw.shape[1]
-                        else mSFA_raw.shape[1] - 1
-                    )
-                    if const_expr(cute.rank(mSFA_raw) == 3):
-                        scale_a_raw = mSFA_raw[m_safe, scale_k_group, batch_idx]
-                    else:
-                        scale_a_raw = mSFA_raw[m_safe, scale_k_group]
-                    b_coord = n_safe
-                    if const_expr(varlen_k):
-                        # The second WGMMA operand is the logical output-N scale.
-                        # For varlen-K its accumulator coordinate follows the
-                        # transposed MMA value layout while A remains output-M.
-                        b_coord = (
-                            tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
-                            + col_in_atom
-                            + (i // 8) * 16
-                        )
-                        b_coord = b_coord if b_coord < mSFB_raw.shape[0] else Int32(0)
-                    if const_expr(cute.rank(mSFB_raw) == 3):
-                        scale_b_k = (
-                            scale_k_group
-                            if scale_k_group < mSFB_raw.shape[1]
-                            else mSFB_raw.shape[1] - 1
-                        )
-                        scale_b_raw = mSFB_raw[b_coord, scale_b_k, batch_idx]
-                    else:
-                        scale_b_k = (
-                            scale_k_group
-                            if scale_k_group < mSFB_raw.shape[1]
-                            else mSFB_raw.shape[1] - 1
-                        )
-                        scale_b_raw = mSFB_raw[b_coord, scale_b_k]
-                    scale = self.decode_ue8m0(scale_a_raw) * self.decode_ue8m0(scale_b_raw)
-                    acc_slow[i] = acc_slow[i] + acc[i] * scale
+                        m_safe = m_abs if m_abs < mSFA_raw.shape[0] else Int32(0)
+                        if const_expr(cute.rank(mSFA_raw) == 3):
+                            raw = mSFA_raw[m_safe, scale_a_k, batch_idx]
+                        else:
+                            raw = mSFA_raw[m_safe, scale_a_k]
+                        a_scales.append(self.decode_ue8m0(raw))
+                    b_scales = []
+                    for c in cutlass.range_constexpr(num_b_scales):
+                        if const_expr(b_block_aligned):
+                            b_coord = (
+                                tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+                            ) // self.weight_block + c
+                        else:
+                            b_coord = (
+                                tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+                                + warp_group_idx * (64 if self.atom_layout_mnk[1] > 1 else 0)
+                                + (mma_group_tidx % 4) * 2
+                                + c * 16
+                            ) // self.weight_block
+                        b_safe = b_coord if b_coord < mSFB_raw.shape[0] else Int32(0)
+                        if const_expr(cute.rank(mSFB_raw) == 3):
+                            raw = mSFB_raw[b_safe, scale_b_k, batch_idx]
+                        else:
+                            raw = mSFB_raw[b_safe, scale_b_k]
+                        b_scales.append(self.decode_ue8m0(raw))
+                    warpgroup.wait_group(0)
+                    # Nested static loops: a flat 64-iteration range_constexpr triggers
+                    # DSLOptimizationWarning, and cutlass.range(..., unroll_full=True)
+                    # measured slower here.
+                    for i_hi in cutlass.range_constexpr(num_acc // 8):
+                        for i_lo in cutlass.range_constexpr(8):
+                            i = i_hi * 8 + i_lo
+                            a_scale = a_scales[(i // 2) % 2 + (i // 64) * 2]
+                            if const_expr(b_block_aligned):
+                                b_scale = b_scales[(i // 8) * 16 // self.weight_block]
+                            else:
+                                b_scale = b_scales[i // 8]
+                            acc_slow[i] = acc_slow[i] + acc[i] * (a_scale * b_scale)
             ab_pipeline.consumer_release(ab_release_state)
             ab_read_state.advance()
             ab_release_state.advance()
@@ -2072,8 +2119,8 @@ class _GemmSm90RawScaledBase:
         """
         a_smem_shape = cute.slice_(cta_tile_shape_mnk, (None, 0, None))
 
-        a_is_k_major = a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
-        b_is_k_major = b_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
+        a_is_k_major = a_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K
+        b_is_k_major = b_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K
         a_major_mode_size = cta_tile_shape_mnk[2 if a_is_k_major else 0]
         a_smem_layout_atom = warpgroup.make_smem_layout_atom(
             sm90_utils.get_smem_layout_atom(a_layout, a_dtype, a_major_mode_size),
@@ -2145,7 +2192,7 @@ class _GemmSm90RawScaledBase:
             if op_type == "load"
             else cpasync.CopyBulkTensorTileS2GOp()
             if op_type == "store"
-            else cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionOp.ADD)
+            else cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionKind.ADD)
         )
         tma_atom_d, tma_tensor_d = cpasync.make_tiled_tma_atom(
             op, tensor_d, epi_smem_layout, d_cta_v_layout
@@ -2381,14 +2428,103 @@ class Sm90ScaledRecomputeZ(Sm90ScaledGemm):
     """Scaled gather/varlen-M recompute kernel."""
 
 
+_SONIC_QUACK_UTILS_DIR = Path(__file__).resolve().parent
+if _SONIC_QUACK_UTILS_DIR not in EXTRA_SOURCE_DIRS:
+    # The kernels live here, so their sources must be in the jit_cache fingerprint.
+    EXTRA_SOURCE_DIRS.append(_SONIC_QUACK_UTILS_DIR)
+
+# Compile cache of the from_dlpack fallback (SONIC_MOE_DISABLE_SM90_SCALED_TVM_FFI=1).
+# The default TVM-FFI path is cached by ``_compile_sm90_scaled_tvm_ffi``.
 _SM90_SCALED_CACHE = InstrumentedCompileCache("sm90_raw_ue8m0_scaled")
 
-
-def _raw_stream():
-    stream = torch.cuda.current_stream()
-    return cuda.CUstream(
-        stream.stream_base.raw_stream if hasattr(stream, "stream_base") else stream.cuda_stream
+_SM90_SCALED_CLASSES = {
+    cls.__name__: cls
+    for cls in (
+        Sm90ScaledGemm, Sm90ScaledGated, Sm90ScaledDGated, Sm90ScaledGatedZQuant,
+        Sm90ScaledGatedY1Quant, Sm90ScaledGatedZY1Quant, Sm90ScaledGatedRawQuant,
+        Sm90ScaledDGatedFP8PreAct, Sm90ScaledWgradVarlenK, Sm90ScaledRecomputeZ,
     )
+}
+
+# Constexpr epilogue callables are passed by name so compile keys stay picklable.
+_EPI_FUNCS = {
+    "swiglu_precise": quack.activation.swiglu_precise,
+    "dswiglu_precise": quack.activation.dswiglu_precise,
+}
+_EPI_FUNC_FIELDS = ("act_fn", "act_bwd_fn")
+# Runtime (non-Constexpr) Float32 epilogue scalars.
+_EPI_SCALAR_FIELDS = ("alpha", "beta")
+
+_CUTE_DTYPES = {
+    "float8_e4m3fn": cutlass.Float8E4M3FN,
+    "bfloat16": cutlass.BFloat16,
+    "float16": cutlass.Float16,
+    "float32": cutlass.Float32,
+    "uint8": cutlass.Uint8,
+    "int32": cutlass.Int32,
+}
+
+_GEMM_DIMS = {
+    "A": ("m", "k", "l"), "B": ("n", "k", "l"),
+    "D": ("m", "n", "l"), "C": ("m", "n", "l"),
+}
+
+
+def _dtype_name(dtype):
+    # str() covers torch and paddle-compat dtypes ("torch.bfloat16", "paddle.bfloat16").
+    return str(dtype).rsplit(".", 1)[-1]
+
+
+def _tvm_ffi_enabled():
+    return os.getenv("SONIC_MOE_DISABLE_SM90_SCALED_TVM_FFI", "0").lower() not in {
+        "1", "true", "yes", "on",
+    }
+
+
+_DEVICE_CAPABILITY = {}
+
+
+def _device_capability(device):
+    key = str(device)
+    cap = _DEVICE_CAPABILITY.get(key)
+    if cap is None:
+        cap = tuple(torch.cuda.get_device_capability(device)) if torch.cuda.is_available() else None
+        _DEVICE_CAPABILITY[key] = cap
+    return cap
+
+
+class _EpiTensor(NamedTuple):
+    """Epilogue tensor in kernel order (rank-3 permuted to (*, *, L))."""
+
+    tensor: object
+    leading_dim: int
+
+
+def _epi_operand(tensor, *, varlen_m=False, leading_dim=None):
+    if tensor is None:
+        return None
+    if tensor.ndim == 3 and not varlen_m:
+        tensor = tensor.permute(1, 2, 0)
+    if leading_dim is None:
+        unit = [index for index, stride in enumerate(tensor.stride()) if int(stride) == 1]
+        if not unit:
+            raise ValueError("epilogue tensors require a unit-stride dimension")
+        leading_dim = unit[-1]
+    return _EpiTensor(tensor.detach(), leading_dim)
+
+
+def _scale_operand(tensor):
+    # Raw carriers are produced as (batch, row, k_group), while the kernel
+    # indexes rank-3 scales as (row, k_group, batch), matching A/B tensors after
+    # GemmWrapperBase.permute_tensors.  Rank-2 scales remain row-major, so their
+    # unit-stride K-group dimension is leading dimension 1.
+    if tensor.ndim == 3:
+        tensor = tensor.permute(1, 2, 0)
+    unit_stride_dims = [index for index, stride in enumerate(tensor.stride()) if int(stride) == 1]
+    if not unit_stride_dims:
+        tensor = tensor.contiguous()
+        unit_stride_dims = [tensor.ndim - 1]
+    return _EpiTensor(tensor.detach(), unit_stride_dims[-1])
 
 
 def _prepare_fp8_operand(tensor, *, varlen_m=False, varlen_k=False):
@@ -2405,61 +2541,6 @@ def _prepare_fp8_operand(tensor, *, varlen_m=False, varlen_k=False):
     return tensor if tensor.stride(2) == 1 else tensor.contiguous()
 
 
-def _runtime_cute_tensor(tensor, leading_dim):
-    storage = tensor.detach()
-    dtype = tensor.dtype
-    if dtype == torch.float8_e4m3fn:
-        storage = storage.view(torch.uint8)
-    result = from_dlpack(storage, assumed_align=16)
-    if dtype == torch.float8_e4m3fn:
-        result.element_type = cutlass.Float8E4M3FN
-    return result.mark_layout_dynamic(leading_dim=leading_dim)
-
-
-def _scale_tensor(tensor, *, batched=False):
-    # Raw carriers are produced as (batch, row, k_group), while the kernel
-    # indexes rank-3 scales as (row, k_group, batch), matching A/B tensors after
-    # GemmWrapperBase.permute_tensors.  Rank-2 scales remain row-major, so their
-    # unit-stride K-group dimension is leading dimension 1.
-    if tensor.ndim == 3:
-        tensor = tensor.permute(1, 2, 0)
-    unit_stride_dims = [
-        index for index, stride in enumerate(tensor.stride()) if int(stride) == 1
-    ]
-    if not unit_stride_dims:
-        tensor = tensor.contiguous()
-        unit_stride_dims = [tensor.ndim - 1]
-    return from_dlpack(tensor.detach(), assumed_align=1).mark_layout_dynamic(
-        leading_dim=unit_stride_dims[-1]
-    )
-
-
-def _tensor_signature(tensor):
-    if tensor is None:
-        return None
-    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
-
-
-def _epi_tensor(tensor, *, varlen_m=False, leading_dim=None):
-    if tensor is None:
-        return None
-    if tensor.ndim == 3 and not varlen_m:
-        tensor = tensor.permute(1, 2, 0)
-    dtype = tensor.dtype
-    storage = tensor.detach()
-    if dtype == torch.float8_e4m3fn:
-        storage = storage.view(torch.uint8)
-    if leading_dim is None:
-        unit = [index for index, stride in enumerate(storage.stride()) if int(stride) == 1]
-        if not unit:
-            raise ValueError("epilogue tensors require a unit-stride dimension")
-        leading_dim = unit[-1]
-    result = from_dlpack(storage, assumed_align=16)
-    if dtype == torch.float8_e4m3fn:
-        result.element_type = cutlass.Float8E4M3FN
-    return result.mark_layout_dynamic(leading_dim=leading_dim)
-
-
 def _validate_profile(group_size, weight_block):
     profile = (int(group_size), int(weight_block))
     if profile not in ((32, 32), (128, 128)):
@@ -2471,7 +2552,8 @@ def _validate_public(A, B, D, a_scales, b_scales, group_size, weight_block):
     _validate_profile(group_size, weight_block)
     if not A.is_cuda or not B.is_cuda:
         raise ValueError("A and B must be CUDA tensors")
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(A.device)[0] != 9:
+    cap = _device_capability(A.device)
+    if cap is None or cap[0] != 9:
         raise RuntimeError("native SM90 scaled GEMM requires a Hopper CUDA device")
     if A.dtype != torch.float8_e4m3fn or B.dtype != torch.float8_e4m3fn:
         raise TypeError("A and B must remain torch.float8_e4m3fn operands")
@@ -2489,13 +2571,179 @@ def _validate_public(A, B, D, a_scales, b_scales, group_size, weight_block):
             raise TypeError(f"{name} must be a raw one-byte UE8M0 CUDA tensor")
 
 
+def _tensor_spec(operand):
+    """Shape-free compile spec of an _EpiTensor: (dtype name, rank, leading dim)."""
+    if operand is None:
+        return None
+    return (_dtype_name(operand.tensor.dtype), operand.tensor.ndim, operand.leading_dim)
+
+
+def _epi_spec(epi_fields):
+    """Shape-free compile spec of the epilogue fields (tensors, scalars, Constexprs)."""
+    spec, seen = [], {}
+    for name, value in epi_fields.items():
+        if isinstance(value, _EpiTensor):
+            if id(value) in seen:  # the same tensor bound to two fields
+                spec.append((name, "alias", seen[id(value)]))
+            else:
+                seen[id(value)] = name
+                spec.append((name, "tensor", _tensor_spec(value)))
+        elif name in _EPI_SCALAR_FIELDS:
+            spec.append((name, "scalar", value is not None))
+        else:
+            spec.append((name, "const", value))
+    return tuple(spec)
+
+
+def _fake_tensor(spec, align):
+    """Fake tensor with fully dynamic shape/strides, matching ``mark_layout_dynamic``."""
+    if spec is None:
+        return None
+    dtype_name, ndim, leading_dim = spec
+    dtype = _CUTE_DTYPES[dtype_name]
+    shape = tuple(cute.sym_int() for _ in range(ndim))
+    stride = tuple(1 if i == leading_dim else cute.sym_int64() for i in range(ndim))
+    return cute.runtime.make_fake_tensor(dtype, shape, stride=stride, assumed_align=align)
+
+
+def _fake_varlen_args(varlen_m, varlen_k, gather):
+    if not varlen_m and not varlen_k:
+        return None
+    fake = lambda: _fake_tensor(("int32", 1, 0), 4)
+    return VarlenArguments(
+        mCuSeqlensM=fake() if varlen_m else None,
+        mCuSeqlensK=fake() if varlen_k else None,
+        mAIdx=fake() if gather else None,
+    )
+
+
+def _build_epilogue_args(GemmCls, epi_spec, make_tensor, make_scalar, resolve_const,
+                         runtime=False):
+    # TVM-FFI runtime calls pass None for every field that is not a tensor or scalar,
+    # including Constexpr fields left at their defaults (e.g. rounding_mode).
+    fields = dict.fromkeys(GemmCls.EpilogueArguments._fields) if runtime else {}
+    tensors = {}
+    for name, kind, value in epi_spec:
+        if kind == "tensor":
+            tensors[name] = fields[name] = make_tensor(name, value)
+        elif kind == "alias":
+            fields[name] = tensors[value]
+        elif kind == "scalar":
+            fields[name] = make_scalar(name) if value else None
+        else:
+            fields[name] = resolve_const(name, value)
+    return GemmCls.EpilogueArguments(**fields)
+
+
+def _new_kernel(gemm_cls_name, a_dtype, tile_shape, cluster_shape, pingpong, persistent,
+                gather, activation_group, weight_block, implicit_dtype):
+    kernel = _SM90_SCALED_CLASSES[gemm_cls_name](
+        Float32, a_dtype, tile_shape, cluster_shape, pingpong=pingpong,
+        is_persistent=persistent, gather_A=gather,
+        activation_group=activation_group, weight_block=weight_block,
+    )
+    if implicit_dtype is not None:
+        kernel.implicit_dtype = _CUTE_DTYPES[implicit_dtype]
+    return kernel
+
+
+def _resolve_compile_const(name, value):
+    return _EPI_FUNCS[value] if name in _EPI_FUNC_FIELDS and value is not None else value
+
+
+@jit_cache
+def _compile_sm90_scaled_tvm_ffi(
+    gemm_cls_name, a_spec, b_spec, d_spec, c_spec, sa_spec, sb_spec, epi_spec,
+    varlen_m, varlen_k, gather, tile_shape, cluster_shape, pingpong, persistent,
+    max_swizzle_size, activation_group, weight_block, implicit_dtype, device_capability,
+):
+    """Compile once per layout/config; shapes and strides stay symbolic.
+
+    ``max_swizzle_size`` and ``device_capability`` are not read here but keep
+    compiled kernels apart in the in-memory and disk caches.
+    """
+    GemmCls = _SM90_SCALED_CLASSES[gemm_cls_name]
+    mA, mB, mD, mC = (_fake_tensor(spec, 16) for spec in (a_spec, b_spec, d_spec, c_spec))
+    mSFA, mSFB = _fake_tensor(sa_spec, 1), _fake_tensor(sb_spec, 1)
+    epi_args = _build_epilogue_args(
+        GemmCls, epi_spec,
+        make_tensor=lambda name, spec: _fake_tensor(spec, 16),
+        make_scalar=lambda name: Float32(1.0),
+        resolve_const=_resolve_compile_const,
+    )
+    scheduler_args = make_fake_scheduler_args(False, False, None)
+    varlen_args = _fake_varlen_args(varlen_m, varlen_k, gather)
+    kernel = _new_kernel(gemm_cls_name, mA.element_type, tile_shape, cluster_shape, pingpong,
+                         persistent, gather, activation_group, weight_block, implicit_dtype)
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        kernel, mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, stream, mSFA, mSFB,
+        options="--enable-tvm-ffi",
+    )
+
+
+def _raw_stream():
+    stream = torch.cuda.current_stream()
+    return cuda.CUstream(
+        stream.stream_base.raw_stream if hasattr(stream, "stream_base") else stream.cuda_stream
+    )
+
+
+def _runtime_cute_tensor(tensor, leading_dim, align):
+    storage = tensor.detach()
+    is_fp8 = tensor.dtype == torch.float8_e4m3fn
+    if is_fp8:
+        storage = storage.view(torch.uint8)
+    result = from_dlpack(storage, assumed_align=align)
+    if is_fp8:
+        result.element_type = cutlass.Float8E4M3FN
+    return result.mark_layout_dynamic(leading_dim=leading_dim)
+
+
+def _launch_dlpack(
+    gemm_cls_name, key, operands, scales, epi_spec, epi_fields, scheduler, varlen,
+    kernel_args,
+):
+    """from_dlpack fallback; the key has no shapes since all layouts are dynamic."""
+    GemmCls = _SM90_SCALED_CLASSES[gemm_cls_name]
+    mA, mB, mD, mC = (
+        None if op is None else _runtime_cute_tensor(op.tensor, op.leading_dim, 16)
+        for op in operands
+    )
+    mSFA, mSFB = (
+        from_dlpack(op.tensor, assumed_align=1).mark_layout_dynamic(leading_dim=op.leading_dim)
+        for op in scales
+    )
+    epi_args = _build_epilogue_args(
+        GemmCls, epi_spec,
+        make_tensor=lambda name, spec: _runtime_cute_tensor(
+            epi_fields[name].tensor, epi_fields[name].leading_dim, 16
+        ),
+        make_scalar=lambda name: float(epi_fields[name]),
+        resolve_const=_resolve_compile_const,
+    )
+    max_active_clusters, max_swizzle_size = scheduler
+    scheduler_args = GemmWrapperBase.create_scheduler_args(
+        max_active_clusters, max_swizzle_size=max_swizzle_size
+    )
+    varlen_args = GemmWrapperBase.create_varlen_args(*varlen)
+    stream = _raw_stream()
+    compiled = _SM90_SCALED_CACHE.get_or_compile(
+        key,
+        lambda: cute.compile(
+            _new_kernel(gemm_cls_name, mA.element_type, *kernel_args), mA, mB, mD, mC, epi_args,
+            scheduler_args, varlen_args, stream, mSFA, mSFB,
+        ),
+    )
+    compiled(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, stream, mSFA, mSFB)
+
+
 def _run_scaled(
-    GemmCls, A, B, D, a_scales, b_scales, *, C=None, epilogue_args=None,
+    GemmCls, A, B, D, a_scales, b_scales, *, C=None, epi_fields=None,
     cu_seqlens_m=None, cu_seqlens_k=None, A_idx=None, activation_group=32,
     weight_block=32, tile_shape=(128, 128), cluster_shape=(1, 1, 1),
-    pingpong=False, persistent=True, activation=None, activation_clamp=0.0,
-    z_mode="bf16", y1_quant=False, fp8_preact=False, accumulate="fresh",
-    implicit_dtype=None, max_swizzle_size=8, activation_scale_order=None,
+    pingpong=False, persistent=True, implicit_dtype=None, max_swizzle_size=8,
+    activation_scale_order=None,
 ):
     _validate_public(A, B, D, a_scales, b_scales, activation_group, weight_block)
     if D is None and not issubclass(GemmCls, GemmGatedMixin):
@@ -2504,103 +2752,54 @@ def _run_scaled(
         raise ValueError("only one varlen dimension may be selected")
     if (cu_seqlens_m is not None or cu_seqlens_k is not None) and not persistent:
         raise ValueError("varlen requires persistent=True")
-    if A_idx is not None and str(A_idx.dtype) not in (
-        "torch.int32", "paddle.int32", "int32"
-    ):
+    if A_idx is not None and _dtype_name(A_idx.dtype) != "int32":
         raise TypeError("A_idx must be int32")
-    if cu_seqlens_k is not None and str(cu_seqlens_k.dtype) not in (
-        "torch.int32", "paddle.int32", "int32"
-    ):
+    if cu_seqlens_k is not None and _dtype_name(cu_seqlens_k.dtype) != "int32":
         raise TypeError("cu_seqlens_k must be int32")
     gather = A_idx is not None
-    A = _prepare_fp8_operand(A, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None)
-    B = _prepare_fp8_operand(B, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None)
-    if cu_seqlens_k is not None:
+    varlen_m, varlen_k = cu_seqlens_m is not None, cu_seqlens_k is not None
+    A = _prepare_fp8_operand(A, varlen_m=varlen_m, varlen_k=varlen_k)
+    B = _prepare_fp8_operand(B, varlen_m=varlen_m, varlen_k=varlen_k)
+    if varlen_k:
         # Dedicated Hopper wgrad ABI: both operands are already physical and
         # logical K-major matrices [M,total_K] and [N,total_K]. No transpose,
         # gather, or BF16 operand is accepted by this path.
         if gather:
             raise ValueError("SM90 scaled varlen-K consumes pre-gathered K-major payloads")
         if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
-            raise ValueError(
-                "SM90 scaled varlen-K expects A=[M,total_K], B=[N,total_K]"
-            )
+            raise ValueError("SM90 scaled varlen-K expects A=[M,total_K], B=[N,total_K]")
         if not A.is_contiguous() or not B.is_contiguous():
             raise ValueError("SM90 scaled varlen-K operands must be contiguous K-major")
-    if gather:
-        expected_scale_rows = A_idx.numel()
-        if cu_seqlens_k is None:
-            if activation_scale_order not in ("source", "route"):
-                raise ValueError(
-                    "gathered SM90 scaled GEMM requires activation_scale_order="
-                    "'source' or 'route'"
-                )
-            expected_rows = A.shape[0] if activation_scale_order == "source" else expected_scale_rows
-            if a_scales.shape[0] != expected_rows:
-                raise ValueError(
-                    f"{activation_scale_order}-ordered A scales require {expected_rows} rows, "
-                    f"got {a_scales.shape[0]}"
-                )
-            if activation_scale_order == "source":
-                # A is read through A_idx, so source-row scales must follow the
-                # same explicit gather even when source and route row counts match.
-                a_scales = a_scales[A_idx.to(torch.int64)].contiguous()
+    if gather and not varlen_k:
+        if activation_scale_order not in ("source", "route"):
+            raise ValueError(
+                "gathered SM90 scaled GEMM requires activation_scale_order='source' or 'route'"
+            )
+        expected_rows = A.shape[0] if activation_scale_order == "source" else A_idx.numel()
+        if a_scales.shape[0] != expected_rows:
+            raise ValueError(
+                f"{activation_scale_order}-ordered A scales require {expected_rows} rows, "
+                f"got {a_scales.shape[0]}"
+            )
+        if activation_scale_order == "source":
+            # A is read through A_idx, so source-row scales must follow the
+            # same explicit gather even when source and route row counts match.
+            a_scales = a_scales[A_idx.to(torch.int64)].contiguous()
     if torch.float8_e4m3fn not in torch2cute_dtype_map:
         torch2cute_dtype_map[torch.float8_e4m3fn] = cutlass.Float8E4M3FN
-    validate_D = D
-    validate_C = C
-    dgated_packed = issubclass(GemmCls, GemmDGatedMixin) and D.dtype == torch.float32
-    if dgated_packed and C is not None:
-        validate_C = C
     L, M, K, N, infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A,
-        B,
-        validate_D,
-        validate_C,
-        cu_seqlens_m=cu_seqlens_m,
-        cu_seqlens_k=cu_seqlens_k,
-        A_idx=A_idx,
+        A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx,
     )
-    GemmWrapperBase.permute_tensors(
-        infos, varlen_m=cu_seqlens_m is not None, varlen_k=cu_seqlens_k is not None
+    GemmWrapperBase.permute_tensors(infos, varlen_m=varlen_m, varlen_k=varlen_k)
+    GemmWrapperBase.determine_major_orders(infos, _GEMM_DIMS)
+    operands = tuple(
+        None if infos[name].tensor is None else _EpiTensor(
+            infos[name].tensor.detach(),
+            1 if infos[name].major == _GEMM_DIMS[name][1] else 0,
+        )
+        for name in ("A", "B", "D", "C")
     )
-    dims = {"A": ("m", "k", "l"), "B": ("n", "k", "l"),
-            "D": ("m", "n", "l"), "C": ("m", "n", "l")}
-    GemmWrapperBase.determine_major_orders(infos, dims)
-    for name, info in infos.items():
-        if dgated_packed and name in ("D", "C") and info.tensor is not None:
-            packed = D if name == "D" else C
-            info.tensor = packed
-            info.dtype = cutlass.Float32
-            info.cute_tensor = _runtime_cute_tensor(packed, 1)
-            continue
-        if info.tensor is not None:
-            dtype_text = str(info.tensor.dtype)
-            if dtype_text in ("torch.float8_e4m3fn", "paddle.float8_e4m3fn", "float8_e4m3fn"):
-                info.dtype = cutlass.Float8E4M3FN
-            elif dtype_text in ("torch.float32", "paddle.float32", "float32"):
-                info.dtype = cutlass.Float32
-            elif dtype_text in ("torch.bfloat16", "paddle.bfloat16", "bfloat16"):
-                info.dtype = cutlass.BFloat16
-            elif dtype_text in ("torch.float16", "paddle.float16", "float16"):
-                info.dtype = cutlass.Float16
-            else:
-                info.dtype = torch2cute_dtype_map[info.tensor.dtype]
-    for name, info in infos.items():
-        if info.tensor is not None and name in dims:
-            info.cute_tensor = _runtime_cute_tensor(
-                info.tensor, 1 if info.major == dims[name][1] else 0
-            )
-    if epilogue_args is None:
-        epilogue_args = GemmDefaultEpiMixin.EpilogueArguments()
-    scheduler_args = GemmWrapperBase.create_scheduler_args(
-        get_max_active_clusters(cluster_shape[0] * cluster_shape[1]) if persistent else 0,
-        max_swizzle_size=max_swizzle_size,
-    )
-    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
-    stream = _raw_stream()
-    batched_scales = cu_seqlens_m is None and cu_seqlens_k is None
-    if cu_seqlens_k is not None:
+    if varlen_k:
         # Raw scale ABI is fixed for wgrad regardless of the forward profile:
         # contiguous [feature,total_K/32], rebased by expert_start/32.
         groups = K // 32
@@ -2614,32 +2813,44 @@ def _run_scaled(
             )
         if not a_scales.is_contiguous() or not b_scales.is_contiguous():
             raise ValueError("SM90 varlen-K raw scales must be contiguous")
-    sa = _scale_tensor(a_scales, batched=batched_scales and a_scales.ndim == 3)
-    sb = _scale_tensor(b_scales, batched=batched_scales and b_scales.ndim == 3)
-    arch = torch.cuda.get_device_capability(A.device)
+    scales = (_scale_operand(a_scales), _scale_operand(b_scales))
+    epi_fields = dict(epi_fields or {})
+    epi_spec = _epi_spec(epi_fields)
+    implicit_dtype = None if implicit_dtype is None else _dtype_name(implicit_dtype)
+    kernel_args = (tile_shape, cluster_shape, pingpong, persistent, gather,
+                   activation_group, weight_block, implicit_dtype)
     key = (
-        arch, GemmCls.__name__, activation_group, weight_block,
-        _tensor_signature(A), _tensor_signature(B), _tensor_signature(D),
-        _tensor_signature(C), _tensor_signature(a_scales), _tensor_signature(b_scales),
-        tile_shape, cluster_shape, infos["A"].major, infos["B"].major,
-        infos["D"].major, infos["C"].major, gather,
-        cu_seqlens_m is not None, cu_seqlens_k is not None, pingpong, persistent,
-        max_swizzle_size, activation, float(activation_clamp), z_mode,
-        bool(y1_quant), bool(fp8_preact), accumulate,
-        type(epilogue_args), tuple(getattr(epilogue_args, "_fields", ())),
+        GemmCls.__name__, *(_tensor_spec(op) for op in operands + scales), epi_spec,
+        varlen_m, varlen_k, gather, tuple(tile_shape), tuple(cluster_shape), bool(pingpong),
+        bool(persistent), int(max_swizzle_size), int(activation_group), int(weight_block),
+        implicit_dtype, _device_capability(A.device),
     )
-    def compile_kernel():
-        kernel = GemmCls(Float32, infos["A"].dtype, tile_shape, cluster_shape,
-                         pingpong=pingpong, is_persistent=persistent, gather_A=gather,
-                         activation_group=activation_group, weight_block=weight_block)
-        if implicit_dtype is not None:
-            kernel.implicit_dtype = implicit_dtype
-        return cute.compile(kernel, infos["A"].cute_tensor, infos["B"].cute_tensor,
-                            infos["D"].cute_tensor, infos["C"].cute_tensor, epilogue_args,
-                            scheduler_args, varlen_args, stream, sa, sb)
-    compiled = _SM90_SCALED_CACHE.get_or_compile(key, compile_kernel)
-    compiled(infos["A"].cute_tensor, infos["B"].cute_tensor, infos["D"].cute_tensor,
-             infos["C"].cute_tensor, epilogue_args, scheduler_args, varlen_args, stream, sa, sb)
+    max_active_clusters = (
+        get_max_active_clusters(cluster_shape[0] * cluster_shape[1]) if persistent else 0
+    )
+    varlen = (cu_seqlens_m, cu_seqlens_k, A_idx)
+    if not _tvm_ffi_enabled():
+        _launch_dlpack(
+            GemmCls.__name__, key, operands, scales, epi_spec, epi_fields,
+            (max_active_clusters, max_swizzle_size), varlen, kernel_args,
+        )
+        return D
+    compiled = _compile_sm90_scaled_tvm_ffi(*key)
+    if cache_utils.COMPILE_ONLY:
+        return D
+    # Runtime call: tensors bind to the symbolic layouts, Constexpr fields are None.
+    epi_args = _build_epilogue_args(
+        GemmCls, epi_spec,
+        make_tensor=lambda name, spec: epi_fields[name].tensor,
+        make_scalar=lambda name: Float32(epi_fields[name]),
+        resolve_const=lambda name, value: None,
+        runtime=True,
+    )
+    compiled(
+        *(None if op is None else op.tensor for op in operands), epi_args,
+        make_scheduler_args(max_active_clusters, max_swizzle_size, None),
+        make_varlen_args(*varlen), *(op.tensor for op in scales),
+    )
     return D
 
 
@@ -2650,21 +2861,10 @@ def sm90_scaled_gemm(
     """Public native scaled GEMM wrapper."""
     if add_to_output and C is not None:
         raise ValueError("add_to_output cannot also take C")
-    epi = GemmDefaultEpiMixin.EpilogueArguments(
-        beta=float(beta) if C is not None else None,
-        add_to_output=bool(add_to_output),
-    )
+    epi = dict(beta=float(beta) if C is not None else None, add_to_output=bool(add_to_output))
     return _run_scaled(
-        Sm90ScaledGemm,
-        A,
-        B,
-        D,
-        a_scales,
-        b_scales,
-        C=None if add_to_output else C,
-        epilogue_args=epi,
-        accumulate="add" if add_to_output else ("c_beta" if C is not None else "fresh"),
-        **kwargs,
+        Sm90ScaledGemm, A, B, D, a_scales, b_scales,
+        C=None if add_to_output else C, epi_fields=epi, **kwargs,
     )
 
 
@@ -2688,34 +2888,20 @@ def sm90_scaled_gated(
         raise ValueError("FP8 z requires z_scale_out, and BF16/no-z forbids it")
     if y1_fp8 != (postact_scale_out is not None):
         raise ValueError("FP8 y1 requires postact_scale_out, and BF16 y1 forbids it")
-    varlen_m = kwargs.get("cu_seqlens_m") is not None
-    postact_cute = _epi_tensor(PostAct, varlen_m=varlen_m)
-    common = dict(
-        swiglu_clamp_value=float(swiglu_clamp_value),
-        postact_bf16_trunc=bool(postact_bf16_trunc),
-    )
+    postact = _epi_operand(PostAct, varlen_m=kwargs.get("cu_seqlens_m") is not None)
+    epi = dict(mPostAct=postact, act_fn="swiglu_precise",
+               swiglu_clamp_value=float(swiglu_clamp_value))
     if z_fp8 or y1_fp8:
         GemmCls = Sm90ScaledGatedRawQuant
-        epi = GemmCls.EpilogueArguments(
-            postact_cute,
-            quack.activation.swiglu_precise,
-            mZScale=_epi_tensor(z_scale_out, varlen_m=True),
-            mPostActScaleRaw=_epi_tensor(postact_scale_out, varlen_m=True),
-            mPostActOutput=postact_cute,
-            **common,
+        epi.update(
+            postact_bf16_trunc=bool(postact_bf16_trunc),
+            mZScale=_epi_operand(z_scale_out, varlen_m=True),
+            mPostActScaleRaw=_epi_operand(postact_scale_out, varlen_m=True),
+            mPostActOutput=postact,
         )
     else:
         GemmCls = Sm90ScaledGated
-        epi = GemmCls.EpilogueArguments(
-            postact_cute, quack.activation.swiglu_precise,
-            swiglu_clamp_value=float(swiglu_clamp_value),
-        )
-    return _run_scaled(
-        GemmCls, A, B, D, a_scales, b_scales, epilogue_args=epi,
-        activation=activation, activation_clamp=swiglu_clamp_value,
-        z_mode="none" if D is None else ("fp8" if z_fp8 else "bf16"),
-        y1_quant=y1_fp8, **kwargs,
-    )
+    return _run_scaled(GemmCls, A, B, D, a_scales, b_scales, epi_fields=epi, **kwargs)
 
 
 def sm90_scaled_dgated(
@@ -2740,6 +2926,12 @@ def sm90_scaled_dgated(
         raise TypeError("dGated dz output must be packed FP32 or BF16/FP16")
     if PostAct.dtype not in (torch.bfloat16, torch.float16):
         raise TypeError("dGated y1s output must be BF16/FP16")
+    epi = dict(
+        mPostAct=_epi_operand(PostAct, varlen_m=varlen_m), act_bwd_fn="dswiglu_precise",
+        swiglu_clamp_value=float(swiglu_clamp_value),
+        mColVecBroadcast=_epi_operand(colvec_scale, varlen_m=varlen_m, leading_dim=0),
+        mColVecReduce=_epi_operand(colvec_reduce, varlen_m=varlen_m),
+    )
     if fp8_mode:
         if preact_fp8.dtype != torch.float8_e4m3fn or preact_scales.dtype != torch.uint8:
             raise TypeError("carrier preact must be E4M3 with raw uint8 UE8M0 scales")
@@ -2753,29 +2945,18 @@ def sm90_scaled_dgated(
             )
         GemmCls = Sm90ScaledDGatedFP8PreAct
         C = None
-        epi = GemmCls.EpilogueArguments(
-            _epi_tensor(PostAct, varlen_m=varlen_m), quack.activation.dswiglu_precise,
-            swiglu_clamp_value=float(swiglu_clamp_value),
-            mColVecBroadcast=_epi_tensor(colvec_scale, varlen_m=varlen_m, leading_dim=0),
-            mColVecReduce=_epi_tensor(colvec_reduce, varlen_m=varlen_m),
-            mFP8PreAct_fp8=_epi_tensor(preact_fp8, varlen_m=True),
-            mFP8PreAct_scales=_epi_tensor(preact_scales, varlen_m=True),
+        epi.update(
+            mFP8PreAct_fp8=_epi_operand(preact_fp8, varlen_m=True),
+            mFP8PreAct_scales=_epi_operand(preact_scales, varlen_m=True),
         )
     else:
         if PreAct is None or PreAct.dtype not in (torch.bfloat16, torch.float16):
             raise TypeError("BF16/FP16 preact must be provided")
         GemmCls = Sm90ScaledDGated
         C = PreAct.contiguous().view(torch.float32)
-        epi = GemmCls.EpilogueArguments(
-            _epi_tensor(PostAct, varlen_m=varlen_m), quack.activation.dswiglu_precise,
-            swiglu_clamp_value=float(swiglu_clamp_value),
-            mColVecBroadcast=_epi_tensor(colvec_scale, varlen_m=varlen_m, leading_dim=0),
-            mColVecReduce=_epi_tensor(colvec_reduce, varlen_m=varlen_m),
-        )
     _run_scaled(
-        GemmCls, A, B, D_packed, a_scales, b_scales, C=C, epilogue_args=epi,
-        activation=activation, activation_clamp=swiglu_clamp_value,
-        fp8_preact=fp8_mode, implicit_dtype=torch2cute_dtype_map[output_dtype], **kwargs,
+        GemmCls, A, B, D_packed, a_scales, b_scales, C=C, epi_fields=epi,
+        implicit_dtype=output_dtype, **kwargs,
     )
     return D
 
@@ -2911,15 +3092,13 @@ def sm90_scaled_wgrad_varlen_k(
             A, B, D, a_scales, b_scales, cu_seqlens_k,
             None if add_to_output else C, beta, add_to_output,
         )
-    mode = "add" if add_to_output else ("c_beta" if C is not None else "fresh")
-    epi = GemmDefaultEpiMixin.EpilogueArguments(
+    epi = dict(
         beta=float(beta) if C is not None and beta is not None else None,
         add_to_output=bool(add_to_output),
     )
     return _run_scaled(
         Sm90ScaledWgradVarlenK, A, B, D, a_scales, b_scales,
-        C=None if add_to_output else C, epilogue_args=epi,
-        cu_seqlens_k=cu_seqlens_k, accumulate=mode, **kwargs,
+        C=None if add_to_output else C, epi_fields=epi, cu_seqlens_k=cu_seqlens_k, **kwargs,
     )
 
 
@@ -2942,7 +3121,7 @@ def sm90_scaled_recompute_z(
         raise ValueError("BF16 recompute output forbids z_scale_out")
     return _run_scaled(
         Sm90ScaledRecomputeZ, A, B, D, a_scales, b_scales,
-        cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, z_mode="recompute_z_only", **kwargs,
+        cu_seqlens_m=cu_seqlens_m, A_idx=A_idx, **kwargs,
     )
 
 

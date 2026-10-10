@@ -11,7 +11,7 @@ Two layers of validation:
         - z_scale (UE8M0) bytes are byte-equal.
 
   (2) **End-to-end equivalence**: the existing recompute_z=True path now
-      goes through Option B (because we rewired ``_recompute_z_fp8``). Re-
+      goes through Option B (because we rewired ``sm100_funcs._recompute_z_fp8``). Re-
       run a small MLP forward+backward, check out/dx/ds/dw1/dw2 are
       bit-equal (cosine=1, rrmse=0) to the recompute_z=False baseline.
 
