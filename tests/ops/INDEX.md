@@ -55,7 +55,6 @@
 | `test_mlpnode_extreme_shapes.py` | Extreme-shape stress tests for SonicMoEMlpNode (CI gating). | — |
 | `test_mlpnode_multilayer.py` | Multi-layer correctness for SonicMoEMlpNode + flush_native_grads. | — |
 | `test_mlpnode_precision.py` | Element-wise precision audit: FP8 MlpNode vs BF16 gold (output/dx/dw1/dw2). | — |
-| `test_moe_general_routing_fp8.py` | FP8 frontier unit-test for moe_general_routing_inputs. | — |
 | `test_moe_module.py` | MoE module-level regression suite against a pure-torch reference. | — |
 | `test_pad_gradient_integrity.py` | Axiomatic backward-correctness test for route-level padding. | — |
 | `test_pad_routing.py` | Axiomatic correctness test for route-level padding. | — |

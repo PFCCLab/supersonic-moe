@@ -84,14 +84,11 @@ from .functional import (
     get_default_fp8_protocol,
     is_blackwell_device,
     resolve_fp8_backend,
-    moe_general_routing_inputs,
-    moe_TC_softmax_topk_layer,
     quantize_activation_reference,
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
 from .config import SonicMoEConfig, get_active_config, set_active_config
-from .moe import MoE
 from .quack_utils import make_blockscaled_grouped_reverse_scatter_idx, pack_blockscaled_1x32_scales
 from .ernie_compat.deepep_metadata import deepep_to_sonic_metadata, deepep_topk_to_sonic_metadata
 from .ernie_compat.mlp_node_v2 import _differentiable_router_scores

@@ -36,7 +36,7 @@ def _torch_swiglu_postact(z_preact, scale=None):
 
 
 def _run_zeromat_bf16_preact_case(*, inplace_dz: bool):
-    from sonicmoe.functional import _gather_1x32_scales_to_isa
+    from sonicmoe.quack_utils.sm100_funcs import _gather_1x32_scales_to_isa
     from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
         precompute_weight_fp8_for_direct_fused_dgated,
         quantize_activation_blockscaled_fast,
@@ -105,7 +105,7 @@ def _run_zeromat_bf16_preact_case(*, inplace_dz: bool):
 @pytest.mark.parametrize("T,H,I,E,K", [pytest.param(128, 128, 128, 8, 8, id="gather_repeated_aligned")])
 def test_fp8_zeromat_bf16_preact_vs_torch(T, H, I, E, K, seed):
     """FP8 ZeroMat dGated with BF16 PreAct must handle real A_idx gather."""
-    from sonicmoe.functional import _gather_1x32_scales_to_isa
+    from sonicmoe.quack_utils.sm100_funcs import _gather_1x32_scales_to_isa
     from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
         precompute_weight_fp8_for_direct_fused_dgated,
         quantize_activation_blockscaled_fast,

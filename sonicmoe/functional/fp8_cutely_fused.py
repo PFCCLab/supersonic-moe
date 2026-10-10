@@ -31,12 +31,9 @@ def _reject_situ_activation(activation_type, site: str) -> None:
             f"sonicmoe/functional/fp8_cutely_fused.py [{site}]: the fused "
             "cutify preact path is SwiGLU-only "
             "(fused_weighted_swiglu_act_quant_best) and cannot express "
-            "situ_glu. Disable the fused SwiGLU quant adapter "
-            "(SonicMoEConfig(fused_swiglu_quant=False) / "
-            "SONIC_MOE_FP8_FUSED_SWIGLU_QUANT=0) or run the fused gated "
-            "CUTLASS epilogue path (fused_gated=True), which computes the "
-            "SiTU epilogue natively. Falling back to swiglu is deliberately "
-            "not done."
+            "situ_glu. Use the aligned FP8 path (fused gated CUTLASS "
+            "epilogue), which computes the SiTU epilogue natively. Falling "
+            "back to swiglu is deliberately not done."
         )
 
 

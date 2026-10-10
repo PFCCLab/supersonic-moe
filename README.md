@@ -179,9 +179,7 @@ rm -rf $TORCH_EXTENSIONS_DIR/sonicmoe_deepep_topk_metadata_cuda  # (or matching 
 
 | Flag | Value | Notes |
 |---|:---:|---|
-| `SONIC_MOE_FP8_FUSED_GATED` | `1` | Fused SwiGLU+quant in up-proj epilogue. Non-fused path is deprecated. |
 | `SONIC_MOE_FP8_EPILOGUE_QUANT` | `1` | FP8 quant inside GEMM epilogue. Always active when FP8 enabled. |
-| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | `1` | Fused SwiGLU+rowquant on y1 path. Always active. |
 | `SONIC_MOE_FP8_SAVE_Z_FP8` | `1` | Save z as FP8 for backward (vs BF16). Always active. |
 
 **Deprecated / do-not-use:**
@@ -367,7 +365,7 @@ See `HANDOFF.md` for full kernel breakdown, memory notes, and next-step prioriti
 | `sonicmoe/ernie_compat/mlp_node_v2.py` | `SonicMoEMlpNode`: production MlpNode with `.forward()`, `.step()`, `.warmup()` |
 | `sonicmoe/jit_warmup.py` | `warmup_jit(E, H, I)`: pre-compiles all CuTe + Triton kernels |
 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | FP8 GEMM wrappers (CUTLASS + Triton quant), cache key design |
-| `sonicmoe/quack_utils/swiglu_triton.py` | Fused SwiGLU Triton kernels (5 production + 2 legacy bf16 variants) |
+| `sonicmoe/quack_utils/swiglu_triton.py` | Blockscaled FP8 dequant Triton kernel (`dequantize_blockscaled_fp8`) |
 | `sonicmoe/quack_utils/_validate.py` | Low-overhead input validation (dtype/stride/shape, zero GPU sync) |
 | `sonicmoe/ernie_compat/deepep_metadata.py` | DeepEP topk → SonicMoE routing metadata conversion |
 | `sonicmoe/functional/__init__.py` | `_UpProjection`, `_DownProjection` autograd Functions |

@@ -335,7 +335,7 @@ def test_epi_tile_n_ablation_bit_identical(tmp_path):
 
 def test_fused_y1_rejects_unaligned_TK():
     """TK or I not a multiple of 128 must raise (no silent OOB scale writes)."""
-    from sonicmoe.functional import _fused_blockscaled_gated_forward  # noqa: F401
+    from sonicmoe.quack_utils.sm100_funcs import _fused_blockscaled_gated_forward  # noqa: F401
     # The assertion lives in _fused_blockscaled_gated_forward; here we exercise
     # the lower-level guarantee directly: the ISA-pack buffer shape derivation
     # requires 128-alignment.  An unaligned I would size the buffer wrong and

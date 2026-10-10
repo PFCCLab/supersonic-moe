@@ -27,6 +27,7 @@
 | `backward.py` | Python module for backward. | — |
 | `forward.py` | Python module for forward. | — |
 | `fp8_cutely_fused.py` | Python module for fp8 cutely fused. | — |
+| `fp8_kernels.py` | Device-dispatching FP8 kernel interface: forwards each op to `quack_utils/sm90_funcs` or `quack_utils/sm100_funcs`. | — |
 | `fp8_protocol.py` | Python module for fp8 protocol. | — |
 | `fp8_quant.py` | Python module for fp8 quant. | — |
 | `fp8_reference.py` | Python module for fp8 reference. | — |

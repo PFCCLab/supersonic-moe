@@ -41,7 +41,6 @@ MODULES = [
     "sonicmoe.functional.utils",
     "sonicmoe.jit",
     "sonicmoe.jit_warmup",
-    "sonicmoe.moe",
     "sonicmoe.quack_utils._validate",
     "sonicmoe.quack_utils.blockscaled_fp8_gemm",
     "sonicmoe.quack_utils.cute_blockscaled_quant",

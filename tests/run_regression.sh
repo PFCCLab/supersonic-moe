@@ -17,11 +17,6 @@ echo ""
 # ─────────────────────────────────────────────────────────────────────────────
 echo "═══ HARD-FAIL GATES ═══"
 
-echo "--- [HARD] fp8_frontier_determinism_test.py (bit-exact repeated fwd/bwd) ---"
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_frontier_determinism_test.py -v --tb=short
-
-echo ""
 echo "--- [HARD] test_no_memcpy_sync.py (zero GPU sync in hot path) ---"
 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/test_no_memcpy_sync.py -v --tb=short
@@ -83,14 +78,9 @@ USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python tests/ops/test_e2e_mlpnode.py 2>&1 || true
 
 echo ""
-echo "--- [CORE] ops/test_moe_module.py (59 parametrized MoE tests) ---"
+echo "--- [CORE] ops/test_moe_module.py (parametrized MoE module tests) ---"
 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/ops/test_moe_module.py -v --tb=short 2>&1 || true
-
-echo ""
-echo "--- [CORE] ops/test_moe_general_routing_fp8.py (FP8 routing) ---"
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/ops/test_moe_general_routing_fp8.py -v --tb=short 2>&1 || true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # QUANT kernel tests: precision of FP8 quantization building blocks.
@@ -158,11 +148,6 @@ echo "--- [CONTRACT] fp8_large_project_contract_test.py ---"
 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/fp8_large_project_contract_test.py -v --tb=short 2>&1 || true
 
-echo ""
-echo "--- [CONTRACT] fp8_frontier_strict_test.py ---"
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_frontier_strict_test.py -v --tb=short 2>&1 || true
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SMOKE tests: import + misc.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,7 +161,6 @@ USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
     tests/ops/test_import_smoke.py \
     tests/test_blockscaled_fp8_varlen.py \
     tests/test_moe_layer.py \
-    tests/test_moe_layer_e2e.py \
     -v --tb=short 2>&1 || true
 
 echo ""
@@ -184,7 +168,7 @@ echo "════════════════════════�
 echo "REGRESSION COMPLETE: $(date)"
 echo "═══════════════════════════════════════════════════════════════════════"
 echo ""
-echo "DEPRECATED (skipped): moe_blackwell_test.py, moe_test.py, count_cumsum_test.py"
+echo "DEPRECATED (skipped): count_cumsum_test.py"
 echo "  Reason: require torch._dynamo/torch.compile (Paddle compat incompatible)"
 echo ""
 echo "COVERAGE GAPS (need future work):"

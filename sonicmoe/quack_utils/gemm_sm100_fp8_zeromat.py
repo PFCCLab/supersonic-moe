@@ -622,7 +622,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
 ) -> tuple[Tensor, Tensor]:
     """Recompute-only kernel: blockscaled FP8 GEMM that ONLY emits z_fp8 + scales.
 
-    Used by `_recompute_z_fp8` (Option B): backward materializes z without
+    Used by `sm100_funcs._recompute_z_fp8` (Option B): backward materializes z without
     paying for swiglu activation, postact register convert, R2S/S2G smem copy,
     or the y1 TMA store.
 

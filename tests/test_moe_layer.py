@@ -3,7 +3,8 @@ Unit test for MoELayer single-card implementation,
 adapted from PaddleFleet's moe_layer.py.
 
 Two test paths:
-  Path A — MoELayer using moe_general_routing_inputs (Paddle autograd, reliable baseline).
+  Path A — MoELayer using general_routing_router_metadata + _UpProjection/_DownProjection
+           (Paddle autograd, reliable baseline).
   Path B — SonicMoEMlpNode E2E (production DeepEP topk path, main_grad accumulation).
 """
 import sys
@@ -23,7 +24,6 @@ paddle.compat.enable_torch_proxy(
 
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional import (
-    moe_general_routing_inputs,
     general_routing_router_metadata,
     _UpProjection,
     _DownProjection,
@@ -177,7 +177,7 @@ class GroupedMLPExpert(paddle.nn.Layer):
         initializer = paddle.nn.initializer.Uniform(-0.001, 0.001)
         dtype = "bfloat16"
 
-        # moe_general_routing_inputs expects w1 as [2I, H, E], w2 as [H, I, E]
+        # _UpProjection/_DownProjection expect w1 as [2I, H, E], w2 as [H, I, E]
         if self.using_sonic_moe:
             w1_shape = [fc1_output_size, config.hidden_size, num_local_experts]
             w2_shape = [config.hidden_size, fc2_input_size, num_local_experts]
@@ -251,7 +251,7 @@ def _prepare_sonic_inputs(
     n_local_experts: int,
     block: int = BLOCK,
 ):
-    """Convert routing outputs to the format expected by moe_general_routing_inputs.
+    """Convert routing outputs to the format expected by general_routing_router_metadata.
 
     Each expert with a non-block-aligned token count receives virtual (zero-weight)
     padding tokens so that every expert's count is a multiple of ``block`` (128).
@@ -471,7 +471,7 @@ class AddAuxiliaryLoss(paddle.autograd.PyLayer):
 
 
 # ---------------------------------------------------------------------------
-# Test entry point — Path A (MoELayer + moe_general_routing_inputs)
+# Test entry point — Path A (MoELayer + _UpProjection/_DownProjection)
 # ---------------------------------------------------------------------------
 def test_moe_layer():
     config = MoETestConfig()
@@ -619,5 +619,5 @@ def test_mlpnode_e2e():
 
 
 if __name__ == "__main__":
-    test_moe_layer()          # Path A: MoELayer + moe_general_routing_inputs
+    test_moe_layer()          # Path A: MoELayer + _UpProjection/_DownProjection
     test_mlpnode_e2e()         # Path B: SonicMoEMlpNode (production MlpNode)

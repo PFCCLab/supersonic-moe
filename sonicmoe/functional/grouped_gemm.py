@@ -2814,8 +2814,8 @@ class HopperWgmma_MoE_kernel:
     ]:
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
 
-        a_is_k_major = a_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
-        b_is_k_major = b_layout.sm90_mma_major_mode() == warpgroup.OperandMajorMode.K
+        a_is_k_major = a_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K
+        b_is_k_major = b_layout.sm90_mma_major_mode() == cute.nvgpu.OperandMajorMode.K
 
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
         a_smem_layout_atom = warpgroup.make_smem_layout_atom(

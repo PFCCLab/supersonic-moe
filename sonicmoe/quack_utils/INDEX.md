@@ -32,5 +32,7 @@
 | `gemm_interface.py` | Python module for gemm interface. | — |
 | `gemm_sm100_fp8_zeromat.py` | Zero-materialization SM100 FP8 GEMM kernels. | — |
 | `sgl_mxfp8_gemm.py` | sgl-kernel MXFP8 blockscaled grouped GEMM for varlen MoE. | — |
-| `swiglu_triton.py` | Fused Triton kernels for interleaved SwiGLU forward and backward. | — |
+| `sm100_funcs.py` | SM100 backend of `functional/fp8_kernels`: CUTLASS blockscaled FP8 ops with ISA-packed 1x32 scales. | — |
+| `sm90_funcs.py` | SM90 backend of `functional/fp8_kernels`: WGMMA FP8 ops with raw UE8M0 `[rows, K/G]` scales and GxG weight blocks. | — |
+| `swiglu_triton.py` | Blockscaled FP8 dequant Triton kernel (`dequantize_blockscaled_fp8`). | — |
 | `triton_blockscaled_gemm.py` | Custom Triton blockscaled FP8 varlen GEMM for down-proj forward. | — |

@@ -36,7 +36,7 @@ from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
     gather_raw_blockscaled_1x32_scales_to_isa,
     quantize_activation_blockscaled_fast,
 )
-from sonicmoe.functional import (
+from sonicmoe.quack_utils.sm100_funcs import (
     _ensure_isa_1x32_scales,
     _gather_1x32_scales_to_isa,
     _raw_1x32_scale_bytes,
