@@ -22,25 +22,14 @@ _ALL_COMPILED_MODULES = {}
 
 
 def _resolve_cpp_extension_load() -> Callable:
-    """Resolve ``torch.utils.cpp_extension.load`` lazily.
+    """Resolve Paddle's C++ extension loader lazily.
 
-    sonicmoe is consumed under two import orders:
-
-      1. **Production** — ``paddle.compat.enable_torch_proxy(...)`` is called
-         BEFORE ``import sonicmoe``. ``torch.utils.cpp_extension`` is then a
-         proxy onto ``paddle.utils.cpp_extension`` and the returned ``load``
-         produces a paddle-native ``_pd_.so`` that accepts ``paddle.Tensor``.
-
-      2. **CI / warmup** — sonicmoe is imported first; the proxy is enabled
-         later (e.g. inside ``warmup_jit``). If we cached ``load`` at
-         module-import time we'd hold real torch's ``load`` forever, which
-         JIT-compiles a torch-pybind ``.so`` whose pybind binding rejects
-         ``paddle.Tensor`` with the misleading
-         ``TypeError: deepep_topk_metadata_cuda(): incompatible function arguments``.
-
-    Resolving lazily on each compile makes both paths work correctly.
+    Cold JIT may run after the scoped torch proxy has been disabled. Importing
+    ``torch.utils.cpp_extension`` at that point would follow normal Python
+    import rules, so use Paddle's loader directly.
     """
-    from torch.utils.cpp_extension import load as _load
+    from paddle.utils.cpp_extension import load as _load
+
     return _load
 
 
@@ -192,14 +181,12 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
     # shared warmup completing concurrently or this rank already building it.
     lock_timeout = float(os.getenv("SONIC_MOE_JIT_LOCK_TIMEOUT", "600"))
     with FileLock(lock_path, timeout=lock_timeout):
-        # Re-arm the paddle/torch-proxy blockers (idempotent). The initial
-        # ``import sonicmoe`` may have happened BEFORE the consumer called
-        # ``paddle.enable_compat()``; in that order our hipify blocker is
-        # a no-op because the proxy didn't exist yet. Re-running here
-        # guarantees the blocker is live by the time paddle's
-        # ``cpp_extension.load()`` looks up ``torch.utils.hipify``.
+        # Re-arm the Paddle/Quack compatibility patches (idempotent). Optional
+        # dependencies may have loaded after the initial ``import sonicmoe``,
+        # so retry immediately before a cold JIT build.
         try:
             from ._quack_compat import install_quack_paddle_compat
+
             install_quack_paddle_compat()
         except Exception:
             pass
