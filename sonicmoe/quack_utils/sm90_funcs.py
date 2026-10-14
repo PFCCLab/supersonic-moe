@@ -33,7 +33,7 @@ from .gemm_sm90_scaled import (
     sm90_scaled_recompute_z,
     sm90_scaled_wgrad_varlen_k,
 )
-from .swiglu_triton import dequantize_blockscaled_fp8
+from .swiglu_triton import _dequant_blockscaled_fp8_kernel, dequantize_blockscaled_fp8
 
 
 # ---------------------------------------------------------------------------
@@ -103,11 +103,20 @@ def materialize_activation_sm90(
         )
     rows, cols = (int(data.shape[0]), int(data.shape[1]))
     raw_scales = _raw_activation_scales(scales, rows, cols // group_size)
-    restored = (
-        data.float().reshape(rows, cols // group_size, group_size)
-        * _decode_ue8m0(raw_scales).unsqueeze(-1)
+    data = data.contiguous()
+    # Fused Triton dequant: fp8 * 2^(e8m0-127) -> bf16 without materializing
+    # the two activation-sized fp32 temporaries of the eager formulation.
+    out = torch.empty(rows, cols, dtype=torch.bfloat16, device=data.device)
+    if rows == 0:
+        return out
+    block_rows = 16
+    _dequant_blockscaled_fp8_kernel[(triton.cdiv(rows, block_rows),)](
+        data, raw_scales, out,
+        rows,
+        data.stride(0), raw_scales.stride(0), out.stride(0),
+        D=cols, GROUP_SIZE=group_size, BLOCK_ROWS=block_rows,
     )
-    return restored.reshape(rows, cols).to(torch.bfloat16).contiguous()
+    return out
 
 
 @wrap_triton_kernel

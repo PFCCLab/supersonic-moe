@@ -252,6 +252,32 @@ def _get_fp8_weight_attr(
     return attr
 
 
+def _get_transposed_fp8_weight(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, bool]:
+    """Return (fp8, scales, lazy) for the backward (transposed) weight operand.
+
+    SM90 does not keep a persistent ``transposed_fp8`` copy (WGMMA fp8 is
+    K-major only, so it cannot be a view of ``fp8``).  In that case the
+    forward ``fp8`` payload is returned with ``lazy=True`` and the caller
+    must build the transposed copy via ``_materialize_transposed_fp8`` right
+    before the backward GEMM and drop it afterwards.
+    """
+    attr = getattr(weight, "transposed_fp8", None)
+    if attr is not None:
+        return attr[0], attr[1], False
+    fp8, scales = _get_fp8_weight_attr(weight, "fp8")
+    return fp8, scales, True
+
+
+def _materialize_transposed_fp8(
+    fp8: torch.Tensor, scales: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Same op as the eager SM90 quant_weight() copy -> bit-identical operand.
+    return (
+        fp8.permute(0, 2, 1).contiguous(),
+        scales.permute(0, 2, 1).contiguous(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1022,8 +1048,8 @@ class _UpProjection(torch.autograd.Function):
             # _w1T_fp8, _w1T_scales = _STASHED_FP8_WEIGHTS.get("w1T_varlen", None) or precompute_weight_fp8(w1, permute=(1, 0, 2))
             # ctx._w1T_fp8 = _w1T_fp8
             # ctx._w1T_scales = _w1T_scales
-            ctx._w1T_fp8, ctx._w1T_scales = _get_fp8_weight_attr(
-                w1, "transposed_fp8"
+            ctx._w1T_fp8, ctx._w1T_scales, ctx._w1T_lazy = (
+                _get_transposed_fp8_weight(w1)
             )
             x_fp8_pre, x_scales_pre = None, None
             x_saved = x
@@ -1312,6 +1338,11 @@ class _UpProjection(torch.autograd.Function):
                 if has_prequant:
                     _PREQUANT_HIT_COUNT["bwd"] += 1
                     _, dz_fp8, dz_packed_scales = prequant_dz
+                    if getattr(ctx, "_w1T_lazy", False):
+                        # Built after wgrad/del dz_bf16, freed right after use.
+                        w1T_fp8, w1T_scales = _materialize_transposed_fp8(
+                            w1T_fp8, w1T_scales
+                        )
                     if ctx._w1_decoupled:
                         # w1 not in saved_tensors; call low-level GEMM directly
                         # with shape metadata (avoids needing a weight tensor).
@@ -1718,7 +1749,9 @@ class _DownProjection(torch.autograd.Function):
             if _w2_decouple:
                 # Eagerly look up w2 dgated fp8 cache for backward.
                 # _w2_dgated_fp8, _w2_dgated_scales = _STASHED_FP8_WEIGHTS.get("w2_dgated", None) or precompute_weight_fp8_for_direct_fused_dgated(w2)
-                _w2_dgated_fp8, _w2_dgated_scales = _get_fp8_weight_attr(w2, "transposed_fp8")
+                _w2_dgated_fp8, _w2_dgated_scales, ctx._w2_dgated_lazy = (
+                    _get_transposed_fp8_weight(w2)
+                )
                 ctx._w2_dgated_fp8 = _w2_dgated_fp8
                 ctx._w2_dgated_scales = _w2_dgated_scales
                 ctx._w2_shape = w2.shape  # (E, H, I)
@@ -1751,7 +1784,9 @@ class _DownProjection(torch.autograd.Function):
                 )
         else:
             if _w2_decouple:
-                _w2_dgated_fp8, _w2_dgated_scales = _get_fp8_weight_attr(w2, "transposed_fp8")
+                _w2_dgated_fp8, _w2_dgated_scales, ctx._w2_dgated_lazy = (
+                    _get_transposed_fp8_weight(w2)
+                )
                 ctx._w2_dgated_fp8 = _w2_dgated_fp8
                 ctx._w2_dgated_scales = _w2_dgated_scales
                 ctx._w2_shape = w2.shape
@@ -1945,6 +1980,12 @@ class _DownProjection(torch.autograd.Function):
                         )
                 else:
                     dout_fp8, dout_raw_scales_t = fp8_kernels.quantize_activation_raw(dout, ctx._fp8_cfg)
+
+                if ctx._w2_decoupled and getattr(ctx, "_w2_dgated_lazy", False):
+                    # Transient transposed copy, freed by ``del w2_fp8_enk`` below.
+                    w2_fp8_enk, w2_scales = _materialize_transposed_fp8(
+                        w2_fp8_enk, w2_scales
+                    )
 
                 dz, y1s, ds = fp8_kernels.gemm_dgated(
                     dout_fp8, dout_raw_scales_t,
