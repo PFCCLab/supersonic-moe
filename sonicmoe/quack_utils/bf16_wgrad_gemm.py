@@ -74,11 +74,13 @@ def _bf16_wgrad_default_config(
     cap = get_device_capacity(device)
     if cap[0] < 10:
         raise RuntimeError("bf16 wgrad direct varlen_k path requires SM100+")
-    # A35B BF16 wgrad shapes are large enough to benefit from Blackwell 2CTA UMMA
-    # along M.  gather_A requires cluster_n=1 in GemmSm100, so cluster_m is the
-    # safe cluster dimension for this direct, non-materialized path.  Smaller or
-    # unqualified shapes fall back to the previous conservative 1CTA tile.
-    if M is not None and N is not None and M >= 4096 and N >= 2048:
+    # Blackwell 2CTA UMMA along M (gather_A requires cluster_n=1 in GemmSm100, so
+    # cluster_m is the safe cluster dimension for this direct, non-materialized
+    # path).  The 2CTA 256x256 tile is faster whenever N > 128, i.e. more than
+    # one 128-wide N tile (measured on varlen-K wgrad shapes with M >= 2048,
+    # bitwise-identical output); with a single N tile it is slower, so those
+    # shapes keep the conservative 1CTA tile.
+    if M is not None and N is not None and M >= 2048 and N > 128:
         return GemmConfig(
             tile_m=256,
             tile_n=256,
