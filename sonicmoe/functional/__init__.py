@@ -2332,6 +2332,7 @@ class _DownProjection(torch.autograd.Function):
                         cur.plan,
                         cur.groups,
                         cur.err,
+                        ready_event=cur.ready_event,
                     )
                     if tuple(o_grouped.shape) != (T, H) or o_grouped.dtype != torch.bfloat16:
                         raise ValueError(

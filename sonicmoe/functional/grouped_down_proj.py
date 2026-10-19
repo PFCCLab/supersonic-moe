@@ -168,16 +168,16 @@ class Plan:
 
 def grouped_down_proj(
     y1, w2, expert_frequency_offset, lane_rows, lane_scores, token_lane_offset, ids, plan, groups,
-    err=None, config=None,
+    err=None, config=None, ready_event=None,
 ):
     """Grouped GEMM2 + combine of one batch; returns o [T, H] bf16.
 
-    y1 ([TK, I]) rows grouped by expert, w2 ([E, H, I]); lane_rows / lane_scores
-    the y1 row and weight of every routed (token, expert) lane; token_lane_offset
-    the [T+1] lanes of each token (or None for a dense K lanes per token); ids
-    the [T, K] int32 routing (-1 = dropped) the plan was built from; err an
-    int32 flag set to 1 if a token's lanes do not match ids.
+    If ``ready_event`` is given (the plan is produced on another stream), the
+    current stream waits on it first, so the plan can be built concurrently
+    with the work before this call.
     """
+    if ready_event is not None:
+        paddle.device.cuda.current_stream().wait_event(ready_event)
     T, K = int(ids.shape[0]), int(ids.shape[1])
     I, E, H = int(y1.shape[1]), int(w2.shape[0]), int(w2.shape[1])
     assert E == groups.E
@@ -216,6 +216,7 @@ class _GroupedPlan:
     plan: Plan
     ids: paddle.Tensor
     err: paddle.Tensor
+    ready_event: object = None
 
 
 _local = threading.local()
@@ -226,11 +227,15 @@ def current_grouped_plan():
 
 
 @contextlib.contextmanager
-def grouped_down_proj_plan(groups, plan, ids, err=None):
+def grouped_down_proj_plan(groups, plan, ids, err=None, ready_event=None):
     """Install (groups, plan, ids) for the next ``_DownProjection`` forward on
-    this thread; None restores the default path.  Nestable."""
+    this thread; None restores the default path.  ``ready_event``: an event the
+    down projection waits on (the plan was produced on another stream).
+    Nestable."""
     prev = getattr(_local, "cur", None)
-    _local.cur = _GroupedPlan(groups, plan, ids, err if err is not None else paddle.zeros([1], dtype=paddle.int32))
+    _local.cur = _GroupedPlan(
+        groups, plan, ids, err if err is not None else paddle.zeros([1], dtype=paddle.int32), ready_event
+    )
     try:
         yield _local.cur
     finally:

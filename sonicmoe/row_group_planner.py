@@ -622,9 +622,14 @@ def attach_shm(name):
     return shm
 
 
-def serve(shm_name, T, K, E, list_paths, threads, nround, nrank):
-    """Planner loop (runs until a negative IN_SEQ).  Slots are served in
-    order of their round, latest round first (remote rounds before home)."""
+def serve(shm_name, T, K, E, list_paths, threads, nround, nrank, round_order=None):
+    """Planner loop (runs until a negative IN_SEQ).
+
+    ``round_order`` is the priority in which rounds are served within every
+    table (default ``0..nround-1``); a consumer that uses the rounds in a
+    different order passes that order so the first-needed plan is produced
+    first.
+    """
     nb.set_num_threads(threads)
     indexes = [build_index(load_list(p), E) for p in list_paths]
     nslot = len(indexes) * nround
@@ -634,7 +639,9 @@ def serve(shm_name, T, K, E, list_paths, threads, nround, nrank):
     warm = np.random.RandomState(0).rand(T, E).argsort(1)[:, :K].astype(np.int16)
     for ix in indexes:  # JIT + first touch
         plan(warm, ix, sc, slots[0] if ix is indexes[0] else alloc_out(T, K, ix))
-    order = sorted(range(nslot), key=lambda s: (-(s % nround), s))
+    if round_order is None:
+        round_order = list(range(nround))
+    order = [t * nround + r for r in round_order for t in range(len(indexes))]
     done = [0] * nslot
     ack = flags[flag_word(ACK, 0, nslot) : flag_word(ACK, 0, nslot) + nrank * nslot].reshape(nrank, nslot)
     out = None
@@ -671,8 +678,10 @@ def _main():
     ap.add_argument("--threads", type=int, required=True)
     ap.add_argument("--nround", type=int, required=True)
     ap.add_argument("--nrank", type=int, required=True)
+    ap.add_argument("--round-order", default="", help="comma round indices in serve priority")
     a = ap.parse_args()
-    serve(a.shm, a.T, a.K, a.E, a.list, a.threads, a.nround, a.nrank)
+    ro = [int(x) for x in a.round_order.split(",") if x != ""] or None
+    serve(a.shm, a.T, a.K, a.E, a.list, a.threads, a.nround, a.nrank, round_order=ro)
 
 
 if __name__ == "__main__":
