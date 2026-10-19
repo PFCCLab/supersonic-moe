@@ -65,6 +65,7 @@ from .fp8_reference import (
     dequantize_activation_reference,
     quantize_activation_reference,
 )
+from .grouped_down_proj import current_grouped_plan, grouped_down_proj
 from .forward import _router_forward, _softmax_topk_fwd
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_fp8, enable_quack_gemm, is_fp8_active, is_using_quack_gemm
@@ -2226,6 +2227,7 @@ class _DownProjection(torch.autograd.Function):
                 raise ValueError("router_score_src_idx cannot exceed the metadata score buffer")
 
         use_quack_gemm = is_using_quack_gemm()
+        o_grouped = None  # set when an installed grouped plan computed o
 
         if use_quack_gemm:
             # assert not torch.compiler.is_compiling()  # Paddle compat
@@ -2317,14 +2319,34 @@ class _DownProjection(torch.autograd.Function):
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
-                y2 = gemm(
-                    y1,
-                    w2.permute(0, 2, 1),
-                    cu_seqlens_m=expert_frequency_offset,
-                    tuned=False,
-                )
-                router_perm = s_reverse_scatter_idx
-                y2_for_router = y2
+                cur = current_grouped_plan()
+                if cur is not None:
+                    o_grouped = grouped_down_proj(
+                        y1,
+                        w2,
+                        expert_frequency_offset,
+                        s_reverse_scatter_idx,
+                        topk_scores if topk_scores.ndim == 1 else topk_scores.flatten(),
+                        num_activated_expert_per_token_offset if is_varlen_K else None,
+                        cur.ids,
+                        cur.plan,
+                        cur.groups,
+                        cur.err,
+                    )
+                    if tuple(o_grouped.shape) != (T, H) or o_grouped.dtype != torch.bfloat16:
+                        raise ValueError(
+                            f"grouped down projection must return a ({T}, {H}) bf16 tensor, "
+                            f"got {tuple(o_grouped.shape)} {o_grouped.dtype}"
+                        )
+                if o_grouped is None:
+                    y2 = gemm(
+                        y1,
+                        w2.permute(0, 2, 1),
+                        cu_seqlens_m=expert_frequency_offset,
+                        tuned=False,
+                    )
+                    router_perm = s_reverse_scatter_idx
+                    y2_for_router = y2
         else:
             raise RuntimeError(
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
@@ -2334,22 +2356,24 @@ class _DownProjection(torch.autograd.Function):
         #     f"In forward, after down gemm, down_output shape: {y2_for_router.shape}, dtype: {y2_for_router.dtype}"
         # )
 
-        # Output must always be bf16 (z may be fp8 when epilogue_quant is active).
-        o = torch.empty(T, H, device=z.device, dtype=torch.bfloat16)
         topk_scores = topk_scores if topk_scores.ndim == 1 else topk_scores.flatten()
-
-        _router_forward(
-            y2=y2_for_router,
-            o=o,
-            topk_scores=topk_scores,
-            s_reverse_scatter_idx=router_perm,
-            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(K if K is not None else E),
-            H=H,
-            is_varlen_K=is_varlen_K,
-        )
-        del y2_for_router
-        del y2
+        if o_grouped is not None:
+            o = o_grouped
+        else:
+            # Output must always be bf16 (z may be fp8 when epilogue_quant is active).
+            o = torch.empty(T, H, device=z.device, dtype=torch.bfloat16)
+            _router_forward(
+                y2=y2_for_router,
+                o=o,
+                topk_scores=topk_scores,
+                s_reverse_scatter_idx=router_perm,
+                num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+                varlen_K_max=(K if K is not None else E),
+                H=H,
+                is_varlen_K=is_varlen_K,
+            )
+            del y2_for_router
+            del y2
         # _log_stage_memory(
         #     f"In forward, after local combine, expert_out shape:{o.shape}, dtype: {o.dtype}"
         # )

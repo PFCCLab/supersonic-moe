@@ -94,3 +94,10 @@ from .quack_utils import make_blockscaled_grouped_reverse_scatter_idx, pack_bloc
 from .ernie_compat.deepep_metadata import deepep_to_sonic_metadata, deepep_topk_to_sonic_metadata
 from .ernie_compat.mlp_node_v2 import _differentiable_router_scores
 from .interface import run_sonic_moe
+from .functional.grouped_down_proj import (  # noqa: F401
+    GroupList,
+    Plan,
+    grouped_down_proj,
+    grouped_down_proj_plan,
+)
+from . import row_group_planner  # noqa: F401
