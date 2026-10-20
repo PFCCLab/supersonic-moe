@@ -215,3 +215,28 @@ import contextlib  # noqa: E402
 
 def _nullctx():
     return contextlib.nullcontext()
+
+
+def test_group_lists_share_buffers_and_stay_correct():
+    """Several group lists of one shape (several layers, and lists that are
+    freed and replaced) share one set of work buffers and each stays exact."""
+    import gc
+    import importlib
+
+    gdp = importlib.import_module("sonicmoe.functional.grouped_down_proj")  # the module, not the function
+
+    E, K, T, H, I = 64, 8, 2048, 256, 128
+    rng = np.random.RandomState(11)
+    ids = _routing(rng, E, K, T, 0.05)
+    w = (2.0 ** -rng.randint(0, 2, (T, K))).astype(np.float32)
+    y1 = (rng.randint(-1, 2, (T * K, I)) * (rng.rand(T * K, I) < 0.08)).astype(np.float32)
+    w2 = rng.randint(-1, 2, (E, H, I)).astype(np.float32)
+    lists = [frequent_groups(ids, (2,), n) for n in (50, 300, 120)] + [frequent_groups(ids, (2, 3, 4), 200)]
+    n_before = len(gdp._scratch)
+    for _ in range(2):
+        for groups in lists:  # each call builds (and drops) its own GroupList
+            o_prod, o_g, err, _ = run_both(ids, w, y1, w2, groups)
+            gc.collect()
+            assert err == 0
+            assert np.array_equal(o_g, o_prod)
+    assert len(gdp._scratch) <= n_before + 1  # one buffer set for the shape, not one per list

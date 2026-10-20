@@ -198,26 +198,37 @@ class Plan:
 
 
 class _Scratch:
-    """``grouped_down_proj``'s work buffers for one (T, K, E, H, I) and group
-    list: the lane tables, the A buffer every bucket packs into in turn, y2,
-    and the per-bucket A / y2 views.  ``o`` is not here: it is the call's
-    result and stays a fresh tensor."""
+    """``grouped_down_proj``'s work buffers for one (T, K, H, I): the lane
+    tables, the A buffer every bucket packs into in turn, and y2.  Shared by
+    every group list (every layer) of the process: a call consumes them before
+    it returns, and calls on one stream run in order.  ``o`` is not here: it
+    is the call's result and stays a fresh tensor."""
 
-    def __init__(self, T, K, I, H, groups):
+    def __init__(self, T, K, I, H):
         TK = T * K
         self.row_s = paddle.empty([TK], dtype=paddle.int32)
         self.w_s = paddle.empty([TK], dtype=paddle.float32)
-        a_buf = paddle.empty([TK * I], dtype=paddle.bfloat16)
+        self.a_buf = paddle.empty([TK * I], dtype=paddle.bfloat16)
         self.y2 = paddle.empty([TK, H], dtype=paddle.bfloat16)
         self.KP = triton.next_power_of_2(K)
-        self.buckets = tuple(
-            (c, nseg, at, bidx, TK // c, a_buf[: (TK // c) * c * I].view([TK // c, c * I]),
-             self.y2[: TK // c])
+
+
+_scratch = {}  # (T, K, H, I) -> _Scratch, one per shape for the whole process
+
+
+def _buckets(groups, s, T, K, I, H):
+    """Per-bucket A / y2 views of the shared buffers for one group list; kept
+    on the group list, so they live and die with it."""
+    views = groups.__dict__.setdefault("_views", {})
+    key = (T, K, I, H)
+    b = views.get(key)
+    if b is None:
+        TK = T * K
+        b = views[key] = tuple(
+            (c, nseg, at, bidx, TK // c, s.a_buf[: (TK // c) * c * I].view([TK // c, c * I]), s.y2[: TK // c])
             for c, nseg, at, bidx in groups.gemms
         )
-
-
-_scratch = {}  # (id(groups), T, K, E, H, I) -> _Scratch
+    return b
 
 
 def grouped_down_proj(
@@ -230,9 +241,10 @@ def grouped_down_proj(
     current stream waits on it first, so the plan can be built concurrently
     with the work before this call.
 
-    The work buffers are kept per (group list, shape) and reused across calls;
-    only ``o`` is freshly allocated.  Two concurrent calls of the same shape on
-    the same group list would therefore share them, which the ring never does.
+    The work buffers are kept per shape and shared by every group list (one
+    set per process, not per layer); only ``o`` is freshly allocated.  Two
+    concurrent calls of the same shape would therefore share them, which the
+    ring never does (its calls run in order on one stream).
     """
     if ready_event is not None:
         _current_stream().wait_event(ready_event)
@@ -242,10 +254,11 @@ def grouped_down_proj(
     config = config or default_gemm_config()
     if err is None:
         err = paddle.zeros([1], dtype=paddle.int32)
-    key = (id(groups), T, K, E, H, I)
+    key = (T, K, H, I)
     s = _scratch.get(key)
     if s is None:
-        s = _scratch[key] = _Scratch(T, K, I, H, groups)
+        s = _scratch[key] = _Scratch(T, K, I, H)
+    buckets = _buckets(groups, s, T, K, I, H)
     varlen = token_lane_offset is not None
     off = token_lane_offset if varlen else lane_rows
     _lane_tables_kernel[(triton.cdiv(T, _BT),)](
@@ -254,7 +267,7 @@ def grouped_down_proj(
         BT=_BT, num_warps=4,
     )
     w2t = w2.permute(0, 2, 1)
-    for c, nseg, at, bidx, nmax, a, y2v in s.buckets:  # rows of a GEMM are < nmax
+    for c, nseg, at, bidx, nmax, a, y2v in buckets:  # rows of a GEMM are < nmax
         cu = plan.cu_slice(at, nseg)
         _pack_kernel[(triton.cdiv(nmax, _BR),)](
             y1, plan.row_tok, plan.row_code, s.row_s, s.w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR,
