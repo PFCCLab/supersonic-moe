@@ -158,6 +158,7 @@ class GPUIndex:
         self.seg_of = dev(index.seg_of.astype(np.int32))
         self.K = None  # set on first call (depends on ids), li/lj built then
         self._li = self._lj = None
+        self._scratch = {}  # (T, K, slot) -> _Scratch, built on first call
 
     def _lane_pairs(self, K):
         if self.K == K:
@@ -168,31 +169,59 @@ class GPUIndex:
         self._li, self._lj, self.K = dev(li), dev(lj), K
 
 
-def plan_gpu(ids, gidx):
+class _Scratch:
+    """Every device buffer one ``plan_gpu`` call needs, for one (T, K).
+
+    ``cnt`` is zeroed by ``_k3`` at the end of every call, so only the first
+    call has to zero it on the host.  The ``cu`` destination views and their
+    ``segoff`` sources are sliced once here instead of once per call.
+    """
+
+    def __init__(self, T, K, gidx):
+        S, TK, NB = gidx.S, T * K, triton.cdiv(T, gidx.BT)
+        R = K // 2
+        i32 = lambda n: paddle.empty([n], dtype=paddle.int32)  # noqa: E731
+        self.cnt = paddle.zeros([S], dtype=paddle.int32)
+        self.selseg, self.selslot, self.selcode = i32(T * R), i32(T * R), i32(T * R)
+        self.rslot, self.used, self.rank = i32(TK), i32(T), i32(TK)
+        self.nr, self.bsum = i32(T), i32(NB)
+        self.segoff, self.boff = i32(S + 1), i32(NB)
+        self.row_tok = paddle.empty([TK], dtype=paddle.int16)
+        self.row_code = paddle.empty([TK], dtype=paddle.int16)
+        self.perm, self.moff, self.cu = i32(TK), i32(T + 1), i32(gidx.cu_len)
+        self.NB, self.R = NB, R
+        self.SP, self.NBP = triton.next_power_of_2(S), triton.next_power_of_2(NB)
+        self.plan = Plan(cu=self.cu, row_tok=self.row_tok, row_code=self.row_code,
+                         perm=self.perm, moff=self.moff)
+        self.cu_views = tuple((self.cu[at : at + s1 - s0 + 1], self.segoff[s0 : s1 + 1])
+                              for (c, s0, s1, at) in gidx.gemms)
+
+
+def plan_gpu(ids, gidx, slot=0):
     """Build one batch's `Plan` on the device from int32 routing ``ids`` [T, K]
-    (-1 = dropped) and a :class:`GPUIndex`.  No host sync."""
+    (-1 = dropped) and a :class:`GPUIndex`.  No host sync.
+
+    The work buffers are kept on ``gidx`` per (T, K, slot) and reused, so a
+    steady-state call launches three kernels and nothing else.  The returned
+    `Plan` therefore aliases the previous plan of the same (T, K, slot): a
+    caller that holds several plans alive at once must pass a distinct
+    ``slot`` per plan (the ring consumes each round's plan in the round that
+    builds it, so the default is enough for it).
+    """
     T, K = int(ids.shape[0]), int(ids.shape[1])
+    tab = gidx._scratch
+    s = tab.get((T, K, slot))
+    if s is None:
+        gidx._lane_pairs(K)
+        s = tab[(T, K, slot)] = _Scratch(T, K, gidx)
     G, E, S, BT = gidx.G, gidx.E, gidx.S, gidx.BT
-    gidx._lane_pairs(K)
-    NP = K * (K - 1) // 2
-    R = K // 2
-    NB = triton.cdiv(T, BT)
-    TK = T * K
-    i32 = lambda n: paddle.empty([n], dtype=paddle.int32)  # noqa: E731
-    cnt = paddle.zeros([S], dtype=paddle.int32)
-    selseg, selslot, selcode = i32(T * R), i32(T * R), i32(T * R)
-    rslot, used, rank, nr, bsum = i32(TK), i32(T), i32(TK), i32(T), i32(NB)
-    segoff, boff = i32(S + 1), i32(NB)
-    row_tok = paddle.empty([TK], dtype=paddle.int16)
-    row_code = paddle.empty([TK], dtype=paddle.int16)
-    perm, moff, cu = i32(TK), i32(T + 1), i32(gidx.cu_len)
-    _k1[(NB,)](ids, gidx.tab, gidx.seg_of, gidx._li, gidx._lj, cnt, selseg, selslot, selcode,
-               rslot, used, rank, nr, bsum, T, G, E=E, K=K, R=R, BT=BT, NPP=_NPP, NP=NP, num_warps=4)
-    _k2[(1,)](cnt, bsum, segoff, boff, S, NB, SP=triton.next_power_of_2(S),
-              NBP=triton.next_power_of_2(NB), num_warps=8)
-    for c, s0, s1, at in gidx.gemms:  # per-GEMM cu slice (device copy, no host sync)
-        cu[at : at + s1 - s0 + 1] = segoff[s0 : s1 + 1]
-    _k3[(NB,)](ids, selseg, selslot, selcode, rslot, used, rank, nr, boff, segoff, cnt,
-               row_tok, row_code, perm, moff, S, T, G, K=K, R=R, BT=BT,
-               SP=triton.next_power_of_2(S), num_warps=4)
-    return Plan(cu=cu, row_tok=row_tok, row_code=row_code, perm=perm, moff=moff)
+    _k1[(s.NB,)](ids, gidx.tab, gidx.seg_of, gidx._li, gidx._lj, s.cnt, s.selseg, s.selslot,
+                 s.selcode, s.rslot, s.used, s.rank, s.nr, s.bsum, T, G, E=E, K=K, R=s.R,
+                 BT=BT, NPP=_NPP, NP=K * (K - 1) // 2, num_warps=4)
+    _k2[(1,)](s.cnt, s.bsum, s.segoff, s.boff, S, s.NB, SP=s.SP, NBP=s.NBP, num_warps=8)
+    for dst, src in s.cu_views:  # per-GEMM cu slice (device copy, no host sync)
+        dst[:] = src
+    _k3[(s.NB,)](ids, s.selseg, s.selslot, s.selcode, s.rslot, s.used, s.rank, s.nr, s.boff,
+                 s.segoff, s.cnt, s.row_tok, s.row_code, s.perm, s.moff, S, T, G, K=K, R=s.R,
+                 BT=BT, SP=s.SP, num_warps=4)
+    return s.plan

@@ -37,6 +37,12 @@ from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 
 _BR = 32  # rows per pack program
 _BT = 32  # tokens per lane-table program
+# ``paddle.device.cuda.current_stream`` carries a @deprecated wrapper that
+# costs ~7 us per call, 25x the function itself; the new-API namespace is not
+# a drop-in (its Stream rejects an old-API Event), so call the function under
+# the wrapper.
+_current_stream = getattr(paddle.device.cuda.current_stream, "__wrapped__",
+                          paddle.device.cuda.current_stream)
 
 
 @triton.jit
@@ -112,10 +118,16 @@ def _pack_kernel(
 
 def default_gemm_config():
     """Static (non-persistent) 128 x 256 tiles for the grouped GEMM (K = c*I)."""
-    return GemmConfig(
-        tile_m=128, tile_n=256, cluster_m=1, cluster_n=1, pingpong=False,
-        is_dynamic_persistent=False, device_capacity=paddle.device.cuda.get_device_capability()[0],
-    )
+    global _default_config
+    if _default_config is None:
+        _default_config = GemmConfig(
+            tile_m=128, tile_n=256, cluster_m=1, cluster_n=1, pingpong=False,
+            is_dynamic_persistent=False, device_capacity=paddle.device.cuda.get_device_capability()[0],
+        )
+    return _default_config
+
+
+_default_config = None  # the config above is static: build it once per process
 
 
 class GroupList:
@@ -166,6 +178,29 @@ class Plan:
                    dev(out["moff"]))
 
 
+class _Scratch:
+    """``grouped_down_proj``'s work buffers for one (T, K, E, H, I) and group
+    list: the lane tables, the A buffer every bucket packs into in turn, y2,
+    and the per-bucket A / y2 views.  ``o`` is not here: it is the call's
+    result and stays a fresh tensor."""
+
+    def __init__(self, T, K, I, H, groups):
+        TK = T * K
+        self.row_s = paddle.empty([TK], dtype=paddle.int32)
+        self.w_s = paddle.empty([TK], dtype=paddle.float32)
+        a_buf = paddle.empty([TK * I], dtype=paddle.bfloat16)
+        self.y2 = paddle.empty([TK, H], dtype=paddle.bfloat16)
+        self.KP = triton.next_power_of_2(K)
+        self.buckets = tuple(
+            (c, nseg, at, bidx, TK // c, a_buf[: (TK // c) * c * I].view([TK // c, c * I]),
+             self.y2[: TK // c])
+            for c, nseg, at, bidx in groups.gemms
+        )
+
+
+_scratch = {}  # (id(groups), T, K, E, H, I) -> _Scratch
+
+
 def grouped_down_proj(
     y1, w2, expert_frequency_offset, lane_rows, lane_scores, token_lane_offset, ids, plan, groups,
     err=None, config=None, ready_event=None,
@@ -175,38 +210,39 @@ def grouped_down_proj(
     If ``ready_event`` is given (the plan is produced on another stream), the
     current stream waits on it first, so the plan can be built concurrently
     with the work before this call.
+
+    The work buffers are kept per (group list, shape) and reused across calls;
+    only ``o`` is freshly allocated.  Two concurrent calls of the same shape on
+    the same group list would therefore share them, which the ring never does.
     """
     if ready_event is not None:
-        paddle.device.cuda.current_stream().wait_event(ready_event)
+        _current_stream().wait_event(ready_event)
     T, K = int(ids.shape[0]), int(ids.shape[1])
     I, E, H = int(y1.shape[1]), int(w2.shape[0]), int(w2.shape[1])
     assert E == groups.E
     config = config or default_gemm_config()
     if err is None:
         err = paddle.zeros([1], dtype=paddle.int32)
-    TK = T * K
-    row_s = paddle.empty([TK], dtype=paddle.int32)
-    w_s = paddle.empty([TK], dtype=paddle.float32)
+    key = (id(groups), T, K, E, H, I)
+    s = _scratch.get(key)
+    if s is None:
+        s = _scratch[key] = _Scratch(T, K, I, H, groups)
     varlen = token_lane_offset is not None
     off = token_lane_offset if varlen else lane_rows
     _lane_tables_kernel[(triton.cdiv(T, _BT),)](
-        lane_rows, lane_scores, off, expert_frequency_offset, ids, row_s, w_s, err, T, E,
-        K=K, KP=triton.next_power_of_2(K), LOGE=int(E + 1).bit_length(), VARLEN=varlen, CHECK=True,
+        lane_rows, lane_scores, off, expert_frequency_offset, ids, s.row_s, s.w_s, err, T, E,
+        K=K, KP=s.KP, LOGE=int(E + 1).bit_length(), VARLEN=varlen, CHECK=True,
         BT=_BT, num_warps=4,
     )
-    a_buf = paddle.empty([TK * I], dtype=paddle.bfloat16)  # A of every bucket, reused in turn
-    y2 = paddle.empty([TK, H], dtype=paddle.bfloat16)
     w2t = w2.permute(0, 2, 1)
-    for c, nseg, at, bidx in groups.gemms:
-        nmax = TK // c  # rows of this GEMM are < nmax
-        a = a_buf[: nmax * c * I].view([nmax, c * I])
+    for c, nseg, at, bidx, nmax, a, y2v in s.buckets:  # rows of a GEMM are < nmax
         cu = plan.cu_slice(at, nseg)
         _pack_kernel[(triton.cdiv(nmax, _BR),)](
-            y1, plan.row_tok, plan.row_code, row_s, w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR, num_warps=4,
+            y1, plan.row_tok, plan.row_code, s.row_s, s.w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR, num_warps=4,
         )
-        gemm(a, w2t, out=y2[:nmax], cu_seqlens_m=cu, B_idx=bidx, tuned=False, config=config)
+        gemm(a, w2t, out=y2v, cu_seqlens_m=cu, B_idx=bidx, tuned=False, config=config)
     o = paddle.empty([T, H], dtype=paddle.bfloat16)
-    token_gather_and_sum_varlen_K_triton(y2, None, o, plan.perm, plan.moff, T, K, H, True)
+    token_gather_and_sum_varlen_K_triton(s.y2, None, o, plan.perm, plan.moff, T, K, H, True)
     return o
 
 
