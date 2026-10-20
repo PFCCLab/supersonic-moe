@@ -65,7 +65,7 @@ from .fp8_reference import (
     dequantize_activation_reference,
     quantize_activation_reference,
 )
-from .grouped_down_proj import current_grouped_plan, grouped_down_proj
+from .grouped_down_proj import current_grouped_plan, grouped_down_proj, supports_expert_k
 from .forward import _router_forward, _softmax_topk_fwd
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_fp8, enable_quack_gemm, is_fp8_active, is_using_quack_gemm
@@ -1492,6 +1492,17 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
         return (dlogits,)
 
 
+_UNIT_SCORES = {}
+
+
+def _unit_scores(n):
+    """A cached float32 vector of n ones (the grouped input gradient's scores)."""
+    t = _UNIT_SCORES.get(n)
+    if t is None:
+        t = _UNIT_SCORES[n] = paddle.ones([n], dtype=paddle.float32)
+    return t
+
+
 class _UpProjection(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1721,6 +1732,15 @@ class _UpProjection(torch.autograd.Function):
         )
         ctx._w1_original = w1
         ctx._wgrad_w1_accumulator = _main_grad_accumulator(w1)
+        # Grouped input gradient: a plan installed with backward=True is reused
+        # by the BF16 backward (dz @ W1 + combine as one grouped down projection).
+        _gp = current_grouped_plan()
+        ctx._grouped = (
+            _gp
+            if _gp is not None and _gp.backward and use_quack_gemm and not cfg.enabled
+            and supports_expert_k(w1.shape[1])
+            else None
+        )
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
@@ -1853,6 +1873,7 @@ class _UpProjection(torch.autograd.Function):
         # allocates its own output).  BF16 path allocates below.
         dw1_base = dw1 = None
         db1 = None if b1 is None else torch.empty_like(b1)
+        dx_expanded = None  # set by every path but the grouped input gradient
 
         if use_quack_gemm:
             assert not is_compiling
@@ -2121,28 +2142,48 @@ class _UpProjection(torch.autograd.Function):
                         num_experts=E,
                         device=x.device,
                     )
-                dx_expanded = gemm(
-                    dz, w1,
-                    cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
-                    tuned=False,
-                )
+                if ctx._grouped is None:
+                    dx_expanded = gemm(
+                        dz, w1,
+                        cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
+                        tuned=False,
+                    )
+                else:
+                    # dx[t] = sum_k dz[row(t, k)] @ W1[e_k]: the down projection's
+                    # grouped form with W1 (E, 2I, H) as its (E, H, 2I) weight and
+                    # unit scores (dz already carries the router weights).
+                    _gp = ctx._grouped
+                    dx_expanded = None
+                    dx_reduced = grouped_down_proj(
+                        dz.contiguous(),
+                        w1.permute(0, 2, 1),
+                        expert_frequency_offset,
+                        s_reverse_scatter_idx,
+                        _unit_scores(TK),
+                        num_activated_expert_per_token_offset if is_varlen_K else None,
+                        _gp.ids,
+                        _gp.plan,
+                        _gp.groups,
+                        _gp.err,
+                    )
                 # _log_stage_memory("In backward, after w1 grad")
         else:
             raise RuntimeError(
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
             )
 
-        dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
+        if dx_expanded is not None:
+            dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
 
-        _token_broadcast_backward(
-            dx_reduced=dx_reduced,
-            dx_expanded=dx_expanded,
-            s_reverse_scatter_idx=s_reverse_scatter_idx,
-            num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(K if K is not None else E),
-            H=H,
-            is_varlen_K=is_varlen_K,
-        )
+            _token_broadcast_backward(
+                dx_reduced=dx_reduced,
+                dx_expanded=dx_expanded,
+                s_reverse_scatter_idx=s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
+                varlen_K_max=(K if K is not None else E),
+                H=H,
+                is_varlen_K=is_varlen_K,
+            )
         # _log_stage_memory(
         #     f"In backward, after up_gate gemm bwd, d_up_gate_input shape: {dx_reduced.shape}, dtype:{dx_reduced.dtype}"
         # )

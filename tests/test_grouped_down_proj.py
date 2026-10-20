@@ -169,10 +169,12 @@ def test_mismatched_routing_sets_error():
     assert int(err.numpy()[0]) == 1
 
 
-def test_moe_forward_backward_matches_default():
+@pytest.mark.parametrize("bwd", [False, True])
+def test_moe_forward_backward_matches_default(bwd):
     """End to end: output within bf16 error of the default path, and every
     gradient bitwise identical (the backward recomputes y2 and reads neither
-    y2 nor o)."""
+    y2 nor o).  bwd: the plan also serves the input gradient (grouped
+    dz @ W1 + combine); x.grad then within bf16 error, the others bitwise."""
     T, H, I, E, K = 2048, 512, 128, 32, 8
     rng = np.random.RandomState(9)
     ids = _routing(rng, E, K, T, 0.05)
@@ -191,7 +193,7 @@ def test_moe_forward_backward_matches_default():
         sc = paddle.to_tensor(np.where(ids >= 0, rng.dirichlet(np.ones(K), size=T), 0).astype(np.float32))
         for t in (x, w1, w2, sc):
             t.stop_gradient = False
-        ctx = grouped_down_proj_plan(gl, plan, d_ids, err) if grouped else _nullctx()
+        ctx = grouped_down_proj_plan(gl, plan, d_ids, err, backward=bwd) if grouped else _nullctx()
         with ctx:
             o = run_sonic_moe(x, paddle.to_tensor(ids.astype(np.int64)), sc, K, E, w1, w2)
         (o.astype(paddle.float32) * 0.01).sum().backward()
@@ -199,14 +201,32 @@ def test_moe_forward_backward_matches_default():
         g = lambda t: t.astype(paddle.float32).numpy()  # noqa: E731
         return g(o), {n: g(t.grad) for n, t in (("x", x), ("w1", w1), ("w2", w2), ("sc", sc))}
 
+    import importlib
+
+    fn_mod = importlib.import_module("sonicmoe.functional")
+    real, calls = fn_mod.grouped_down_proj, []
+
+    def counted(*a, **k):
+        calls.append(int(a[0].shape[1]))  # per-expert K: I forward, 2I backward
+        return real(*a, **k)
+
     rng = np.random.RandomState(1)
     o0, g0 = run(False)
     rng = np.random.RandomState(1)
-    o1, g1 = run(True)
+    fn_mod.grouped_down_proj = counted
+    try:
+        o1, g1 = run(True)
+    finally:
+        fn_mod.grouped_down_proj = real
+    assert calls == ([I, 2 * I] if bwd else [I]), calls
     assert int(err.numpy()[0]) == 0
     rel = np.linalg.norm(o1 - o0) / np.linalg.norm(o0)
     assert np.isfinite(o1).all() and rel < 1e-2, rel
     for n in g0:
+        if bwd and n == "x":  # grouped sum order differs from the per-lane k-sum
+            r = np.linalg.norm(g1[n] - g0[n]) / np.linalg.norm(g0[n])
+            assert np.isfinite(g1[n]).all() and r < 1e-2, r
+            continue
         assert np.array_equal(g0[n], g1[n]), (n, np.abs(g0[n] - g1[n]).max())
 
 

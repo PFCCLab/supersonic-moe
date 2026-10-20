@@ -286,6 +286,10 @@ class _GroupedPlan:
     ids: paddle.Tensor
     err: paddle.Tensor
     ready_event: object = None
+    # The caller keeps the plan's buffers unchanged until this forward's
+    # backward has run: the up projection then reuses the plan for its input
+    # gradient (grouped dz @ W1 + combine instead of per-lane GEMM + k-sum).
+    backward: bool = False
 
 
 _local = threading.local()
@@ -296,14 +300,17 @@ def current_grouped_plan():
 
 
 @contextlib.contextmanager
-def grouped_down_proj_plan(groups, plan, ids, err=None, ready_event=None):
+def grouped_down_proj_plan(groups, plan, ids, err=None, ready_event=None, backward=False):
     """Install (groups, plan, ids) for the next ``_DownProjection`` forward on
     this thread; None restores the default path.  ``ready_event``: an event the
     down projection waits on (the plan was produced on another stream).
-    Nestable."""
+    ``backward``: the plan also serves the up projection's input gradient in
+    this forward's backward; the caller must keep its buffers unchanged until
+    then.  Nestable."""
     prev = getattr(_local, "cur", None)
     _local.cur = _GroupedPlan(
-        groups, plan, ids, err if err is not None else paddle.zeros([1], dtype=paddle.int32), ready_event
+        groups, plan, ids, err if err is not None else paddle.zeros([1], dtype=paddle.int32), ready_event,
+        bool(backward),
     )
     try:
         yield _local.cur
