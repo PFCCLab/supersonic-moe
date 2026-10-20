@@ -95,7 +95,7 @@ def _lane_tables_kernel(
 @triton.jit
 def _pack_kernel(
     y1_ptr, tok_ptr, code_ptr, row_ptr, w_ptr, cu_ptr, dst_ptr, nseg,
-    K: tl.constexpr, I: tl.constexpr, C: tl.constexpr, BR: tl.constexpr,
+    K: tl.constexpr, I: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, IP: tl.constexpr,
 ):
     """Rows [cu[0], cu[nseg]) of one GEMM:  dst[r, j*I:(j+1)*I] =
     w[t, l_j] * y1[row[t, l_j]],  l_j = nibble j of code[r] (sorted rank)."""
@@ -105,15 +105,16 @@ def _pack_kernel(
     m = r < hi
     t = tl.load(tok_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
     code = tl.load(code_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
-    c = tl.arange(0, I)
+    c = tl.arange(0, IP)  # IP = next power of 2 >= I
+    mc = m[:, None] & (c[None, :] < I)
     for j in tl.static_range(C):
         lane = (code >> (4 * j)) & 15
         off = t * K + lane
         src = tl.load(row_ptr + off, mask=m, other=0).to(tl.int64)
         sc = tl.load(w_ptr + off, mask=m, other=0.0)
-        v = tl.load(y1_ptr + src[:, None] * I + c[None, :], mask=m[:, None], other=0.0)
+        v = tl.load(y1_ptr + src[:, None] * I + c[None, :], mask=mc, other=0.0)
         v = v.to(tl.float32) * sc[:, None]
-        tl.store(dst_ptr + (r[:, None].to(tl.int64) * C + j) * I + c[None, :], v.to(tl.bfloat16), mask=m[:, None])
+        tl.store(dst_ptr + (r[:, None].to(tl.int64) * C + j) * I + c[None, :], v.to(tl.bfloat16), mask=mc)
 
 
 def default_gemm_config():
@@ -238,7 +239,8 @@ def grouped_down_proj(
     for c, nseg, at, bidx, nmax, a, y2v in s.buckets:  # rows of a GEMM are < nmax
         cu = plan.cu_slice(at, nseg)
         _pack_kernel[(triton.cdiv(nmax, _BR),)](
-            y1, plan.row_tok, plan.row_code, s.row_s, s.w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR, num_warps=4,
+            y1, plan.row_tok, plan.row_code, s.row_s, s.w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR,
+            IP=triton.next_power_of_2(I), num_warps=4,
         )
         gemm(a, w2t, out=y2v, cu_seqlens_m=cu, B_idx=bidx, tuned=False, config=config)
     o = paddle.empty([T, H], dtype=paddle.bfloat16)

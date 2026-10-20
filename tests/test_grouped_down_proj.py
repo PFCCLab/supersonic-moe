@@ -116,6 +116,22 @@ def test_exact_on_integer_data(case):
     assert np.array_equal(o_g, o_prod)
 
 
+@pytest.mark.parametrize("I", [16, 32, 48, 96])
+@pytest.mark.parametrize("case", ["pairs", "mixed"])
+def test_exact_short_expert_k(case, I):
+    """Per-expert K below 64 or not a power of 2 (e.g. I-sharded experts at
+    high EP): the segmented GEMM uses a shorter k-tile, the pack kernel masks."""
+    E, K, T, H, sizes, n, drop = CASES[case]
+    rng = np.random.RandomState(I)
+    ids = _routing(rng, E, K, T, drop)
+    w = (2.0 ** -rng.randint(0, 2, (T, K))).astype(np.float32)
+    y1 = (rng.randint(-1, 2, (T * K, I)) * (rng.rand(T * K, I) < 0.2)).astype(np.float32)
+    w2 = rng.randint(-1, 2, (E, H, I)).astype(np.float32)
+    o_prod, o_g, err, nrow = run_both(ids, w, y1, w2, frequent_groups(ids, sizes, n))
+    assert err == 0 and nrow < int((ids >= 0).sum())
+    assert np.array_equal(o_g, o_prod)
+
+
 def test_mismatched_routing_sets_error():
     E, K, T, H = 64, 8, 512, 256
     rng = np.random.RandomState(3)
