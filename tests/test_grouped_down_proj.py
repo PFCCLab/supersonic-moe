@@ -116,11 +116,23 @@ def test_exact_on_integer_data(case):
     assert np.array_equal(o_g, o_prod)
 
 
+def test_supports_expert_k():
+    from sonicmoe.functional.grouped_down_proj import supports_expert_k
+
+    assert supports_expert_k(64) and supports_expert_k(128) and supports_expert_k(256)
+    assert not supports_expert_k(24) and not supports_expert_k(0)
+    assert supports_expert_k(32) == supports_expert_k(16) == supports_expert_k(48)
+
+
 @pytest.mark.parametrize("I", [16, 32, 48, 96])
 @pytest.mark.parametrize("case", ["pairs", "mixed"])
 def test_exact_short_expert_k(case, I):
     """Per-expert K below 64 or not a power of 2 (e.g. I-sharded experts at
     high EP): the segmented GEMM uses a shorter k-tile, the pack kernel masks."""
+    from sonicmoe.functional.grouped_down_proj import supports_expert_k
+
+    if not supports_expert_k(I):
+        pytest.skip("quack without short-segment segmented B")
     E, K, T, H, sizes, n, drop = CASES[case]
     rng = np.random.RandomState(I)
     ids = _routing(rng, E, K, T, drop)

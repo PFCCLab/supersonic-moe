@@ -106,7 +106,10 @@ def _pack_kernel(
     t = tl.load(tok_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
     code = tl.load(code_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
     c = tl.arange(0, IP)  # IP = next power of 2 >= I
-    mc = m[:, None] & (c[None, :] < I)
+    if IP == I:
+        mc = m[:, None]
+    else:
+        mc = m[:, None] & (c[None, :] < I)
     for j in tl.static_range(C):
         lane = (code >> (4 * j)) & 15
         off = t * K + lane
@@ -115,6 +118,21 @@ def _pack_kernel(
         v = tl.load(y1_ptr + src[:, None] * I + c[None, :], mask=mc, other=0.0)
         v = v.to(tl.float32) * sc[:, None]
         tl.store(dst_ptr + (r[:, None].to(tl.int64) * C + j) * I + c[None, :], v.to(tl.bfloat16), mask=mc)
+
+
+def supports_expert_k(I):
+    """Whether `grouped_down_proj` runs with a per-expert K (intermediate size
+    per expert) of ``I``.  The segmented-B GEMM needs every segment to be whole
+    k-tiles: 64 always works; any multiple of 16 needs a quack whose segmented
+    B picks a shorter k-tile (``GemmSm100.mma_inst_tile_k``)."""
+    I = int(I)
+    if I > 0 and I % 64 == 0:
+        return True
+    if I <= 0 or I % 16:
+        return False
+    from quack.gemm_sm100 import GemmSm100
+
+    return hasattr(GemmSm100, "mma_inst_tile_k")
 
 
 def default_gemm_config():
