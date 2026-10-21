@@ -11,13 +11,22 @@ from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_config import GemmConfig
 from quack.gemm_default_epi import GemmDefaultSm100
-from quack.gemm_interface import gemm, gemm_add
+from quack.gemm_interface import gemm, gemm_add, gemm_tuned
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 
 from ..cache_manager import InstrumentedCompileCache as _ICC
 
 
 _MAX_FAST_PATH_ENTRIES = 64
+_SM90_WGRAD_CONFIG = GemmConfig(
+    tile_m=128,
+    tile_n=256,
+    pingpong=False,
+    is_dynamic_persistent=False,
+    cluster_m=2,
+    cluster_n=1,
+    device_capacity=9,
+)
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.uint8: cutlass.Uint8,
@@ -174,17 +183,24 @@ def _validate_problem(
             "BF16 varlen-K wgrad B must have shape [total_K, N], expected "
             f"{(int(total_K), int(N))}, got {tuple(B.shape)}"
         )
-    if A_idx.ndim != 1 or A_idx.numel() != int(total_K):
+    if A_idx is None:
+        # Route-ordered A (SM90 only): A's columns are the total_K routed rows.
+        if int(A.shape[1]) != int(total_K):
+            raise ValueError(
+                "BF16 varlen-K wgrad without A_idx needs A of shape [M, total_K], "
+                f"got {tuple(A.shape)} for total_K={int(total_K)}"
+            )
+    elif A_idx.ndim != 1 or int(A_idx.shape[0]) != int(total_K):
         raise ValueError(
             "BF16 varlen-K wgrad A_idx must be route/total_K-sized [total_K], "
             f"expected {int(total_K)} elements, got shape {tuple(A_idx.shape)}"
         )
-    if cu_seqlens_k.ndim != 1 or cu_seqlens_k.numel() != int(num_experts) + 1:
+    if cu_seqlens_k.ndim != 1 or int(cu_seqlens_k.shape[0]) != int(num_experts) + 1:
         raise ValueError(
             "BF16 varlen-K wgrad cu_seqlens_k must have num_experts + 1 elements, "
             f"got shape {tuple(cu_seqlens_k.shape)}"
         )
-    if A_idx.dtype != torch.int32 or cu_seqlens_k.dtype != torch.int32:
+    if (A_idx is not None and A_idx.dtype != torch.int32) or cu_seqlens_k.dtype != torch.int32:
         raise TypeError("BF16 varlen-K wgrad A_idx and cu_seqlens_k must be int32")
 
 
@@ -207,6 +223,7 @@ def _run_bf16_wgrad_varlen_k(
     epi_args,
     add_to_output: bool = False,
     config: Optional[GemmConfig] = None,
+    dynamic_scheduler: bool = False,
 ) -> torch.Tensor:
     _validate_problem(
         A,
@@ -222,6 +239,27 @@ def _run_bf16_wgrad_varlen_k(
     )
     device_capacity = get_device_capacity(device)
     if device_capacity[0] == 9:
+        if C is None or C is out:
+            # quack's untuned SM90 default (128x192 pingpong) wastes a third
+            # of the last N tile for N in {512, 1024}; 128x256 cooperative with
+            # cluster_m=2 is 15% faster on H800 for the gathered varlen-K wgrad
+            # (dw1 315 -> 268 us, dw2 180 -> 152 us) and bitwise identical.
+            gemm_tuned.fn(
+                A,
+                B,
+                out,
+                None,
+                cu_seqlens_k=cu_seqlens_k,
+                A_idx=A_idx,
+                add_to_output=C is not None or add_to_output,
+                # Tile->CTA assignment only; every tile still runs its full K
+                # loop in one CTA, so the result is bitwise the same.  Used when
+                # the GEMM shares the GPU with a DeepEP kernel: CTAs that could
+                # not be resident at launch pick up the remaining tiles later.
+                dynamic_scheduler=dynamic_scheduler,
+                config=_SM90_WGRAD_CONFIG,
+            )
+            return out
         call = gemm_add if add_to_output else gemm
         kwargs = dict(out=out, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx, dynamic_scheduler=False, tuned=False)
         if C is not None or add_to_output:
@@ -229,6 +267,8 @@ def _run_bf16_wgrad_varlen_k(
         return call(A, B, **kwargs)
     if device_capacity[0] < 10:
         raise RuntimeError("BF16 varlen-K wgrad requires SM90+")
+    if A_idx is None:
+        raise NotImplementedError("SM100 BF16 varlen-K wgrad requires A_idx (gather_A kernel)")
     if config is None:
         config = _bf16_wgrad_default_config(device, M=M, N=N)
     fast_key = (
@@ -411,6 +451,7 @@ def bf16_wgrad_gemm_varlen_k_accumulate(
     total_K: int,
     num_experts: int,
     device: torch.device,
+    dynamic_scheduler: bool = False,
 ) -> None:
     _run_bf16_wgrad_varlen_k(
         A,
@@ -428,6 +469,7 @@ def bf16_wgrad_gemm_varlen_k_accumulate(
         compile_cache=_COMPILE_CACHE_BF16_VK_ACCUM,
         fast_cache=_GEMM_FAST_PATH_BF16_VK_ACCUM,
         epi_args=GemmDefaultSm100.EpilogueArguments(beta=Float32(1.0)),
+        dynamic_scheduler=dynamic_scheduler,
     )
 
 
@@ -443,6 +485,7 @@ def bf16_wgrad_gemm_varlen_k_tma_add(
     total_K: int,
     num_experts: int,
     device: torch.device,
+    dynamic_scheduler: bool = False,
 ) -> None:
     _run_bf16_wgrad_varlen_k(
         A,
@@ -461,4 +504,5 @@ def bf16_wgrad_gemm_varlen_k_tma_add(
         fast_cache=_GEMM_FAST_PATH_BF16_VK_TMA_ADD,
         epi_args=GemmDefaultSm100.EpilogueArguments(add_to_output=True),
         add_to_output=True,
+        dynamic_scheduler=dynamic_scheduler,
     )

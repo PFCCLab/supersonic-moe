@@ -551,6 +551,7 @@ def _token_broadcast_backward(
     varlen_K_max: int,
     H: int,
     is_varlen_K: bool,
+    skip_single: bool = False,
 ) -> None:
     if num_activated_expert_per_token_offset is None:
         assert not is_varlen_K, "`num_activated_expert_per_token_offset` as None requires fixed top-K routing"
@@ -564,6 +565,7 @@ def _token_broadcast_backward(
         varlen_K_max,
         H,
         is_varlen_K,
+        skip_single=skip_single,
     )
 
 

@@ -24,7 +24,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass import Int32, Float32, Float16, Boolean, const_expr
+from cutlass import Int32, Int64, Int16, Float32, Float16, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 
@@ -64,6 +64,9 @@ from ._gated_epilogues import (
     GemmGatedBlockscaledQuantPostActMixin,
     Sm90RawGatedQuantMixin,
     GemmDGatedFP8PreActMixin,
+    Sm90DGatedDzQuantMixin,
+    Sm90DGatedColQuantMixin,
+    Sm90ScaledGemmRouteScatterMixin,
 )
 
 
@@ -221,6 +224,7 @@ class _GemmSm90RawScaledBase:
     """
 
     arch = 90
+    a_tile_local = False  # see Sm90ScaledWgradVarlenKTileLocal
 
     @dataclass
     class EpilogueArguments:
@@ -241,6 +245,9 @@ class _GemmSm90RawScaledBase:
         use_clc_persistence: bool = False,
         activation_group: int = 32,
         weight_block: int = 32,
+        tma_gather_A: bool = False,
+        tma_gather_cp_div: int = 0,
+        tma_gather_warps: int = 1,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -264,6 +271,14 @@ class _GemmSm90RawScaledBase:
         # It always preserves E4M3 operands and scales K=32 WGMMA partials into
         # a separate FP32 master accumulator.
         self.raw_ue8m0_scaled = True
+        # Software-pipelined profile-32 mainloop (see mma_scaled_pipelined).
+        # Disabled: the extra 64-reg accumulator spills at tile 128x128 (4-12% slower).
+        self.pipe_mma = False
+        # gather_A with source-row A scales: the MMA warps read scales through
+        # A_idx (set by _new_kernel; requires gather_A and not varlen-K).
+        self.gather_a_scales = False
+        # CTA K tile override (0 = activation_group); set by _new_kernel.
+        self.k_tile = 0
         self.activation_group = int(activation_group)
         self.weight_block = int(weight_block)
         if (self.activation_group, self.weight_block) not in ((32, 32), (128, 128)):
@@ -274,13 +289,23 @@ class _GemmSm90RawScaledBase:
             assert self.is_persistent, "Pingpong gemm requires persistent scheduler"
         self.fp8_slow_accum = not fp8_fast_accum and a_dtype.width == 8
         self.gather_A = gather_A
-        if gather_A:
+        # TMA row gather (varlen-M only): one 2D TMA per A row (box 1 x tile_K)
+        # lands in the swizzled stage, so gathered A can be multicast across
+        # the cluster N dimension like a plain TMA A tile.
+        self.tma_gather_A = bool(tma_gather_A) and gather_A
+        if gather_A and not self.tma_gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
 
         self.cluster_shape_mnk = cluster_shape_mnk
         # K dimension is deferred in _setup_attributes
         self.cta_tile_shape_mnk = (*tile_shape_mn, 1)
         tile_M, tile_N = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
+        # Hybrid TMA row gather: the last tile_M // tma_gather_cp_div rows of each
+        # tile go through cp.async (LSU) in 3 producer warps, the rest through
+        # per-row TMA in the TMA warp, so neither path bounds the mainloop.
+        self.hybrid_cp_rows = (
+            tile_M // tma_gather_cp_div if self.tma_gather_A and tma_gather_cp_div else 0
+        )
         # check the cta tile shape
         if not self.pingpong:
             if tile_M not in [64, 128, 192, 256, 320]:
@@ -324,7 +349,7 @@ class _GemmSm90RawScaledBase:
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
 
         self.num_mcast_ctas_a = self.cluster_shape_mnk[1]
-        if self.gather_A:
+        if self.gather_A and not self.tma_gather_A:
             assert self.num_mcast_ctas_a == 1
         self.num_mcast_ctas_b = self.cluster_shape_mnk[0]
         self.is_a_mcast = self.num_mcast_ctas_a > 1
@@ -339,7 +364,22 @@ class _GemmSm90RawScaledBase:
         self.threads_per_cta = (self.mma_warp_groups + 1) * self.num_threads_per_warp_group
         self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
         self.num_epi_warps = (self.mma_warp_groups if not self.pingpong else 1) * 4
-        self.num_ab_load_warps = 1 if not self.gather_A else 4
+        self.cpasync_gather_A = self.gather_A and (
+            not self.tma_gather_A or self.hybrid_cp_rows > 0
+        )
+        # TMA row issue is bound by one lane's issue rate: split the TMA rows over
+        # ``tma_gather_warps`` load warps (warp 0 also loads B and arms the barrier).
+        self.tma_gather_warps = int(tma_gather_warps) if self.tma_gather_A else 1
+        # multi_load: several load roles per stage (load_AB_hybrid, PipelineTmaCpAsync)
+        self.multi_load = self.tma_gather_A and (
+            self.hybrid_cp_rows > 0 or self.tma_gather_warps > 1
+        )
+        self.num_ab_load_warps = 4 if self.cpasync_gather_A or self.multi_load else 1
+        if self.hybrid_cp_rows > 0:
+            assert self.tma_gather_warps < 4
+            self.num_cp_threads = (4 - self.tma_gather_warps) * 32
+        else:
+            self.num_cp_threads = 128 if self.cpasync_gather_A else 0
         self.ab_load_warp_id = self.mma_warp_groups * 4
 
         regs_per_thread = math.prod(self.cta_tile_shape_mnk[:2]) // (
@@ -349,7 +389,7 @@ class _GemmSm90RawScaledBase:
             regs_per_thread *= 2
         # The raw-scaled path always keeps an independent FP32 partial and
         # master accumulator, matching the register footprint of slow FP8.
-        if not self.gather_A:
+        if not self.cpasync_gather_A:
             if self.mma_warp_groups == 3:
                 self.num_regs_load, self.num_regs_mma = 32, 160
             else:
@@ -414,12 +454,19 @@ class _GemmSm90RawScaledBase:
             )
         mma_inst_shape_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
+        # CTA K tile: one scale group by default; profile-32 may use a K=128
+        # tile (4 scale columns per stage) to amortize pipeline and scale
+        # addressing overhead. Promotion order per K=32 partial is unchanged.
+        k_tile = self.k_tile if self.k_tile else self.activation_group
+        assert k_tile in (32, 128) and k_tile % self.activation_group == 0
         self.cta_tile_shape_mnk = (
             self.cta_tile_shape_mnk[0],
             self.cta_tile_shape_mnk[1],
-            self.activation_group,
+            k_tile,
         )
-        self.scale_partials_per_tile = self.activation_group // 32
+        self.scale_partials_per_tile = k_tile // 32
+        self.partials_per_scale = self.activation_group // 32
+        self.scale_cols_per_tile = k_tile // self.activation_group
         if self.raw_ue8m0_scaled:
             assert self.a_dtype == cutlass.Float8E4M3FN and self.b_dtype == cutlass.Float8E4M3FN
             assert mma_inst_shape_k == 32, "Hopper scaled E4M3 requires WGMMA K=32 partials"
@@ -434,6 +481,7 @@ class _GemmSm90RawScaledBase:
             self.d_dtype,
         )
 
+        smem_capacity = cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}")
         # Compute stage before compute smem layout
         self.ab_stage, self.epi_stage, self.epi_c_stage = self._compute_stages(
             self.cta_tile_shape_mnk,
@@ -443,7 +491,7 @@ class _GemmSm90RawScaledBase:
             self.d_dtype,
             self.c_dtype,
             epilogue_args,
-            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}"),  # smem_capacity
+            smem_capacity,
             self.occupancy,
         )
         self.sched_stage = 2 if self.pingpong else 1
@@ -549,15 +597,27 @@ class _GemmSm90RawScaledBase:
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
         tma_atom_a, tma_tensor_a = None, None
         if const_expr(not self.gather_A):
+            mA_tma = mA
+            if const_expr(self.a_tile_local):
+                # A = fp8 [F, total_K] stored tile-locally in a bf16 [total_K, F]
+                # buffer (see Sm90DGatedColQuantMixin): element (f, k) at byte
+                # (k//128*128 + f%128) * 2F + f//128 * 256 + k%128.  The host
+                # passes the first F*total_K bytes as a flat [F, total_K] view.
+                fb, kb = mA.shape[0] // 128, mA.shape[1] // 128
+                mA_tma = cute.make_tensor(mA.iterator, cute.make_layout(
+                    ((128, fb), (128, kb)), stride=((fb * 256, 256), (1, fb * 32768))))
             # Packed varlen-K wgrad owns a physical contiguous K range per expert.
             # Keep the rank-2 descriptor: VarlenManager applies the packed offset
             # with domain_offset, avoiding the ragged descriptor's wraparound stride.
             tma_atom_a, tma_tensor_a = self._make_tma_atoms_and_tensors(
-                mA,
+                mA_tma,
                 a_smem_layout,
                 (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]),
                 self.cluster_shape_mnk[1],
             )
+        elif const_expr(self.tma_gather_A):
+            assert varlen_m, "TMA row gather supports varlen-M only"
+            tma_atom_a = self._make_tma_row_atom(mA, a_smem_layout)
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
             mB,
             b_smem_layout,
@@ -566,8 +626,13 @@ class _GemmSm90RawScaledBase:
         )
 
         self.num_tma_load_bytes = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        if const_expr(not self.gather_A):
+        if const_expr(not self.cpasync_gather_A):
             self.num_tma_load_bytes += cute.size_in_bytes(self.a_dtype, a_smem_layout)
+        elif const_expr(self.hybrid_cp_rows > 0):
+            self.num_tma_load_bytes += (
+                (self.cta_tile_shape_mnk[0] - self.hybrid_cp_rows)
+                * self.cta_tile_shape_mnk[2] * self.a_dtype.width // 8
+            )
 
         tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
@@ -612,6 +677,9 @@ class _GemmSm90RawScaledBase:
             epi_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.epi_c_stage * 2]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
             sched_data: cute.struct.MemRange[Int32, self.sched_stage * 4]
+            a_idx: cute.struct.MemRange[
+                Int32, self.cta_tile_shape_mnk[0] if self.tma_gather_A else 1
+            ]
             sD: cute.struct.Align[
                 cute.struct.MemRange[
                     self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
@@ -766,6 +834,9 @@ class _GemmSm90RawScaledBase:
 
         # Generate smem tensor A/B
         sA = storage.sA.get_tensor(a_smem_layout.outer, swizzle=a_smem_layout.inner)
+        sAIdx = None
+        if const_expr(self.tma_gather_A):
+            sAIdx = storage.a_idx.get_tensor(cute.make_layout(self.cta_tile_shape_mnk[0]))
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
         sD = None
         if const_expr(has_D):
@@ -779,11 +850,11 @@ class _GemmSm90RawScaledBase:
             varlen_params,
             # Only used if not varlen_m
             len_m_static=Int32(
-                mA_mkl.shape[0]
+                cute.size(mA_mkl, mode=[0])
                 if varlen_k or varlen_params.mAIdx is None
                 else varlen_params.mAIdx.shape[0]
             ),
-            len_k_static=Int32(mA_mkl.shape[1]),
+            len_k_static=Int32(cute.size(mA_mkl, mode=[1])),
         )
 
         TileSchedulerCls = partial(
@@ -872,6 +943,18 @@ class _GemmSm90RawScaledBase:
                             dst_tensor=sA,
                             mcast_mask=a_mcast_mask,
                         )
+                    elif const_expr(self.multi_load):
+                        pass  # built per producer role in load_AB_hybrid
+                    elif const_expr(self.tma_gather_A):
+                        copy_A = self.tma_row_gather_get_copy_fn(
+                            tma_atom_a,
+                            sA.iterator,
+                            sAIdx,
+                            gAIdx,
+                            len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
+                            block_in_cluster_coord_mnk[1],
+                            a_mcast_mask,
+                        )
                     else:
                         tiled_copy_A = self._make_gmem_tiled_copy_A(
                             mA_mkl.element_type, self.a_layout, self.num_ab_load_warps * 32
@@ -911,9 +994,25 @@ class _GemmSm90RawScaledBase:
                         mcast_mask=b_mcast_mask,
                     )
                     k_tile_cnt = cute.ceil_div(len_k, self.cta_tile_shape_mnk[2])
-                    if const_expr(not self.gather_A):
+                    if const_expr(not self.cpasync_gather_A and not self.multi_load):
                         ab_producer_state = self.load_AB(
                             ab_pipeline, ab_producer_state, copy_A, copy_B, k_tile_cnt
+                        )
+                    elif const_expr(self.multi_load):
+                        ab_producer_state = self.load_AB_hybrid(
+                            ab_pipeline,
+                            ab_producer_state,
+                            tma_atom_a,
+                            mA_mk,
+                            sA,
+                            sAIdx,
+                            gAIdx,
+                            len_m - tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0],
+                            len_k,
+                            block_in_cluster_coord_mnk[1],
+                            a_mcast_mask,
+                            copy_B,
+                            k_tile_cnt,
                         )
                     else:
                         ab_producer_state = self.load_AB_gather_A(
@@ -933,7 +1032,13 @@ class _GemmSm90RawScaledBase:
                     if is_scheduler_warp:
                         tile_scheduler.write_work_tile_to_smem(work_tile)
                     work_tile = tile_scheduler.get_current_work()
-                ab_pipeline.producer_tail(ab_producer_state)
+                if const_expr(self.multi_load and self.hybrid_cp_rows == 0):
+                    # Pure multi-warp TMA: the full barrier expects one producer
+                    # arrive, so only the lead warp may run the tail acquire.
+                    if warp_idx == self.ab_load_warp_id:
+                        ab_pipeline.producer_tail(ab_producer_state)
+                else:
+                    ab_pipeline.producer_tail(ab_producer_state)
                 if is_scheduler_warp:
                     tile_scheduler.producer_tail()
 
@@ -961,6 +1066,13 @@ class _GemmSm90RawScaledBase:
                 thr_mma, self.cta_tile_shape_mnk, sA, sB
             )
             acc_slow = cute.make_rmem_tensor(acc.shape, self.acc_dtype)
+            # Profile-32 non-varlen-K: double-buffered partial accumulator so the
+            # WGMMA of K tile k overlaps the FP32 promotion of tile k-1.
+            use_pipe_mma = const_expr(
+                not varlen_k and self.scale_partials_per_tile == 1 and self.pipe_mma
+                and not self.gather_a_scales
+            )
+            acc2 = cute.make_rmem_tensor(acc.shape, self.acc_dtype) if use_pipe_mma else None
             # Differential control: this is the vendored native FP8 mainloop
             # callable used to prove that merely carrying scale tensors is safe.
             mma_fn = partial(quack_sm90_utils.gemm_w_idx, tiled_mma, acc, tCrA, tCrB)
@@ -971,7 +1083,8 @@ class _GemmSm90RawScaledBase:
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="mma")
                     self.pingpong_barrier_arrive(warp_group_idx=0, stage="epi")
 
-            k_tile_cnt_static = cute.ceil_div(mA_mkl.shape[1], self.cta_tile_shape_mnk[2])
+            k_tile_cnt_static = cute.ceil_div(cute.size(mA_mkl, mode=[1]),
+                                              self.cta_tile_shape_mnk[2])
             c_tile_cnt = cute.size(cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile))
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
@@ -1009,12 +1122,54 @@ class _GemmSm90RawScaledBase:
                 if const_expr(varlen_m):
                     scale_m_offset = varlen_manager.params.cu_seqlens_m[batch_idx]
                 if const_expr(varlen_k):
+                    # Packed expert starts are multiples of the wgrad token group.
                     scale_k_offset = (
                         varlen_manager.params.cu_seqlens_k[safe_batch_idx]
-                        // 32
+                        // self.activation_group
+                    )
+                # Early C prefetch (non-pingpong): issue the first epi_c_stage C
+                # subtile TMA loads before the mainloop so their DRAM latency is
+                # hidden behind the MMA instead of stalling the epilogue start.
+                early_c = const_expr(has_C and not self.pingpong)
+                copy_C = None
+                if const_expr(early_c):
+                    copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
+                        tma_atom_c,
+                        varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
+                        self.cta_tile_shape_mnk[:2],
+                        self.epi_tile,
+                        sC,
+                        tile_coord_mnkl,
+                    )
+                    copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
+                    epi_producer_state = self.epi_prefetch_c(
+                        copy_C, epi_pipeline, epi_producer_state, is_tma_warp
+                    )
+                epilogue_barrier = pipeline.NamedBarrier(
+                    barrier_id=int(NamedBarrierGemm.Epilogue),
+                    num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
+                )
+                # Per-row epilogue metadata loaded before the mainloop (latency hidden by MMA).
+                epi_pre = None
+                if const_expr(hasattr(self, "epi_tile_prefetch")):
+                    tiled_copy_r2s_pre, _, _ = self.epilog_smem_store_and_partition(
+                        tiled_mma, self.d_layout,
+                        self.d_dtype if self.d_dtype is not None else cutlass.BFloat16, sD, tidx,
+                    )
+                    epi_pre = self.epi_tile_prefetch(
+                        epilogue_params, tiled_copy_r2s_pre, sD, tile_coord_mnkl, varlen_manager,
+                        tidx,
                     )
                 if k_tile_cnt == 0:
                     acc.fill(0.0)
+                elif const_expr(use_pipe_mma):
+                    ab_read_state = self.mma_scaled_pipelined(
+                        ab_pipeline, ab_read_state, tiled_mma, acc, acc2, acc_slow,
+                        tCrA, tCrB, k_tile_cnt, warp_group_idx,
+                        mSFA_raw, mSFB_raw, tile_coord_mnkl, safe_batch_idx,
+                        scale_m_offset, scale_k_offset,
+                        tidx % self.num_threads_per_warp_group,
+                    )
                 else:
                     acc.fill(0.0)
                     ab_read_state = self.mma_scaled(
@@ -1023,19 +1178,18 @@ class _GemmSm90RawScaledBase:
                         mSFA_raw, mSFB_raw, tile_coord_mnkl, safe_batch_idx,
                         scale_m_offset, scale_k_offset, tidx, varlen_k,
                         tidx % self.num_threads_per_warp_group,
+                        varlen_manager.params.mAIdx
+                        if const_expr(self.gather_a_scales) else None,
                     )
 
                 # EPILOGUE
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
 
-                epilogue_barrier = pipeline.NamedBarrier(
-                    barrier_id=int(NamedBarrierGemm.Epilogue),
-                    num_threads=self.num_epi_warps * cute.arch.WARP_SIZE,
-                )
-
                 copy_D = None
-                if const_expr(has_D):
+                # _epi_direct_store: the epilogue writes D from registers itself
+                # (mD stays bound for the varlen-M scheduler's total_m).
+                if const_expr(has_D and not getattr(self, "_epi_direct_store", False)):
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
                         varlen_manager.offset_batch_epi(mD_mnl, batch_idx),
@@ -1044,8 +1198,7 @@ class _GemmSm90RawScaledBase:
                         sD,
                         tile_coord_mnkl,
                     )
-                copy_C = None
-                if const_expr(has_C):
+                if const_expr(has_C and not early_c):
                     copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
                         varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
@@ -1097,6 +1250,9 @@ class _GemmSm90RawScaledBase:
                     tile_scheduler,
                     tidx,
                     is_tma_warp,
+                    c_prefetched=early_c,
+                    epi_pre=epi_pre,
+                    sD_full=sD,
                 )
 
                 if const_expr(self.pingpong):
@@ -1233,6 +1389,78 @@ class _GemmSm90RawScaledBase:
         return ab_producer_state
 
     @cute.jit
+    def load_AB_hybrid(
+        self,
+        ab_pipeline,
+        ab_producer_state,
+        tma_atom_a,
+        mA_mk: cute.Tensor,
+        sA: cute.Tensor,
+        sAIdx: cute.Tensor,
+        gAIdx: cute.Tensor,
+        limit_m: Int32,
+        len_k: Int32,
+        cta_n: Int32,
+        a_mcast_mask,
+        copy_B: Callable,
+        k_tile_cnt: Int32,
+    ):
+        """Load warps [0, tma_gather_warps): per-row TMA of the first rows of each A
+        tile (multicast over the N cluster), warp 0 also loads B and arms the full
+        barrier. The remaining load warps: the last ``hybrid_cp_rows`` rows via cp.async."""
+        tile_m, tile_k = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]
+        cp_rows = self.hybrid_cp_rows
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        peek_ab_empty_status = Boolean(True)
+        if 0 < k_tile_cnt:
+            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        if warp_idx < self.ab_load_warp_id + self.tma_gather_warps:
+            tma_warp = warp_idx - self.ab_load_warp_id
+            is_lead = tma_warp == 0
+            copy_A = self.tma_row_gather_get_copy_fn(
+                tma_atom_a, sA.iterator, sAIdx, gAIdx, limit_m, cta_n, a_mcast_mask, tma_warp
+            )
+            for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, is_lead)
+                tma_bar_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                smem_idx = ab_producer_state.index
+                if is_lead:
+                    copy_B(k_tile, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                copy_A(k_tile, smem_idx, tma_bar_ptr)
+                ab_producer_state.advance()
+                peek_ab_empty_status = Boolean(True)
+                if k_tile + 1 < k_tile_cnt:
+                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+        elif const_expr(cp_rows > 0):
+            n_blk = tile_m // cp_rows
+            tiled_copy_A = self._make_gmem_tiled_copy_A(
+                mA_mk.element_type, self.a_layout, self.num_cp_threads
+            )
+            tidx = cute.arch.thread_idx()[0] - cute.arch.WARP_SIZE * (
+                self.ab_load_warp_id + self.tma_gather_warps
+            )
+            sA_cp = cute.flat_divide(sA, (cp_rows, tile_k))[None, None, n_blk - 1, 0, None]
+            gAIdx_cp = cute.flat_divide(gAIdx, (cp_rows,))[None, n_blk - 1]
+            copy_A = copy_utils.gather_m_get_copy_fn(
+                tiled_copy_A.get_slice(tidx), mA_mk, sA_cp, gAIdx_cp,
+                limit_m=limit_m - (tile_m - cp_rows), limit_k=len_k,
+            )
+            for k_tile in cutlass.range(k_tile_cnt - 1, unroll=1):
+                ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, False)
+                copy_A(k_tile, ab_producer_state.index)
+                ab_pipeline.producer_cpasync_commit(ab_producer_state)
+                ab_producer_state.advance()
+                peek_ab_empty_status = Boolean(True)
+                if k_tile + 1 < k_tile_cnt:
+                    peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+            if 0 < k_tile_cnt:
+                ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status, False)
+                copy_A(k_tile_cnt - 1, ab_producer_state.index, pred=True)
+                ab_pipeline.producer_cpasync_commit(ab_producer_state)
+                ab_producer_state.advance()
+        return ab_producer_state
+
+    @cute.jit
     def mma_unscaled(
         self,
         ab_pipeline,
@@ -1304,6 +1532,7 @@ class _GemmSm90RawScaledBase:
         tidx,
         varlen_k,
         mma_group_tidx,
+        a_scale_idx=None,
     ):
         """Accumulate native E4M3 WGMMA K=32 partials in master FP32.
 
@@ -1318,28 +1547,267 @@ class _GemmSm90RawScaledBase:
         peek = Boolean(True)
         if 0 < k_tile_cnt:
             peek = ab_pipeline.consumer_try_wait(ab_read_state)
-        # Accumulator element i of this thread lies in
-        #   row = (i // 64) * 8 + ((i // 2) % 2) * 8 + lane_row
-        #   col span (i // 8) * 16 + lane_col   (outside varlen-K)
-        # Outside varlen-K a partial therefore needs only 2 * ceil(n / 64) A
-        # scales and one B scale per weight block touched (weight_block >= 32).
+        # Accumulator layout per thread: ((2, 2, n_wg / 8), m_reps) with one
+        # 64 x n_wg WGMMA atom per M repetition. Element i = mr * frag + j:
+        #   row = wg_m_off + mr * 64 + warp * 16 + ((j // 2) % 2) * 8 + lane // 4
+        #   col = chunk_col(j // 4) + (lane % 4) * 2 + j % 2
+        # where chunk_col(ch) = 8 * ch (atom_n == 1) or 8 * (wg_n + atom_n * ch)
+        # under the N permutation of an N-split atom layout. An 8-column chunk
+        # never straddles a weight block (weight_block >= 32).
         num_acc = const_expr(cute.size(acc))
-        num_a_scales = const_expr(2 * cute.ceil_div(num_acc, 64))
-        # When the warpgroup's column span starts on a weight-block boundary,
-        # the 16-column groups of one weight block share a single B scale.
-        b_block_aligned = const_expr(
-            self.atom_layout_mnk[1] == 1
-            and self.cta_tile_shape_mnk[1] % self.weight_block == 0
+        atom_m = const_expr(self.atom_layout_mnk[0])
+        atom_n = const_expr(self.atom_layout_mnk[1])
+        n_wg = const_expr(self.cta_tile_shape_mnk[1] // atom_n)
+        frag = const_expr(n_wg // 2)
+        m_reps = const_expr(num_acc // frag)
+        num_chunks = const_expr(frag // 4)
+        num_a_scales = const_expr(2 * m_reps)
+        wb = const_expr(self.weight_block)
+        tile_n_start = tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+        wg_m_off = Int32(0)
+        wg_n = Int32(0)
+        if const_expr(not self.pingpong):
+            wg_m_off = (warp_group_idx % atom_m) * (64 * m_reps)
+            wg_n = warp_group_idx // atom_m
+        # B scale modes:
+        #   0: tile N is a multiple of weight_block (atom_n == 1): static block
+        #      index per chunk, ceil(n_wg / wb) loads.
+        #   1: atom_n == 1, tile N not block aligned (e.g. 192 vs 128): the tile
+        #      spans a few consecutive blocks; chunk ch uses block
+        #      (tile_n_start % wb + 8 * ch) // wb, resolved by compare/select.
+        #   2: atom_n > 1: one load per chunk (runtime block per chunk).
+        b_mode = const_expr(
+            0 if atom_n == 1 and self.cta_tile_shape_mnk[1] % wb == 0
+            else (1 if atom_n == 1 else 2)
         )
         num_b_scales = const_expr(
-            cute.ceil_div((num_acc // 8) * 16, self.weight_block)
-            if b_block_aligned
-            else num_acc // 8
+            cute.ceil_div(n_wg, wb) if b_mode == 0
+            else (
+                cute.ceil_div(
+                    wb - math.gcd(self.cta_tile_shape_mnk[1], wb) + self.cta_tile_shape_mnk[1], wb
+                )
+                if b_mode == 1 else num_chunks
+            )
         )
+        b_off = Int32(0)
+        if const_expr(b_mode == 1):
+            b_off = tile_n_start % wb
+        # Source-ordered A scales under gather_A: resolve this thread's source
+        # rows once per tile through A_idx instead of a host-side scale gather.
+        # Rows past the route total read A_idx[0], matching the old gathered
+        # carrier's safe row 0; their D elements are discarded by the epilogue.
+        a_rows = []
+        if const_expr(a_scale_idx is not None):
+            for r_pre in cutlass.range_constexpr(num_a_scales):
+                m_pre = (
+                    scale_m_offset
+                    + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                    + wg_m_off
+                    + (mma_group_tidx // 32) * 16
+                    + (r_pre // 2) * 64
+                    + (mma_group_tidx % 32) // 4
+                    + (r_pre % 2) * 8
+                )
+                a_rows.append(a_scale_idx[m_pre if m_pre < a_scale_idx.shape[0] else Int32(0)])
+        # Profile-128 (one scale group per K=128 tile): like DeepGEMM, the four
+        # K=32 WGMMAs accumulate in the tensor core and the tile is promoted
+        # once, instead of a wait + 64-FFMA promotion after every partial.
+        tc_accum = const_expr(
+            self.scale_cols_per_tile == 1
+            and self.partials_per_scale == self.scale_partials_per_tile
+            and self.scale_partials_per_tile > 1
+        )
+        # Varlen-K wgrad, 1x128 token groups: both operands carry one scale per
+        # output row / column and 128-token group, stored k-group-major
+        # ([groups(+pad), feature] u8). Each thread reads the A scales of its 2
+        # rows (per M repetition) and the B scales of its 2 * num_chunks columns
+        # (2 adjacent columns per 8-column chunk: one 16-bit load).
+        vk_a_base = None
+        vk_b_base = None
+        if const_expr(varlen_k and tc_accum):
+            assert atom_n == 1, "varlen-K 1x128 wgrad promotion assumes atom_n == 1"
+            vk_lane = mma_group_tidx % 32
+            vk_m0 = (
+                tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                + wg_m_off
+                + (mma_group_tidx // 32) * 16
+                + vk_lane // 4
+            )
+            vk_n0 = tile_n_start + (vk_lane % 4) * 2
+            vk_a_base = (
+                mSFA_raw.iterator.toint()
+                + Int64(scale_k_offset) * Int64(mSFA_raw.stride[0])
+                + Int64(vk_m0)
+            )
+            vk_b_base = (
+                mSFB_raw.iterator.toint()
+                + Int64(scale_k_offset) * Int64(mSFB_raw.stride[0])
+                + Int64(vk_n0)
+            )
+            # Scales are prefetched one K tile ahead (the LDG latency would
+            # otherwise sit on the wait -> promote critical path). The read of
+            # the tile past the expert end lands in the next expert's rows or
+            # in the host-guaranteed pad rows.
+            vk_a_pre = cute.make_rmem_tensor((num_a_scales,), Float32)
+            vk_b_pre = cute.make_rmem_tensor((num_chunks,), Int32)
+            for r in cutlass.range_constexpr(num_a_scales):
+                vk_a_pre[r] = self.load_ue8m0(vk_a_base + ((r // 2) * 64 + (r % 2) * 8))
+            for ch in cutlass.range_constexpr(num_chunks):
+                vk_b_pre[ch] = self.load_scale_u16(vk_b_base + 8 * ch)
+        # Outside varlen-K the scale rows/columns this thread reads are fixed for
+        # the whole tile; resolve their (clamped) indices once per tile.
+        # Manual scale LDGs are not TMA-predicated. Phantom rows or columns in
+        # skewed edge tiles therefore use a safe scale; the corresponding D
+        # element is discarded by the epilogue.
+        a_scale_rows = []
+        b_scale_rows = []
+        if const_expr(not varlen_k):
+            for r in cutlass.range_constexpr(num_a_scales):
+                if const_expr(a_scale_idx is not None):
+                    m_row_safe = a_rows[r]
+                else:
+                    m_row = (
+                        scale_m_offset
+                        + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                        + wg_m_off
+                        + (mma_group_tidx // 32) * 16
+                        + (r // 2) * 64
+                        + (mma_group_tidx % 32) // 4
+                        + (r % 2) * 8
+                    )
+                    m_row_safe = m_row if m_row < mSFA_raw.shape[0] else Int32(0)
+                a_scale_rows.append(m_row_safe)
+            for c in cutlass.range_constexpr(num_b_scales):
+                if const_expr(b_mode == 2):
+                    b_col = (tile_n_start + 8 * (wg_n + atom_n * c)) // wb
+                else:
+                    b_col = tile_n_start // wb + c
+                b_col_safe = b_col if b_col < mSFB_raw.shape[0] else Int32(0)
+                b_scale_rows.append(b_col_safe)
+            if const_expr(self.scale_cols_per_tile == 4 or tc_accum):
+                # Packed scales: a K=128 tile's 4 UE8M0 columns are 4 consecutive
+                # bytes of each row (host guarantees 4B-aligned rows and a
+                # < 2**31 byte span), so one 32-bit load per row replaces 4 byte
+                # loads. Rows are kept as Int32 byte offsets from the tensor base:
+                # under the 152-160 register MMA budget ptxas rematerializes
+                # hoisted 64-bit row pointers every K tile otherwise.
+                # Profile 128 (tc_accum, host guarantees a < 2**31 byte span)
+                # uses the same Int32 offsets with one byte per row and tile.
+                a_scale_base = mSFA_raw.iterator.toint()
+                b_scale_base = mSFB_raw.iterator.toint()
+                for r in cutlass.range_constexpr(num_a_scales):
+                    a_row_off = a_scale_rows[r] * mSFA_raw.stride[0]
+                    if const_expr(cute.rank(mSFA_raw) == 3):
+                        a_row_off = a_row_off + batch_idx * mSFA_raw.stride[2]
+                    a_scale_rows[r] = Int32(a_row_off)
+                for c in cutlass.range_constexpr(num_b_scales):
+                    b_row_off = b_scale_rows[c] * mSFB_raw.stride[0]
+                    if const_expr(cute.rank(mSFB_raw) == 3):
+                        b_row_off = b_row_off + batch_idx * mSFB_raw.stride[2]
+                    b_scale_rows[c] = Int32(b_row_off)
+                if const_expr(self.scale_cols_per_tile == 4):
+                    # Scale words are prefetched one K tile ahead so the LDG
+                    # latency hides behind a whole tile of WGMMAs (+6 registers).
+                    scale_words = cute.make_rmem_tensor((num_a_scales + num_b_scales,), Int32)
+                    for r in cutlass.range_constexpr(num_a_scales):
+                        scale_words[r] = self.load_scale_word(a_scale_base + Int64(a_scale_rows[r]))
+                    for c in cutlass.range_constexpr(num_b_scales):
+                        scale_words[num_a_scales + c] = self.load_scale_word(
+                            b_scale_base + Int64(b_scale_rows[c])
+                        )
+            else:
+                # Per-row 1D views: the row offset is computed once per tile
+                # instead of a 64-bit row*stride per scale load.
+                for r in cutlass.range_constexpr(num_a_scales):
+                    if const_expr(cute.rank(mSFA_raw) == 3):
+                        a_scale_rows[r] = mSFA_raw[a_scale_rows[r], None, batch_idx]
+                    else:
+                        a_scale_rows[r] = mSFA_raw[a_scale_rows[r], None]
+                for c in cutlass.range_constexpr(num_b_scales):
+                    if const_expr(cute.rank(mSFB_raw) == 3):
+                        b_scale_rows[c] = mSFB_raw[b_scale_rows[c], None, batch_idx]
+                    else:
+                        b_scale_rows[c] = mSFB_raw[b_scale_rows[c], None]
         for k_tile in cutlass.range(k_tile_cnt, unroll=1):
             ab_pipeline.consumer_wait(ab_read_state, peek)
-            for inst in cutlass.range_constexpr(self.scale_partials_per_tile):
-                acc.fill(0.0)
+            if const_expr(tc_accum):
+                warpgroup.fence()
+                for inst_tc in cutlass.range_constexpr(self.scale_partials_per_tile):
+                    mma_atom_tc = cute.make_mma_atom(tiled_mma.op)
+                    mma_atom_tc.set(warpgroup.Field.ACCUMULATE, inst_tc != 0)
+                    cute.gemm(
+                        mma_atom_tc,
+                        acc,
+                        tCrA[None, None, inst_tc, ab_read_state.index],
+                        tCrB[None, None, inst_tc, ab_read_state.index],
+                        acc,
+                    )
+                warpgroup.commit_group()
+            if const_expr(tc_accum and varlen_k):
+                # This tile's scales were loaded one tile ahead; issue the next
+                # tile's loads behind the in-flight WGMMAs.
+                vk_a = [vk_a_pre[r] for r in range(num_a_scales)]
+                vk_b_words = [vk_b_pre[ch] for ch in range(num_chunks)]
+                vk_a_k = vk_a_base + Int64(k_tile + 1) * Int64(mSFA_raw.stride[0])
+                vk_b_k = vk_b_base + Int64(k_tile + 1) * Int64(mSFB_raw.stride[0])
+                for r in cutlass.range_constexpr(num_a_scales):
+                    vk_a_pre[r] = self.load_ue8m0(vk_a_k + ((r // 2) * 64 + (r % 2) * 8))
+                for ch in cutlass.range_constexpr(num_chunks):
+                    vk_b_pre[ch] = self.load_scale_u16(vk_b_k + 8 * ch)
+                warpgroup.wait_group(0)
+                ab_pipeline.consumer_release(ab_release_state)
+                vk_b = [
+                    [self.decode_ue8m0_byte(vk_b_words[ch], 0),
+                     self.decode_ue8m0_byte(vk_b_words[ch], 1)]
+                    for ch in range(num_chunks)
+                ]
+                for mr in cutlass.range_constexpr(m_reps):
+                    for ch in cutlass.range_constexpr(num_chunks):
+                        for e in cutlass.range_constexpr(4):
+                            i = mr * frag + ch * 4 + e
+                            acc_slow[i] = acc_slow[i] + acc[i] * (
+                                vk_a[(e // 2) + mr * 2] * vk_b[ch][e % 2]
+                            )
+            if const_expr(tc_accum and not varlen_k):
+                a_k_off = k_tile * mSFA_raw.stride[1]
+                b_k_off = k_tile * mSFB_raw.stride[1]
+                a_scales_tc = [
+                    self.load_ue8m0(a_scale_base + Int64(a_scale_rows[r] + a_k_off))
+                    for r in range(num_a_scales)
+                ]
+                b_scales_tc = [
+                    self.load_ue8m0(b_scale_base + Int64(b_scale_rows[c] + b_k_off))
+                    for c in range(num_b_scales)
+                ]
+                warpgroup.wait_group(0)
+                # The smem stage is no longer read: hand it back to the TMA
+                # producer before the promotion FFMAs (DeepGEMM order).
+                ab_pipeline.consumer_release(ab_release_state)
+                # a*b products once per tile (DeepGEMM scale_0_0/0_1/...), then
+                # one FFMA per element. For tiles straddling weight blocks the
+                # runtime block offset dispatches to a compile-time chunk->block
+                # map (DeepGEMM dispatch_num_former_iters) instead of per-chunk
+                # compare/select. Same operands and order: bit-identical.
+                prods = [
+                    [a_scales_tc[a] * b_scales_tc[c] for c in range(num_b_scales)]
+                    for a in range(num_a_scales)
+                ]
+                if const_expr(b_mode == 1):
+                    g_off = const_expr(math.gcd(self.cta_tile_shape_mnk[1], wb))
+                    for v_i in cutlass.range_constexpr(wb // g_off):
+                        if b_off == v_i * g_off:
+                            self._tc_promote(
+                                acc_slow, acc, prods, m_reps, frag, num_chunks,
+                                [(v_i * g_off + ch * 8) // wb for ch in range(num_chunks)],
+                            )
+                else:
+                    self._tc_promote(
+                        acc_slow, acc, prods, m_reps, frag, num_chunks,
+                        [((ch * 8) // wb if b_mode == 0 else ch) for ch in range(num_chunks)],
+                    )
+            for inst in cutlass.range_constexpr(0 if tc_accum else self.scale_partials_per_tile):
+                # ACCUMULATE=False ignores the old accumulator; no zero fill
+                # (it materializes as 64 MOVs per partial).
                 warpgroup.fence()
                 mma_atom = cute.make_mma_atom(tiled_mma.op)
                 mma_atom.set(warpgroup.Field.ACCUMULATE, False)
@@ -1394,73 +1862,231 @@ class _GemmSm90RawScaledBase:
                             ) * self.decode_ue8m0(mSFB_raw[b_safe, scale_b_k])
                             acc_slow[i] = acc_slow[i] + acc[i] * scale
                 else:
-                    # Scale loads are issued while the WGMMA is in flight; all K=32
-                    # partials of a profile-128 K tile share one scale column.
-                    scale_a_k = scale_k_offset + k_tile
-                    scale_a_k = (
-                        scale_a_k if scale_a_k < mSFA_raw.shape[1] else mSFA_raw.shape[1] - 1
-                    )
-                    scale_b_k = (
-                        scale_a_k if scale_a_k < mSFB_raw.shape[1] else mSFB_raw.shape[1] - 1
-                    )
-                    # Manual scale LDGs are not TMA-predicated. Phantom rows or
-                    # columns in skewed edge tiles therefore use a safe scale;
-                    # the corresponding D element is discarded by the epilogue.
-                    a_scales = []
-                    for r in cutlass.range_constexpr(num_a_scales):
-                        m_abs = (
-                            scale_m_offset
-                            + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
-                            + warp_group_idx * (64 // self.atom_layout_mnk[1])
-                            + (mma_group_tidx // 32) * 16
-                            + (r // 2) * 8
-                            + (mma_group_tidx % 32) // 4
-                            + (r % 2) * 8
-                        )
-                        m_safe = m_abs if m_abs < mSFA_raw.shape[0] else Int32(0)
-                        if const_expr(cute.rank(mSFA_raw) == 3):
-                            raw = mSFA_raw[m_safe, scale_a_k, batch_idx]
-                        else:
-                            raw = mSFA_raw[m_safe, scale_a_k]
-                        a_scales.append(self.decode_ue8m0(raw))
-                    b_scales = []
-                    for c in cutlass.range_constexpr(num_b_scales):
-                        if const_expr(b_block_aligned):
-                            b_coord = (
-                                tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
-                            ) // self.weight_block + c
-                        else:
-                            b_coord = (
-                                tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
-                                + warp_group_idx * (64 if self.atom_layout_mnk[1] > 1 else 0)
-                                + (mma_group_tidx % 4) * 2
-                                + c * 16
-                            ) // self.weight_block
-                        b_safe = b_coord if b_coord < mSFB_raw.shape[0] else Int32(0)
-                        if const_expr(cute.rank(mSFB_raw) == 3):
-                            raw = mSFB_raw[b_safe, scale_b_k, batch_idx]
-                        else:
-                            raw = mSFB_raw[b_safe, scale_b_k]
-                        b_scales.append(self.decode_ue8m0(raw))
+                    # The K=32 partials of one scale group (all 4 for profile-128)
+                    # share a scale column; a K tile spans scale_cols_per_tile
+                    # columns.
+                    # No clamp: outside varlen-K, K % k_tile == 0 and both scale
+                    # tensors span >= K / group columns (host-checked in
+                    # _run_scaled), so every column index is in range.
+                    if const_expr(self.scale_cols_per_tile == 4):
+                        if const_expr(inst == 0):
+                            a_words = [scale_words[r] for r in range(num_a_scales)]
+                            b_words = [scale_words[num_a_scales + c] for c in range(num_b_scales)]
+                            # The last tile re-reads its own word: no read past the span.
+                            k_next = k_tile + 1 if k_tile + 1 < k_tile_cnt else k_tile
+                            k_byte = k_next * 4
+                            for r in cutlass.range_constexpr(num_a_scales):
+                                scale_words[r] = self.load_scale_word(
+                                    a_scale_base + Int64(a_scale_rows[r] + k_byte)
+                                )
+                            for c in cutlass.range_constexpr(num_b_scales):
+                                scale_words[num_a_scales + c] = self.load_scale_word(
+                                    b_scale_base + Int64(b_scale_rows[c] + k_byte)
+                                )
+                        a_scales = [self.decode_ue8m0_byte(a_words[r], inst) for r in range(num_a_scales)]
+                        b_scales = [self.decode_ue8m0_byte(b_words[c], inst) for c in range(num_b_scales)]
+                    elif const_expr(inst % self.partials_per_scale == 0):
+                        scale_k = k_tile * self.scale_cols_per_tile + inst // self.partials_per_scale
+                        a_scales = [self.decode_ue8m0(a_scale_rows[r][scale_k]) for r in range(num_a_scales)]
+                        b_scales = [self.decode_ue8m0(b_scale_rows[c][scale_k]) for c in range(num_b_scales)]
                     warpgroup.wait_group(0)
+                    if const_expr(inst == self.scale_partials_per_tile - 1):
+                        # Last partial done: release the smem stage before its
+                        # promotion so the producer can refill it earlier.
+                        ab_pipeline.consumer_release(ab_release_state)
                     # Nested static loops: a flat 64-iteration range_constexpr triggers
                     # DSLOptimizationWarning, and cutlass.range(..., unroll_full=True)
                     # measured slower here.
-                    for i_hi in cutlass.range_constexpr(num_acc // 8):
-                        for i_lo in cutlass.range_constexpr(8):
-                            i = i_hi * 8 + i_lo
-                            a_scale = a_scales[(i // 2) % 2 + (i // 64) * 2]
-                            if const_expr(b_block_aligned):
-                                b_scale = b_scales[(i // 8) * 16 // self.weight_block]
+                    for mr in cutlass.range_constexpr(m_reps):
+                        for ch in cutlass.range_constexpr(num_chunks):
+                            if const_expr(b_mode == 0):
+                                b_scale = b_scales[(ch * 8) // wb]
+                            elif const_expr(b_mode == 1):
+                                b_scale = b_scales[0]
+                                for c in cutlass.range_constexpr(1, num_b_scales):
+                                    b_scale = b_scales[c] if b_off + ch * 8 >= c * wb else b_scale
                             else:
-                                b_scale = b_scales[i // 8]
-                            acc_slow[i] = acc_slow[i] + acc[i] * (a_scale * b_scale)
-            ab_pipeline.consumer_release(ab_release_state)
+                                b_scale = b_scales[ch]
+                            for e in cutlass.range_constexpr(4):
+                                i = mr * frag + ch * 4 + e
+                                a_scale = a_scales[(e // 2) + mr * 2]
+                                acc_slow[i] = acc_slow[i] + acc[i] * (a_scale * b_scale)
+            if const_expr(varlen_k and not tc_accum):
+                ab_pipeline.consumer_release(ab_release_state)
             ab_read_state.advance()
             ab_release_state.advance()
             peek = Boolean(True)
             if k_tile + 1 < k_tile_cnt:
                 peek = ab_pipeline.consumer_try_wait(ab_read_state)
+        if const_expr(self.pingpong):
+            self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
+        acc.store(acc_slow.load())
+        return ab_read_state
+
+    @staticmethod
+    def _tc_promote(acc_slow, acc, prods, m_reps, frag, num_chunks, chunk_b):
+        """acc_slow += acc * prods[a][chunk_b[ch]] (trace-time unrolled, no control flow)."""
+        for mr in range(m_reps):
+            for ch in range(num_chunks):
+                for e in range(4):
+                    i = mr * frag + ch * 4 + e
+                    acc_slow[i] = acc_slow[i] + acc[i] * prods[(e // 2) + mr * 2][chunk_b[ch]]
+
+    def _pipe_scale_counts(self, num_acc):
+        b_block_aligned = (
+            self.atom_layout_mnk[1] == 1 and self.cta_tile_shape_mnk[1] % self.weight_block == 0
+        )
+        num_a = 2 * ((num_acc + 63) // 64)
+        num_b = (
+            ((num_acc // 8) * 16 + self.weight_block - 1) // self.weight_block
+            if b_block_aligned
+            else num_acc // 8
+        )
+        return b_block_aligned, num_a, num_b
+
+    @cute.jit
+    def _pipe_issue(self, tiled_mma, acc, tCrA, tCrB, stage_idx):
+        """Issue one K=32 WGMMA partial into ``acc`` (overwrite, no zero-fill needed)."""
+        warpgroup.fence()
+        mma_atom = cute.make_mma_atom(tiled_mma.op)
+        mma_atom.set(warpgroup.Field.ACCUMULATE, False)
+        cute.gemm(mma_atom, acc, tCrA[None, None, 0, stage_idx], tCrB[None, None, 0, stage_idx], acc)
+        warpgroup.commit_group()
+
+    @cute.jit
+    def _pipe_load_scales(
+        self, sc, k_tile, mSFA_raw, mSFB_raw, tile_coord_mnkl, batch_idx,
+        scale_m_offset, scale_k_offset, warp_group_idx, mma_group_tidx, num_acc: cutlass.Constexpr,
+    ):
+        """Decode the A/B UE8M0 scales of K tile ``k_tile`` into ``sc`` (a then b)."""
+        b_block_aligned, num_a_scales, num_b_scales = self._pipe_scale_counts(num_acc)
+        scale_a_k = scale_k_offset + k_tile
+        scale_a_k = scale_a_k if scale_a_k < mSFA_raw.shape[1] else mSFA_raw.shape[1] - 1
+        scale_b_k = scale_a_k if scale_a_k < mSFB_raw.shape[1] else mSFB_raw.shape[1] - 1
+        for r in cutlass.range_constexpr(num_a_scales):
+            m_abs = (
+                scale_m_offset
+                + tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0]
+                + warp_group_idx * (64 // self.atom_layout_mnk[1])
+                + (mma_group_tidx // 32) * 16
+                + (r // 2) * 8
+                + (mma_group_tidx % 32) // 4
+                + (r % 2) * 8
+            )
+            m_safe = m_abs if m_abs < mSFA_raw.shape[0] else Int32(0)
+            if const_expr(cute.rank(mSFA_raw) == 3):
+                sc[r] = self.decode_ue8m0(mSFA_raw[m_safe, scale_a_k, batch_idx])
+            else:
+                sc[r] = self.decode_ue8m0(mSFA_raw[m_safe, scale_a_k])
+        for c in cutlass.range_constexpr(num_b_scales):
+            if const_expr(b_block_aligned):
+                b_coord = (tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]) // self.weight_block + c
+            else:
+                b_coord = (
+                    tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1]
+                    + warp_group_idx * (64 if self.atom_layout_mnk[1] > 1 else 0)
+                    + (mma_group_tidx % 4) * 2
+                    + c * 16
+                ) // self.weight_block
+            b_safe = b_coord if b_coord < mSFB_raw.shape[0] else Int32(0)
+            if const_expr(cute.rank(mSFB_raw) == 3):
+                sc[num_a_scales + c] = self.decode_ue8m0(mSFB_raw[b_safe, scale_b_k, batch_idx])
+            else:
+                sc[num_a_scales + c] = self.decode_ue8m0(mSFB_raw[b_safe, scale_b_k])
+
+    @cute.jit
+    def _pipe_promote(self, acc_slow, acc, sc, num_acc: cutlass.Constexpr):
+        """acc_slow += acc * (a_scale * b_scale), bit-identical to ``mma_scaled``."""
+        b_block_aligned, num_a_scales, num_b_scales = self._pipe_scale_counts(num_acc)
+        for i_hi in cutlass.range_constexpr(num_acc // 8):
+            for i_lo in cutlass.range_constexpr(8):
+                i = i_hi * 8 + i_lo
+                a_scale = sc[(i // 2) % 2 + (i // 64) * 2]
+                if const_expr(b_block_aligned):
+                    b_scale = sc[num_a_scales + (i // 8) * 16 // self.weight_block]
+                else:
+                    b_scale = sc[num_a_scales + i // 8]
+                acc_slow[i] = acc_slow[i] + acc[i] * (a_scale * b_scale)
+
+    @cute.jit
+    def mma_scaled_pipelined(
+        self, ab_pipeline, ab_read_state, tiled_mma, acc, acc2, acc_slow, tCrA, tCrB,
+        k_tile_cnt, warp_group_idx, mSFA_raw, mSFB_raw, tile_coord_mnkl, batch_idx,
+        scale_m_offset, scale_k_offset, mma_group_tidx,
+    ):
+        """Software-pipelined profile-32 mainloop (varlen-M / dense, K tile == one K=32 partial).
+
+        Two partial accumulators alternate: WGMMA of K tile k is in flight while the
+        FP32 promotion of tile k-1 runs on the FMA pipe, so the tensor core is no longer
+        idle during scaling. Scale LDGs for tile k are issued behind its WGMMA and
+        consumed one step later. Arithmetic (order and operands) equals ``mma_scaled``.
+        Requires k_tile_cnt >= 1.
+        """
+        num_acc = const_expr(cute.size(acc))
+        _, num_a_scales, num_b_scales = self._pipe_scale_counts(num_acc)
+        if const_expr(self.pingpong):
+            self.pingpong_barrier_sync(warp_group_idx, stage="mma")
+        acc_slow.fill(0.0)
+        sc0 = cute.make_rmem_tensor((num_a_scales + num_b_scales,), Float32)
+        sc1 = cute.make_rmem_tensor((num_a_scales + num_b_scales,), Float32)
+        ab_release_state = ab_read_state.clone()
+        sargs = (mSFA_raw, mSFB_raw, tile_coord_mnkl, batch_idx, scale_m_offset,
+                 scale_k_offset, warp_group_idx, mma_group_tidx, num_acc)
+        peek = ab_pipeline.consumer_try_wait(ab_read_state)
+        # Prologue: K tile 0 -> acc / sc0.
+        ab_pipeline.consumer_wait(ab_read_state, peek)
+        self._pipe_issue(tiled_mma, acc, tCrA, tCrB, ab_read_state.index)
+        self._pipe_load_scales(sc0, Int32(0), *sargs)
+        ab_read_state.advance()
+        peek = Boolean(True)
+        if 1 < k_tile_cnt:
+            peek = ab_pipeline.consumer_try_wait(ab_read_state)
+        num_pairs = (k_tile_cnt - 1) // 2
+        for kp in cutlass.range(num_pairs, unroll=1):
+            k = 1 + 2 * kp
+            # K tile k -> acc2 / sc1 while promoting tile k-1 from acc / sc0.
+            ab_pipeline.consumer_wait(ab_read_state, peek)
+            self._pipe_issue(tiled_mma, acc2, tCrA, tCrB, ab_read_state.index)
+            self._pipe_load_scales(sc1, k, *sargs)
+            ab_read_state.advance()
+            peek = ab_pipeline.consumer_try_wait(ab_read_state)
+            warpgroup.wait_group(1)
+            self._pipe_promote(acc_slow, acc, sc0, num_acc)
+            ab_pipeline.consumer_release(ab_release_state)
+            ab_release_state.advance()
+            # K tile k+1 -> acc / sc0 while promoting tile k from acc2 / sc1.
+            ab_pipeline.consumer_wait(ab_read_state, peek)
+            self._pipe_issue(tiled_mma, acc, tCrA, tCrB, ab_read_state.index)
+            self._pipe_load_scales(sc0, k + 1, *sargs)
+            ab_read_state.advance()
+            peek = Boolean(True)
+            if k + 2 < k_tile_cnt:
+                peek = ab_pipeline.consumer_try_wait(ab_read_state)
+            warpgroup.wait_group(1)
+            self._pipe_promote(acc_slow, acc2, sc1, num_acc)
+            ab_pipeline.consumer_release(ab_release_state)
+            ab_release_state.advance()
+        # Even k_tile_cnt: one K tile left (k_tile_cnt-1) -> acc2, then drain both.
+        rem = k_tile_cnt - 1 - 2 * num_pairs
+        for _ in cutlass.range(rem, unroll=1):
+            ab_pipeline.consumer_wait(ab_read_state, peek)
+            self._pipe_issue(tiled_mma, acc2, tCrA, tCrB, ab_read_state.index)
+            self._pipe_load_scales(sc1, k_tile_cnt - 1, *sargs)
+            ab_read_state.advance()
+            warpgroup.wait_group(1)
+            self._pipe_promote(acc_slow, acc, sc0, num_acc)
+            ab_pipeline.consumer_release(ab_release_state)
+            ab_release_state.advance()
+            warpgroup.wait_group(0)
+            self._pipe_promote(acc_slow, acc2, sc1, num_acc)
+            ab_pipeline.consumer_release(ab_release_state)
+            ab_release_state.advance()
+        # Odd k_tile_cnt: last tile is in acc / sc0.
+        for _ in cutlass.range(1 - rem, unroll=1):
+            warpgroup.wait_group(0)
+            self._pipe_promote(acc_slow, acc, sc0, num_acc)
+            ab_pipeline.consumer_release(ab_release_state)
+            ab_release_state.advance()
         if const_expr(self.pingpong):
             self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
         acc.store(acc_slow.load())
@@ -1481,6 +2107,75 @@ class _GemmSm90RawScaledBase:
         )
         return Float32(llvm.bitcast(T.f32(), bits))
 
+    @staticmethod
+    @cute.jit
+    def load_scale_word(addr):
+        """One 32-bit read-only load of 4 consecutive UE8M0 scale bytes (4B-aligned)."""
+        from cutlass._mlir.dialects import llvm
+        from cutlass.cutlass_dsl import T
+        return Int32(llvm.inline_asm(
+            T.i32(), [Int64(addr).ir_value()], "ld.global.nc.b32 $0, [$1];", "=r,l",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ))
+
+    @staticmethod
+    @cute.jit
+    def load_scale_u16(addr):
+        """16-bit read-only load of 2 consecutive UE8M0 scale bytes (2B-aligned), zero-extended."""
+        from cutlass._mlir.dialects import llvm
+        from cutlass.cutlass_dsl import T
+        return Int32(llvm.inline_asm(
+            T.i32(), [Int64(addr).ir_value()],
+            "{\n\t.reg .u16 h;\n\tld.global.nc.u16 h, [$1];\n\tcvt.u32.u16 $0, h;\n\t}",
+            "=r,l", has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ))
+
+    @staticmethod
+    @cute.jit
+    def load_ue8m0(addr):
+        """Read-only byte load of one UE8M0 scale, decoded like decode_ue8m0 (raw << 23)."""
+        from cutlass._mlir.dialects import llvm
+        from cutlass.cutlass_dsl import T
+        bits = llvm.inline_asm(
+            T.i32(), [Int64(addr).ir_value()],
+            "{\n\t.reg .u32 r;\n\tld.global.nc.u8 r, [$1];\n\tshl.b32 $0, r, 23;\n\t}",
+            "=r,l", has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+        return Float32(llvm.bitcast(T.f32(), bits))
+
+    @staticmethod
+    @cute.jit
+    def decode_ue8m0_byte(word, byte: cutlass.Constexpr[int]):
+        """decode_ue8m0 of byte ``byte`` of a packed scale word (same bits: raw << 23)."""
+        from cutlass._mlir.dialects import llvm
+        from cutlass.cutlass_dsl import T
+        shift = 23 - 8 * byte
+        op = f"shl.b32 $0, $1, {shift};" if shift >= 0 else f"shr.b32 $0, $1, {-shift};"
+        bits = llvm.inline_asm(
+            T.i32(), [Int32(word).ir_value()], op + "\n\tand.b32 $0, $0, 0x7f800000;",
+            "=r,r", has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+        return Float32(llvm.bitcast(T.f32(), bits))
+
+    @cute.jit
+    def epi_prefetch_c(self, copy_C, epi_pipeline, epi_producer_state, is_tma_warp):
+        """Issue the TMA loads of the first epi_c_stage C subtiles (advances the state in place)."""
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
+        ).shape[1]
+        epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
+        for epi_idx in cutlass.range(min(cute.size(epi_tile_shape), self.epi_c_stage), unroll=1):
+            gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
+            if is_tma_warp:
+                epi_pipeline.producer_acquire(epi_producer_state)
+                copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
+                epi_pipeline.producer_commit(epi_producer_state)
+            epi_producer_state.advance()
+        return epi_producer_state
 
     @cute.jit
     def epilogue(
@@ -1509,6 +2204,9 @@ class _GemmSm90RawScaledBase:
         tile_scheduler,
         tidx: Int32,
         is_tma_warp: Boolean,
+        c_prefetched: cutlass.Constexpr[bool] = False,
+        epi_pre=None,
+        sD_full=None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         has_C = const_expr(tRS_rC is not None)
         has_D = const_expr(copy_D is not None)
@@ -1544,14 +2242,16 @@ class _GemmSm90RawScaledBase:
             tidx,
         )
 
-        if const_expr(copy_C is not None):
-            for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
-                if is_tma_warp:
-                    epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
-                    epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
+        if const_expr(copy_C is not None and not c_prefetched):
+            epi_producer_state = self.epi_prefetch_c(
+                copy_C, epi_pipeline, epi_producer_state, is_tma_warp
+            )
+
+        if const_expr(epi_pre is not None):
+            # Per-tile state of the prefetched rows, hoisted out of the subtile loop.
+            epi_pre = self.epi_tile_prefetch_load(
+                params, epi_pre, tiled_copy_r2s, tile_coord_mnkl, varlen_manager, tidx
+            )
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             # The global memory coordinate for the current epi tile
@@ -1559,6 +2259,8 @@ class _GemmSm90RawScaledBase:
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
             epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
+            if const_expr(epi_pre is not None):
+                epi_loop_tensors["epi_pre"] = epi_pre
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -1586,9 +2288,15 @@ class _GemmSm90RawScaledBase:
                     num_prev_subtiles,
                     epi_idx,
                 )
-            if is_tma_warp:
-                epi_store_pipeline.producer_acquire()
-            epilogue_barrier.arrive_and_wait()
+            # Direct-store epilogue without postact: nothing goes through smem/TMA.
+            smem_store = const_expr(
+                not getattr(self, "_epi_direct_store", False) or has_D
+                or postact_ctx is not None
+            )
+            if const_expr(smem_store):
+                if is_tma_warp:
+                    epi_store_pipeline.producer_acquire()
+                epilogue_barrier.arrive_and_wait()
             # Copy from D registers to shared memory
             epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
             if const_expr(has_D):
@@ -1623,15 +2331,23 @@ class _GemmSm90RawScaledBase:
                     tRS_sPostAct[None, None, None, epi_buffer],
                 )
             # Fence and barrier to make sure shared memory store is visible to TMA store
-            cute.arch.fence_view_async_shared()
-            epilogue_barrier.arrive_and_wait()
-            # Copy from shared memory to global memory
-            if is_tma_warp:
-                if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
-                if const_expr(postact_ctx is not None):
-                    copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
-                epi_store_pipeline.producer_commit()
+            if const_expr(smem_store):
+                cute.arch.fence_view_async_shared()
+                epilogue_barrier.arrive_and_wait()
+                # Copy from shared memory to global memory
+                if is_tma_warp:
+                    if const_expr(has_D and not getattr(self, "skip_d_store", False)):
+                        copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
+                    if const_expr(postact_ctx is not None
+                                  and not getattr(self, "skip_postact_store", False)):
+                        copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
+                    epi_store_pipeline.producer_commit()
+                if const_expr(hasattr(self, "epi_after_smem_store")):
+                    # The staged subtile stays valid until the next subtile's barrier.
+                    self.epi_after_smem_store(
+                        params, epi_smem_tensors, sD_full, epi_buffer, gmem_coord,
+                        tile_coord_mnkl, varlen_manager, tidx, epi_idx, epi_tile_num,
+                    )
 
         self.epi_end(
             params,
@@ -1898,7 +2614,7 @@ class _GemmSm90RawScaledBase:
         ab_pipeline_mbar_ptr: cute.Pointer,
     ):
         # Threads/warps participating in this pipeline
-        producer_cnt = 1 if const_expr(not self.gather_A) else 1 + self.num_ab_load_warps * 32
+        producer_cnt = 1 + self.num_cp_threads
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, producer_cnt)
         # Each warp will contribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
@@ -1906,7 +2622,10 @@ class _GemmSm90RawScaledBase:
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
         )
-        pipeline_cls = pipeline.PipelineTmaAsync if not self.gather_A else PipelineTmaCpAsync
+        pipeline_cls = (
+            PipelineTmaCpAsync if self.cpasync_gather_A or self.multi_load
+            else pipeline.PipelineTmaAsync
+        )
         return pipeline_cls.create(
             barrier_storage=ab_pipeline_mbar_ptr,
             num_stages=self.ab_stage,
@@ -2234,6 +2953,99 @@ class _GemmSm90RawScaledBase:
         )
         return tma_atom, tma_tensor
 
+    def _make_tma_row_atom(self, mA: cute.Tensor, a_smem_layout: cute.ComposedLayout):
+        """TMA atom for one K-major A row (box 1 x tile_K) of the source tensor.
+
+        tile_K bytes == the 128B swizzle width, so each row of a stage is a
+        contiguous 128B line and the hardware swizzle (from smem address bits)
+        matches the stage layout when a row is written at ``base + row * 128``.
+        """
+        tile_m, tile_k = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]
+        assert self.a_dtype.width == 8 and tile_k == 128
+        assert self.a_layout == LayoutEnum.ROW_MAJOR, "TMA row gather needs K-major A"
+        tma_rows = tile_m - self.hybrid_cp_rows
+        split = self.num_mcast_ctas_a * self.tma_gather_warps
+        assert tma_rows % split == 0 and (tma_rows // split) % 8 == 0, (tma_rows, split)
+        assert cute.cosize(self.a_smem_layout_staged) == tile_m * tile_k * self.ab_stage
+        row_layout = cute.make_composed_layout(
+            a_smem_layout.inner, 0, cute.make_layout((1, tile_k), stride=(tile_k, 1))
+        )
+        tma_atom, _ = cpasync.make_tiled_tma_atom(
+            cpasync.CopyBulkTensorTileG2SOp(), mA, row_layout, (1, tile_k)
+        )
+        return tma_atom
+
+    @staticmethod
+    @cute.jit
+    def tma_load_row(desc_addr, dst_addr, mbar_addr, col, row, mcast_mask):
+        """2D tile TMA of one A row; multicast to ``mcast_mask`` CTAs when given."""
+        from cutlass._mlir.dialects import llvm
+        args = [Int32(dst_addr).ir_value(), Int64(desc_addr).ir_value(),
+                Int32(col).ir_value(), Int32(row).ir_value(), Int32(mbar_addr).ir_value()]
+        if const_expr(mcast_mask is None):
+            ptx = ("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+                   " [$0], [$1, {$2, $3}], [$4];")
+            cons = "r,l,r,r,r"
+        else:
+            ptx = ("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+                   ".multicast::cluster [$0], [$1, {$2, $3}], [$4], $5;")
+            cons = "r,l,r,r,r,h"
+            args.append(Int16(mcast_mask).ir_value())
+        llvm.inline_asm(None, args, ptx, cons, has_side_effects=True, is_align_stack=False,
+                        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+    @cute.jit
+    def tma_row_gather_get_copy_fn(
+        self, tma_atom, sA_base, sAIdx, gAIdx, limit_m: Int32, cta_n: Int32, mcast_mask,
+        tma_warp=None,
+    ) -> Callable:
+        """Per-row TMAs for one tile: the N-cluster CTAs split the tile rows and
+        multicast them; rows past ``limit_m`` re-read source row 0 (their outputs
+        are masked, as on the cp.async path). With ``tma_gather_warps`` > 1 each
+        TMA warp (``tma_warp``) issues a contiguous slice of this CTA's rows.
+
+        UTMALDG takes uniform operands, so per-lane coordinates would make ptxas
+        emit a waterfall loop per TMA. The lanes stage this warp's row indices in
+        smem once per tile and a single lane issues all of its row TMAs."""
+        tile_m, tile_k = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[2]
+        n_split = self.num_mcast_ctas_a
+        rows_cta = (tile_m - self.hybrid_cp_rows) // n_split
+        rows_w = rows_cta // self.tma_gather_warps
+        # first row (within the tile) of this warp's slice
+        w_off = cta_n * rows_cta
+        if const_expr(tma_warp is not None):
+            w_off = w_off + tma_warp * rows_w
+        lane = cute.arch.lane_idx()
+        cute.arch.sync_warp()
+        for j in cutlass.range_constexpr((rows_w + 31) // 32):
+            if const_expr(32 * (j + 1) <= rows_w) or lane + 32 * j < rows_w:
+                idx = Int32(0)
+                if w_off + lane + 32 * j < limit_m:
+                    idx = gAIdx[w_off + lane + 32 * j]
+                sAIdx[w_off - cta_n * rows_cta + lane + 32 * j] = idx
+        cute.arch.sync_warp()
+        desc_addr = copy_utils.get_tma_desc_addr(tma_atom).toint()
+        dst_w = sA_base.toint() + w_off * tile_k
+        i_off = w_off - cta_n * rows_cta
+        stage_bytes = tile_m * tile_k
+        mask = mcast_mask if const_expr(n_split > 1) else None
+        batch = 16 if rows_w % 16 == 0 else 8
+
+        def copy_fn(k_tile, smem_idx, tma_bar_ptr: cute.Pointer):
+            dst = dst_w + smem_idx * stage_bytes
+            bar = tma_bar_ptr.toint()
+            col = k_tile * tile_k
+            # The TMA asm is a memory side effect, so smem index loads cannot be
+            # hoisted across it by the compiler: load each batch of indices first.
+            for r0 in cutlass.range_constexpr(0, rows_w, batch):
+                rows = [sAIdx[i_off + r0 + i] for i in range(batch)]
+                rows = [cute.arch.make_warp_uniform(v) for v in rows]
+                with cute.arch.elect_one():
+                    for i in cutlass.range_constexpr(batch):
+                        self.tma_load_row(desc_addr, dst + (r0 + i) * tile_k, bar, col, rows[i], mask)
+
+        return copy_fn
+
     def _make_gmem_tiled_copy_A(self, dtype, major_mode, num_threads, copy_bits=128):
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -2327,6 +3139,10 @@ class Sm90ScaledGemm(GemmDefaultEpiMixin, _GemmSm90RawScaledBase):
     """Raw-UE8M0 scaled E4M3 GEMM for Hopper."""
 
 
+class Sm90ScaledGemmRouteScatter(Sm90ScaledGemmRouteScatterMixin, _GemmSm90RawScaledBase):
+    """Scaled varlen-M GEMM whose single-route rows land in the token output."""
+
+
 class Sm90ScaledGated(GemmGatedMixin, _GemmSm90RawScaledBase):
     """Scaled Hopper GEMM with gated forward epilogue."""
 
@@ -2347,6 +3163,47 @@ class Sm90ScaledDGated(GemmDGatedMixin, _GemmSm90RawScaledBase):
 
     def _setup_attributes(self, epilogue_args):
         return _GemmSm90RawScaledBase._setup_attributes(self, epilogue_args)
+
+
+class Sm90ScaledDGatedDzQuant(Sm90DGatedDzQuantMixin, _GemmSm90RawScaledBase):
+    """Scaled dGated that also emits dz as E4M3 + raw 1x128 UE8M0 scales."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blockscaled = False
+
+    def _setup_attributes(self, epilogue_args):
+        return _GemmSm90RawScaledBase._setup_attributes(self, epilogue_args)
+
+
+class Sm90ScaledDGatedColQuant(Sm90DGatedColQuantMixin, _GemmSm90RawScaledBase):
+    """Scaled dGated that also emits colwise 1x128 wgrad operands of y1s / dz."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.blockscaled = False
+
+    def _setup_attributes(self, epilogue_args):
+        return _GemmSm90RawScaledBase._setup_attributes(self, epilogue_args)
+
+
+class Sm90ScaledDGatedColQuantNoY1s(Sm90ScaledDGatedColQuant):
+    """... without the BF16 y1s TMA store (only its col operand is consumed)."""
+
+    skip_postact_store = True
+
+
+class Sm90ScaledDGatedColQuantNoStore(Sm90ScaledDGatedColQuant):
+    """... without the BF16 y1s / dz TMA stores (only fp8 operands consumed)."""
+
+    skip_postact_store = True
+    skip_d_store = True
+
+
+class Sm90ScaledDGatedColQuantNoStoreInplace(Sm90ScaledDGatedColQuantNoStore):
+    """... with the dz col operand written tile-locally into the BF16 preact."""
+
+    dz_col_inplace = True
 
 
 class Sm90ScaledGatedZQuant(GemmGatedBlockscaledQuantMixin, _GemmSm90RawScaledBase):
@@ -2424,6 +3281,12 @@ class Sm90ScaledWgradVarlenK(Sm90ScaledGemm):
     """Scaled varlen-K wgrad; inherited kernel zeros empty experts."""
 
 
+class Sm90ScaledWgradVarlenKTileLocal(Sm90ScaledWgradVarlenK):
+    """Varlen-K wgrad whose A is the tile-local dz_col written into z by dgated."""
+
+    a_tile_local = True
+
+
 class Sm90ScaledRecomputeZ(Sm90ScaledGemm):
     """Scaled gather/varlen-M recompute kernel."""
 
@@ -2443,6 +3306,9 @@ _SM90_SCALED_CLASSES = {
         Sm90ScaledGemm, Sm90ScaledGated, Sm90ScaledDGated, Sm90ScaledGatedZQuant,
         Sm90ScaledGatedY1Quant, Sm90ScaledGatedZY1Quant, Sm90ScaledGatedRawQuant,
         Sm90ScaledDGatedFP8PreAct, Sm90ScaledWgradVarlenK, Sm90ScaledRecomputeZ,
+        Sm90ScaledDGatedDzQuant, Sm90ScaledGemmRouteScatter, Sm90ScaledDGatedColQuant,
+        Sm90ScaledDGatedColQuantNoY1s, Sm90ScaledDGatedColQuantNoStore,
+        Sm90ScaledDGatedColQuantNoStoreInplace, Sm90ScaledWgradVarlenKTileLocal,
     )
 }
 
@@ -2470,18 +3336,42 @@ _GEMM_DIMS = {
 }
 
 
+# Host launch path: under paddle compat `A.device` (~2 us), `dtype ==` (~0.7 us),
+# `permute` (~3 us) and cutlass scalar construction (~1 us) dominate the Python
+# overhead of a launch, so the wrapper below caches everything that only depends
+# on the call configuration and compares dtypes by identity first.
+_FP8 = torch.float8_e4m3fn
+if _FP8 not in torch2cute_dtype_map:
+    torch2cute_dtype_map[_FP8] = cutlass.Float8E4M3FN
+_PROFILES = ((32, 32), (128, 128))
+_DTYPE_NAMES = {}
+
+
+def _same_dtype(dtype, expected):
+    return dtype is expected or dtype == expected
+
+
 def _dtype_name(dtype):
     # str() covers torch and paddle-compat dtypes ("torch.bfloat16", "paddle.bfloat16").
-    return str(dtype).rsplit(".", 1)[-1]
+    name = _DTYPE_NAMES.get(dtype)
+    if name is None:
+        name = _DTYPE_NAMES[dtype] = str(dtype).rsplit(".", 1)[-1]
+    return name
+
+
+_TVM_FFI_ENV = {}
 
 
 def _tvm_ffi_enabled():
-    return os.getenv("SONIC_MOE_DISABLE_SM90_SCALED_TVM_FFI", "0").lower() not in {
-        "1", "true", "yes", "on",
-    }
+    raw = os.environ.get("SONIC_MOE_DISABLE_SM90_SCALED_TVM_FFI", "0")
+    enabled = _TVM_FFI_ENV.get(raw)
+    if enabled is None:
+        enabled = _TVM_FFI_ENV[raw] = raw.lower() not in {"1", "true", "yes", "on"}
+    return enabled
 
 
 _DEVICE_CAPABILITY = {}
+_UNIFORM_CAPABILITY = []
 
 
 def _device_capability(device):
@@ -2493,11 +3383,26 @@ def _device_capability(device):
     return cap
 
 
+def _tensor_capability(tensor):
+    """Capability of the tensor's GPU without touching ``tensor.device`` when
+    every visible GPU has the same capability (the normal training setup)."""
+    if _UNIFORM_CAPABILITY:
+        return _UNIFORM_CAPABILITY[0]
+    caps = set()
+    if torch.cuda.is_available():
+        caps = {tuple(torch.cuda.get_device_capability(i)) for i in range(torch.cuda.device_count())}
+    if len(caps) == 1:
+        _UNIFORM_CAPABILITY.append(caps.pop())
+        return _UNIFORM_CAPABILITY[0]
+    return _device_capability(tensor.device)
+
+
 class _EpiTensor(NamedTuple):
     """Epilogue tensor in kernel order (rank-3 permuted to (*, *, L))."""
 
     tensor: object
     leading_dim: int
+    packed_scales: bool = False  # raw scales readable as aligned 32-bit words
 
 
 def _epi_operand(tensor, *, varlen_m=False, leading_dim=None):
@@ -2516,46 +3421,43 @@ def _epi_operand(tensor, *, varlen_m=False, leading_dim=None):
 def _scale_operand(tensor):
     # Raw carriers are produced as (batch, row, k_group), while the kernel
     # indexes rank-3 scales as (row, k_group, batch), matching A/B tensors after
-    # GemmWrapperBase.permute_tensors.  Rank-2 scales remain row-major, so their
-    # unit-stride K-group dimension is leading dimension 1.
+    # the (L, *, *) -> (*, *, L) operand permute.  Rank-2 scales remain row-major,
+    # so their unit-stride K-group dimension is leading dimension 1.
     if tensor.ndim == 3:
         tensor = tensor.permute(1, 2, 0)
-    unit_stride_dims = [index for index, stride in enumerate(tensor.stride()) if int(stride) == 1]
-    if not unit_stride_dims:
+    stride = tensor.stride()
+    leading_dim = next((i for i in range(len(stride) - 1, -1, -1) if stride[i] == 1), None)
+    if leading_dim is None:
         tensor = tensor.contiguous()
-        unit_stride_dims = [tensor.ndim - 1]
-    return _EpiTensor(tensor.detach(), unit_stride_dims[-1])
+        leading_dim = tensor.ndim - 1
+        stride = tensor.stride()
+    return _EpiTensor(tensor.detach(), leading_dim, _packed_scales_ok(tensor, stride, leading_dim))
 
 
 def _prepare_fp8_operand(tensor, *, varlen_m=False, varlen_k=False):
     """Return physical E4M3 storage whose logical K dimension is contiguous."""
-    if tensor.dtype != torch.float8_e4m3fn:
+    if not _same_dtype(tensor.dtype, _FP8):
         return tensor
-    if tensor.ndim == 2:
-        return tensor if tensor.stride(1) == 1 else tensor.contiguous()
-    if varlen_m:
-        # B enters as [L, N, K] and is later permuted to [N, K, L].
-        return tensor if tensor.stride(2) == 1 else tensor.contiguous()
-    if varlen_k:
-        return tensor if tensor.stride(1) == 1 else tensor.contiguous()
-    return tensor if tensor.stride(2) == 1 else tensor.contiguous()
+    k_dim = 1 if tensor.ndim == 2 or (varlen_k and not varlen_m) else 2
+    return tensor if tensor.stride(k_dim) == 1 else tensor.contiguous()
 
 
 def _validate_profile(group_size, weight_block):
     profile = (int(group_size), int(weight_block))
-    if profile not in ((32, 32), (128, 128)):
+    if profile not in _PROFILES:
         raise ValueError(f"unsupported Hopper scaled profile {profile}")
     return profile
 
 
 def _validate_public(A, B, D, a_scales, b_scales, group_size, weight_block):
-    _validate_profile(group_size, weight_block)
+    if (group_size, weight_block) not in _PROFILES:
+        _validate_profile(group_size, weight_block)
     if not A.is_cuda or not B.is_cuda:
         raise ValueError("A and B must be CUDA tensors")
-    cap = _device_capability(A.device)
+    cap = _tensor_capability(A)
     if cap is None or cap[0] != 9:
         raise RuntimeError("native SM90 scaled GEMM requires a Hopper CUDA device")
-    if A.dtype != torch.float8_e4m3fn or B.dtype != torch.float8_e4m3fn:
+    if not _same_dtype(A.dtype, _FP8) or not _same_dtype(B.dtype, _FP8):
         raise TypeError("A and B must remain torch.float8_e4m3fn operands")
     if A.shape[-1] % group_size or (
         B.ndim == 3 and (B.shape[-2] % weight_block or B.shape[-1] % weight_block)
@@ -2636,12 +3538,21 @@ def _build_epilogue_args(GemmCls, epi_spec, make_tensor, make_scalar, resolve_co
 
 
 def _new_kernel(gemm_cls_name, a_dtype, tile_shape, cluster_shape, pingpong, persistent,
-                gather, activation_group, weight_block, implicit_dtype):
+                gather, activation_group, weight_block, implicit_dtype, k_tile=0):
+    tg = gather - 2 if gather >= 3 else 0  # (tma_gather_warps - 1) * 16 + cp divisor
     kernel = _SM90_SCALED_CLASSES[gemm_cls_name](
         Float32, a_dtype, tile_shape, cluster_shape, pingpong=pingpong,
-        is_persistent=persistent, gather_A=gather,
+        is_persistent=persistent, gather_A=bool(gather),
         activation_group=activation_group, weight_block=weight_block,
+        tma_gather_A=tg > 0, tma_gather_cp_div=tg % 16 if tg % 16 > 1 else 0,
+        tma_gather_warps=tg // 16 + 1,
     )
+    # gather == 2: source-ordered A scales are gathered in-kernel via A_idx.
+    # gather >= 3: same, with A rows loaded by per-row TMA (see tma_gather_A);
+    # (gather - 2) % 16 = d >= 2: hybrid, the last tile_M // d rows of a tile via
+    # cp.async; (gather - 2) // 16 + 1 load warps issue the row TMAs.
+    kernel.gather_a_scales = gather >= 2
+    kernel.k_tile = int(k_tile)
     if implicit_dtype is not None:
         kernel.implicit_dtype = _CUTE_DTYPES[implicit_dtype]
     return kernel
@@ -2655,7 +3566,7 @@ def _resolve_compile_const(name, value):
 def _compile_sm90_scaled_tvm_ffi(
     gemm_cls_name, a_spec, b_spec, d_spec, c_spec, sa_spec, sb_spec, epi_spec,
     varlen_m, varlen_k, gather, tile_shape, cluster_shape, pingpong, persistent,
-    max_swizzle_size, activation_group, weight_block, implicit_dtype, device_capability,
+    max_swizzle_size, activation_group, weight_block, implicit_dtype, k_tile, device_capability,
 ):
     """Compile once per layout/config; shapes and strides stay symbolic.
 
@@ -2674,7 +3585,8 @@ def _compile_sm90_scaled_tvm_ffi(
     scheduler_args = make_fake_scheduler_args(False, False, None)
     varlen_args = _fake_varlen_args(varlen_m, varlen_k, gather)
     kernel = _new_kernel(gemm_cls_name, mA.element_type, tile_shape, cluster_shape, pingpong,
-                         persistent, gather, activation_group, weight_block, implicit_dtype)
+                         persistent, gather, activation_group, weight_block, implicit_dtype,
+                         k_tile)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
         kernel, mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, stream, mSFA, mSFB,
@@ -2738,12 +3650,152 @@ def _launch_dlpack(
     compiled(mA, mB, mD, mC, epi_args, scheduler_args, varlen_args, stream, mSFA, mSFB)
 
 
+_SM90_K_TILE = int(os.environ.get("SONIC_SM90_K_TILE", "128"))
+# 1x128 varlen-K wgrad launch config (SONIC_MOE_SM90_WGRAD128_TILE="128x128",
+# SONIC_MOE_SM90_WGRAD128_CLUSTER="1x1"); SONIC_MOE_SM90_WGRAD_VALIDATE=1 adds
+# a host check (one sync) of the packed offsets.
+
+
+def _parse_mn(raw, default):
+    try:
+        m, n = (int(v) for v in raw.lower().split("x"))
+        return m, n
+    except (AttributeError, ValueError):
+        return default
+
+
+_SM90_WGRAD128_TILE = _parse_mn(os.environ.get("SONIC_MOE_SM90_WGRAD128_TILE"), (128, 128))
+_SM90_WGRAD128_CLUSTER = (
+    *_parse_mn(os.environ.get("SONIC_MOE_SM90_WGRAD128_CLUSTER"), (1, 1)), 1
+)
+_SM90_WGRAD_VALIDATE = os.environ.get("SONIC_MOE_SM90_WGRAD_VALIDATE", "0") == "1"
+
+
+def _packed_scales_ok(t, stride, leading_dim):
+    """Kernel-order scale rows start 4B-aligned, K groups are unit-stride, and
+    every byte offset fits the kernel's Int32 row offsets."""
+    if leading_dim != 1 or t.data_ptr() & 3:
+        return False
+    shape = t.shape
+    span = (shape[0] - 1) * stride[0] + shape[1]
+    if stride[0] & 3 and shape[0] != 1:
+        return False
+    if len(shape) == 3:
+        if stride[2] & 3 and shape[2] != 1:
+            return False
+        span += (shape[2] - 1) * stride[2]
+    return span < 2**31
+
+
+def _select_k_tile(activation_group, varlen_k, K):
+    """Profile-32 uses a K=128 CTA tile when K is a multiple of 128.
+
+    varlen-K (expert K boundaries are only 32-aligned) keeps K=32.
+    SONIC_SM90_K_TILE=32 restores the one-group tile.
+    """
+    if activation_group == 32 and not varlen_k and _SM90_K_TILE == 128 and int(K) % 128 == 0:
+        return 128
+    return int(activation_group)
+
+
+def _gemm_shapes(A, B, D, C, cu_seqlens_m, cu_seqlens_k, A_idx):
+    """(L, M, K, N); the checks of GemmWrapperBase.validate_and_prepare_tensors."""
+    if A_idx is not None:
+        assert cu_seqlens_m is not None or cu_seqlens_k is not None, (
+            "gather_A requires either varlen_m or varlen_k"
+        )
+        assert A_idx.ndim == 1, f"A_idx must be 1D, got {A_idx.ndim}D"
+    a_shape, b_shape = tuple(A.shape), tuple(B.shape)
+    if cu_seqlens_m is not None:
+        assert len(a_shape) == 2, f"A must be 2D when using varlen_m, got {len(a_shape)}D"
+        assert len(b_shape) == 3, f"B must be 3D with varlen_m, got {len(b_shape)}D"
+        M = int(A_idx.shape[0]) if A_idx is not None else a_shape[0]
+        K = a_shape[1]
+        L, N, K_B = b_shape
+        cu_shape = tuple(cu_seqlens_m.shape)
+        dc_shape = (M, N)
+    elif cu_seqlens_k is not None:
+        assert len(a_shape) == 2, f"A must be 2D when using varlen_k, got {len(a_shape)}D"
+        assert len(b_shape) == 2, f"B must be 2D with varlen_k, got {len(b_shape)}D"
+        M = a_shape[0]
+        K = int(A_idx.shape[0]) if A_idx is not None else a_shape[1]
+        N, K_B = b_shape
+        cu_shape = tuple(cu_seqlens_k.shape)
+        L = cu_shape[0] - 1 if len(cu_shape) == 1 else -1
+        dc_shape = (L, M, N)
+    else:
+        assert len(a_shape) == 3 and len(b_shape) == 3, "A and B must be 3D tensors"
+        L, M, K = a_shape
+        _, N, K_B = b_shape
+        assert b_shape == (L, N, K), f"B must have shape {(L, N, K)}, got {b_shape}"
+        cu_shape = (L + 1,)
+        dc_shape = (L, M, N)
+    assert K == K_B, f"K dimension mismatch: A has {K}, B has {K_B}"
+    assert cu_shape == (L + 1,), f"cu_seqlens must have shape ({L + 1},), got {cu_shape}"
+    for tensor, name in ((D, "D"), (C, "C")):
+        if tensor is not None:
+            assert tuple(tensor.shape) == dc_shape, (
+                f"{name} shape {tuple(tensor.shape)} doesn't match expected {dc_shape}"
+            )
+    return L, M, K, N
+
+
+def _gemm_operand(tensor, permute):
+    """Kernel-order operand: rank-3 (L, *, *) -> (*, *, L); leading dim 1 if stride(1)==1."""
+    if tensor is None:
+        return None
+    if permute and tensor.ndim == 3:
+        tensor = tensor.permute(1, 2, 0)
+    return _EpiTensor(tensor.detach(), 1 if tensor.stride(1) == 1 else 0)
+
+
+_SCHEDULER_ARGS = {}
+
+
+def _scheduler_args(cluster_shape, persistent, max_swizzle_size):
+    """(max_active_clusters, runtime TileSchedulerOptions), built once per config."""
+    key = (tuple(cluster_shape), bool(persistent), max_swizzle_size)
+    cached = _SCHEDULER_ARGS.get(key)
+    if cached is None:
+        max_active_clusters = (
+            get_max_active_clusters(cluster_shape[0] * cluster_shape[1]) if persistent else 0
+        )
+        cached = _SCHEDULER_ARGS[key] = (
+            max_active_clusters, make_scheduler_args(max_active_clusters, max_swizzle_size, None),
+        )
+    return cached
+
+
+_EPI_RUNTIME_PLANS = {}
+
+
+def _runtime_epilogue_args(GemmCls, epi_spec, epi_fields):
+    """Runtime EpilogueArguments: tensors/scalars bound, every other field None."""
+    plan_key = (GemmCls, epi_spec)
+    plan = _EPI_RUNTIME_PLANS.get(plan_key)
+    if plan is None:
+        fields = GemmCls.EpilogueArguments._fields
+        plan = _EPI_RUNTIME_PLANS[plan_key] = (len(fields), tuple(
+            (fields.index(name), kind == "scalar", name)
+            for name, kind, value in epi_spec
+            if kind in ("tensor", "alias") or (kind == "scalar" and value)
+        ))
+    num_fields, bound = plan
+    values = [None] * num_fields
+    for index, is_scalar, name in bound:
+        values[index] = Float32(epi_fields[name]) if is_scalar else epi_fields[name].tensor
+    return GemmCls.EpilogueArguments(*values)
+
+
+# In-process TVM-FFI kernels by compile key (jit_cache adds disk lookup and logging).
+_TVM_FFI_COMPILED = {}
+
 def _run_scaled(
     GemmCls, A, B, D, a_scales, b_scales, *, C=None, epi_fields=None,
     cu_seqlens_m=None, cu_seqlens_k=None, A_idx=None, activation_group=32,
     weight_block=32, tile_shape=(128, 128), cluster_shape=(1, 1, 1),
     pingpong=False, persistent=True, implicit_dtype=None, max_swizzle_size=8,
-    activation_scale_order=None,
+    activation_scale_order=None, tma_gather=False,
 ):
     _validate_public(A, B, D, a_scales, b_scales, activation_group, weight_block)
     if D is None and not issubclass(GemmCls, GemmGatedMixin):
@@ -2775,92 +3827,155 @@ def _run_scaled(
             raise ValueError(
                 "gathered SM90 scaled GEMM requires activation_scale_order='source' or 'route'"
             )
-        expected_rows = A.shape[0] if activation_scale_order == "source" else A_idx.numel()
+        expected_rows = A.shape[0] if activation_scale_order == "source" else int(A_idx.shape[0])
         if a_scales.shape[0] != expected_rows:
             raise ValueError(
                 f"{activation_scale_order}-ordered A scales require {expected_rows} rows, "
                 f"got {a_scales.shape[0]}"
             )
         if activation_scale_order == "source":
-            # A is read through A_idx, so source-row scales must follow the
-            # same explicit gather even when source and route row counts match.
-            a_scales = a_scales[A_idx.to(torch.int64)].contiguous()
-    if torch.float8_e4m3fn not in torch2cute_dtype_map:
-        torch2cute_dtype_map[torch.float8_e4m3fn] = cutlass.Float8E4M3FN
-    L, M, K, N, infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, D, C, cu_seqlens_m=cu_seqlens_m, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx,
-    )
-    GemmWrapperBase.permute_tensors(infos, varlen_m=varlen_m, varlen_k=varlen_k)
-    GemmWrapperBase.determine_major_orders(infos, _GEMM_DIMS)
-    operands = tuple(
-        None if infos[name].tensor is None else _EpiTensor(
-            infos[name].tensor.detach(),
-            1 if infos[name].major == _GEMM_DIMS[name][1] else 0,
-        )
-        for name in ("A", "B", "D", "C")
+            # A is read through A_idx, and so are the source-row A scales: the
+            # MMA warps resolve A_idx per tile (gather mode 2), no host gather.
+            gather = 2
+    L, M, K, N = _gemm_shapes(A, B, D, C, cu_seqlens_m, cu_seqlens_k, A_idx)
+    # The non-varlen-K mainloop indexes scale columns without a clamp.
+    if not varlen_k and min(a_scales.shape[-1], b_scales.shape[-1]) * activation_group < K:
+        raise ValueError("a_scales/b_scales must span K / activation_group columns")
+    # (L, *, *) -> (*, *, L): every rank-3 operand without varlen, B under
+    # varlen-M, D/C under varlen-K.
+    operands = (
+        _gemm_operand(A, permute=not varlen_m and not varlen_k),
+        _gemm_operand(B, permute=not varlen_k),
+        _gemm_operand(D, permute=not varlen_m),
+        _gemm_operand(C, permute=not varlen_m),
     )
     if varlen_k:
-        # Raw scale ABI is fixed for wgrad regardless of the forward profile:
-        # contiguous [feature,total_K/32], rebased by expert_start/32.
-        groups = K // 32
-        if activation_group != 32 or weight_block != 32:
-            raise ValueError("SM90 wgrad operands and scales always use colwise 1x32 groups")
-        if tuple(a_scales.shape) != (M, groups) or tuple(b_scales.shape) != (N, groups):
+        # Raw scale ABI of the wgrad (independent of the forward profile):
+        #   1x32:  contiguous [feature, total_K/32], rebased by expert_start/32.
+        #   1x128: contiguous k-group-major [>= total_K/128 + pad, feature],
+        #          rebased by expert_start/128; the pad rows (one prefetch row
+        #          + >= 256 bytes) absorb the one-tile-ahead scale prefetch and
+        #          the unmasked scale reads of phantom rows/columns of edge tiles.
+        if (activation_group, weight_block) == (32, 32):
+            groups = K // 32
+            expected = ((M, groups), (N, groups))
+            ok = tuple(a_scales.shape) == expected[0] and tuple(b_scales.shape) == expected[1]
+        elif (activation_group, weight_block) == (128, 128):
+            groups = K // 128
+            expected = (f"[>={groups}+pad,{M}]", f"[>={groups}+pad,{N}]")
+            ok = all(
+                s.ndim == 2 and int(s.shape[1]) == f and f % 8 == 0
+                and int(s.shape[0]) * f >= (groups + 1) * f + 256
+                for s, f in ((a_scales, M), (b_scales, N))
+            )
+        else:
+            raise ValueError("SM90 wgrad operands and scales use colwise 1x32 or 1x128 groups")
+        if not ok:
             raise ValueError(
-                "SM90 varlen-K raw scale ABI requires "
-                f"a_scales={(M, groups)}, b_scales={(N, groups)}; got "
-                f"{tuple(a_scales.shape)} and {tuple(b_scales.shape)}"
+                f"SM90 varlen-K raw scale ABI requires a_scales={expected[0]}, "
+                f"b_scales={expected[1]}; got {tuple(a_scales.shape)} and {tuple(b_scales.shape)}"
             )
         if not a_scales.is_contiguous() or not b_scales.is_contiguous():
             raise ValueError("SM90 varlen-K raw scales must be contiguous")
     scales = (_scale_operand(a_scales), _scale_operand(b_scales))
-    epi_fields = dict(epi_fields or {})
+    epi_fields = epi_fields or {}
     epi_spec = _epi_spec(epi_fields)
     implicit_dtype = None if implicit_dtype is None else _dtype_name(implicit_dtype)
-    kernel_args = (tile_shape, cluster_shape, pingpong, persistent, gather,
-                   activation_group, weight_block, implicit_dtype)
+    k_tile = _select_k_tile(activation_group, varlen_k, K)
+    packed = scales[0].packed_scales and scales[1].packed_scales
+    if k_tile == 128 and activation_group == 32 and not packed:
+        k_tile = 32  # the K=128 tile reads 4 scale columns as one aligned 32-bit word
+    if tma_gather and gather == 2:
+        # Per-row TMA: 128B K tile (= swizzle width), 16B-aligned K-major rows.
+        if (k_tile != 128 or A.ndim != 2 or A.stride(-1) != 1 or A.stride(0) % 16
+                or A.data_ptr() % 16 or pingpong):
+            raise ValueError("tma_gather needs a 2D K-major A with 16B rows and a K=128 tile")
+        # tma_gather=True: all rows by TMA; tma_gather=d >= 2: the last
+        # tile_M // d rows by cp.async (hybrid); tma_gather=(d, w): w warps
+        # issue the row TMAs (d = 1: no cp.async rows).
+        d, w = (tma_gather if isinstance(tma_gather, tuple)
+                else (1 if tma_gather is True else int(tma_gather), 1))
+        assert d >= 1 and tile_shape[0] % d == 0 and 1 <= w <= 4 - (d > 1) and d < 16, tma_gather
+        gather = 2 + d + 16 * (w - 1)
+    if cluster_shape[1] > 1 and gather and gather < 3:
+        raise ValueError("cp.async gather A cannot use a cluster along N")
+    if activation_group == 128 and not varlen_k:
+        for s in scales:
+            t = s.tensor
+            if sum((n - 1) * st for n, st in zip(t.shape, t.stride())) >= 2**31:
+                raise ValueError("SM90 profile-128 scales must span < 2**31 bytes (Int32 offsets)")
     key = (
         GemmCls.__name__, *(_tensor_spec(op) for op in operands + scales), epi_spec,
         varlen_m, varlen_k, gather, tuple(tile_shape), tuple(cluster_shape), bool(pingpong),
         bool(persistent), int(max_swizzle_size), int(activation_group), int(weight_block),
-        implicit_dtype, _device_capability(A.device),
+        implicit_dtype, k_tile, _tensor_capability(A),
     )
-    max_active_clusters = (
-        get_max_active_clusters(cluster_shape[0] * cluster_shape[1]) if persistent else 0
+    max_active_clusters, scheduler_args = _scheduler_args(
+        cluster_shape, persistent, max_swizzle_size
     )
     varlen = (cu_seqlens_m, cu_seqlens_k, A_idx)
     if not _tvm_ffi_enabled():
+        kernel_args = (tile_shape, cluster_shape, pingpong, persistent, gather,
+                       activation_group, weight_block, implicit_dtype, k_tile)
         _launch_dlpack(
             GemmCls.__name__, key, operands, scales, epi_spec, epi_fields,
             (max_active_clusters, max_swizzle_size), varlen, kernel_args,
         )
         return D
-    compiled = _compile_sm90_scaled_tvm_ffi(*key)
     if cache_utils.COMPILE_ONLY:
+        _compile_sm90_scaled_tvm_ffi(*key)
         return D
+    compiled = _TVM_FFI_COMPILED.get(key)
+    if compiled is None:
+        compiled = _TVM_FFI_COMPILED[key] = _compile_sm90_scaled_tvm_ffi(*key)
     # Runtime call: tensors bind to the symbolic layouts, Constexpr fields are None.
-    epi_args = _build_epilogue_args(
-        GemmCls, epi_spec,
-        make_tensor=lambda name, spec: epi_fields[name].tensor,
-        make_scalar=lambda name: Float32(epi_fields[name]),
-        resolve_const=lambda name, value: None,
-        runtime=True,
-    )
     compiled(
-        *(None if op is None else op.tensor for op in operands), epi_args,
-        make_scheduler_args(max_active_clusters, max_swizzle_size, None),
-        make_varlen_args(*varlen), *(op.tensor for op in scales),
+        *(None if op is None else op.tensor for op in operands),
+        _runtime_epilogue_args(GemmCls, epi_spec, epi_fields),
+        scheduler_args, make_varlen_args(*varlen), scales[0].tensor, scales[1].tensor,
     )
     return D
 
 
 def sm90_scaled_gemm(
     A, B, D, a_scales, b_scales, *, C=None, beta=1.0,
-    add_to_output=False, **kwargs,
+    add_to_output=False, scatter_dst=None, scatter_out=None, scatter_w=None, **kwargs,
 ):
-    """Public native scaled GEMM wrapper."""
+    """Public native scaled GEMM wrapper.
+
+    ``scatter_dst`` (int32 ``[M]``) / ``scatter_out`` (bf16 ``[T, N]``): fused
+    single-route token reduction.  Row ``p`` with ``scatter_dst[p] = t >= 0``
+    is written to ``scatter_out[t]`` as ``bf16(0 + bf16(acc) * w)`` (``w`` =
+    ``scatter_w[p]`` fp32, or the weightless ``0 + x``) instead of ``D[p]``;
+    rows with ``scatter_dst[p] < 0`` go to ``D`` unchanged.
+    """
     if add_to_output and C is not None:
         raise ValueError("add_to_output cannot also take C")
+    if scatter_dst is not None:
+        if C is not None or add_to_output or kwargs.get("cu_seqlens_m") is None \
+                or kwargs.get("A_idx") is not None:
+            raise ValueError("route scatter needs a plain varlen-M GEMM without C / A_idx")
+        N = D.shape[1]
+        for t, name in ((D, "D"), (scatter_out, "scatter_out")):
+            if (not _same_dtype(t.dtype, torch.bfloat16) or t.ndim != 2 or t.shape[1] != N
+                    or t.stride(1) != 1 or t.stride(0) % 8 or t.data_ptr() % 16):
+                raise ValueError(f"route scatter {name} must be 16B-aligned bf16 [*, {N}] rows")
+        if N % 8:
+            raise ValueError("route scatter needs N % 8 == 0")
+        for t, name, dt in ((scatter_dst, "scatter_dst", "int32"),
+                            (scatter_w, "scatter_w", "float32")):
+            if t is not None and (_dtype_name(t.dtype) != dt or t.ndim != 1 or t.stride(0) != 1
+                                  or t.shape[0] != D.shape[0] or t.data_ptr() % 16):
+                raise ValueError(f"{name} must be a contiguous 16B-aligned {dt} [M] tensor")
+        # Validated row-major 2D / 1D above: unit stride is the last dim.
+        epi = dict(
+            mScatterD=_EpiTensor(D.detach(), 1), mScatterDst=_EpiTensor(scatter_dst.detach(), 0),
+            mScatterOut=_EpiTensor(scatter_out.detach(), 1),
+            mScatterW=None if scatter_w is None else _EpiTensor(scatter_w.detach(), 0),
+        )
+        return _run_scaled(
+            Sm90ScaledGemmRouteScatter, A, B, D, a_scales, b_scales, epi_fields=epi, **kwargs,
+        )
     epi = dict(beta=float(beta) if C is not None else None, add_to_output=bool(add_to_output))
     return _run_scaled(
         Sm90ScaledGemm, A, B, D, a_scales, b_scales,
@@ -2907,9 +4022,32 @@ def sm90_scaled_gated(
 def sm90_scaled_dgated(
     A, B, D, PreAct, PostAct, a_scales, b_scales, *,
     activation="swiglu", colvec_scale=None, colvec_reduce=None,
-    preact_fp8=None, preact_scales=None, swiglu_clamp_value=0.0, **kwargs,
+    preact_fp8=None, preact_scales=None, swiglu_clamp_value=0.0,
+    dz_fp8_out=None, dz_scale_out=None, y1s_col_out=None, dz_col_out=None, skip_stores=(),
+    dz_col_inplace=False, **kwargs,
 ):
-    """dGated with BF16 preact or carrier FP8 preact plus UE8M0 scales."""
+    """dGated with BF16 preact or carrier FP8 preact plus UE8M0 scales.
+
+    ``dz_fp8_out``/``dz_scale_out`` additionally emit dz as E4M3 ``[M, 2I]`` with
+    raw 1x128 UE8M0 scales ``[M, 2I/128]``, byte-identical to
+    ``quantize_activation_blockscaled_fast(dz, 128)`` (BF16 preact path only).
+
+    ``y1s_col_out``/``dz_col_out`` = ``(fp8 [F, M], u8 [>= M/128, F])`` additionally
+    emit the colwise 1x128 wgrad operand of y1s / dz, byte-identical to
+    ``quantize_wgrad_colwise128_sm90(y1s|dz, cu_seqlens_m)`` on rows
+    ``< cu_seqlens_m[E]`` (tile M 128, 128-aligned ``cu_seqlens_m``; rows beyond
+    ``cu_seqlens_m[E]`` are left untouched).
+
+    ``skip_stores`` (``("y1s",)`` or ``("y1s", "dz")``, with the matching fused
+    fp8 outputs) drops those BF16 TMA stores: ``PostAct`` / ``D`` keep their
+    previous contents (for the gmem layout only).
+
+    ``dz_col_inplace`` (with ``dz_col_out=(PreAct, scales)`` and both stores
+    skipped) writes the dz col data tile-locally into ``PreAct`` instead: the
+    128x128 block (token block t, feature group g) goes to rows ``128 t + f % 128``,
+    bytes ``256 g + [0, 128)``, which is the preact half this CTA has already read.
+    ``sm90_scaled_wgrad_varlen_k(a_tile_local=True)`` consumes that layout.
+    """
     if activation != "swiglu":
         raise ValueError(f"native SM90 scaled dGated does not support {activation!r}")
     fp8_mode = preact_fp8 is not None or preact_scales is not None
@@ -2954,6 +4092,70 @@ def sm90_scaled_dgated(
             raise TypeError("BF16/FP16 preact must be provided")
         GemmCls = Sm90ScaledDGated
         C = PreAct.contiguous().view(torch.float32)
+    if (dz_fp8_out is None) != (dz_scale_out is None):
+        raise ValueError("fused dz quant requires both dz_fp8_out and dz_scale_out")
+    if dz_fp8_out is not None:
+        if fp8_mode:
+            raise ValueError("fused dz quant supports only the BF16 preact path")
+        rows, width = int(D_packed.shape[0]), 2 * int(D_packed.shape[1])
+        if D_packed.ndim != 2 or width % 128:
+            raise ValueError("fused dz quant needs rank-2 dz with width divisible by 128")
+        if int(tuple(kwargs.get("tile_shape", (128, 128)))[1]) % 64:
+            raise ValueError("fused dz quant needs tile N divisible by 64")
+        if (dz_fp8_out.dtype != torch.float8_e4m3fn or tuple(dz_fp8_out.shape) != (rows, width)
+                or not dz_fp8_out.is_contiguous()):
+            raise ValueError(f"dz_fp8_out must be contiguous E4M3 {(rows, width)}")
+        if (dz_scale_out.dtype != torch.uint8 or tuple(dz_scale_out.shape) != (rows, width // 128)
+                or not dz_scale_out.is_contiguous()):
+            raise ValueError(f"dz_scale_out must be contiguous uint8 {(rows, width // 128)}")
+        GemmCls = Sm90ScaledDGatedDzQuant
+        epi.update(
+            mDzFp8=_epi_operand(dz_fp8_out.view(torch.int32), varlen_m=True),
+            mDzScale=_epi_operand(dz_scale_out, varlen_m=True),
+        )
+    if y1s_col_out is not None or dz_col_out is not None:
+        if fp8_mode or not varlen_m or kwargs.get("pingpong"):
+            raise ValueError("fused col quant needs the BF16 preact varlen-M non-pingpong path")
+        if int(tuple(kwargs.get("tile_shape", (128, 128)))[0]) != 128:
+            raise ValueError("fused col quant needs tile M == 128 (one 1x128 group per tile)")
+        rows = int(D_packed.shape[0])
+        for name, out, feat in (("y1s_col_out", y1s_col_out, int(PostAct.shape[1])),
+                                ("dz_col_out", dz_col_out, 2 * int(D_packed.shape[1]))):
+            if out is None:
+                continue
+            data, scale = out
+            if name == "dz_col_out" and dz_col_inplace:
+                # Tile-local into the preact itself (see TileLocalCol): no [F, M] buffer.
+                if (data is not PreAct or tuple(data.shape) != (rows, feat)
+                        or not data.is_contiguous() or data.dtype != torch.bfloat16):
+                    raise ValueError(f"in-place dz_col_out data must be the contiguous "
+                                     f"bf16 preact [{rows}, {feat}]")
+            elif (data.dtype != torch.float8_e4m3fn or tuple(data.shape) != (feat, rows)
+                    or not data.is_contiguous()):
+                raise ValueError(f"{name} must be (E4M3 [{feat}, {rows}], u8 [>={rows // 128}, {feat}])")
+            if (rows % 128 or scale.dtype != torch.uint8
+                    or scale.ndim != 2 or int(scale.shape[1]) != feat
+                    or int(scale.shape[0]) < rows // 128 or not scale.is_contiguous()):
+                raise ValueError(f"{name} must be (E4M3 [{feat}, {rows}], u8 [>={rows // 128}, {feat}])")
+        GemmCls = Sm90ScaledDGatedColQuant
+        for key, out in (("mY1sCol", y1s_col_out), ("mDzCol", dz_col_out)):
+            if out is not None:
+                epi[key] = _epi_operand(out[0].view(torch.int32))
+                epi[key + "Scale"] = _epi_operand(out[1])
+        skip = tuple(sorted(skip_stores))
+        if dz_col_inplace and (skip != ("dz", "y1s") or dz_col_out is None):
+            # The dropped dz TMA store is what keeps the even subtile's preact free.
+            raise ValueError("dz_col_inplace needs dz_col_out and skip_stores=('y1s', 'dz')")
+        if skip == ("y1s",) and y1s_col_out is not None:
+            GemmCls = Sm90ScaledDGatedColQuantNoY1s
+        elif (skip == ("dz", "y1s") and y1s_col_out is not None and dz_col_out is not None
+              and dz_fp8_out is not None):
+            GemmCls = (Sm90ScaledDGatedColQuantNoStoreInplace if dz_col_inplace
+                       else Sm90ScaledDGatedColQuantNoStore)
+        elif skip:
+            raise ValueError(f"unsupported skip_stores={skip_stores!r}")
+    elif skip_stores or dz_col_inplace:
+        raise ValueError("skip_stores / dz_col_inplace need the fused col quant")
     _run_scaled(
         GemmCls, A, B, D_packed, a_scales, b_scales, C=C, epi_fields=epi,
         implicit_dtype=output_dtype, **kwargs,
@@ -3019,7 +4221,7 @@ def _sm90_raw_wgrad_kernel(
     tl.store(d_ptr + d_offsets, acc, mask=mask)
 
 
-def _validate_packed_wgrad_inputs(A, B, D, a_scales, b_scales, cu_seqlens_k, C):
+def _validate_packed_wgrad_inputs(A, B, D, a_scales, b_scales, cu_seqlens_k, C, group=32):
     """Validate the direct rank-2 TMA ABI before compiling or launching wgrad."""
     if A.ndim != 2 or B.ndim != 2 or A.shape[1] != B.shape[1]:
         raise ValueError("SM90 scaled varlen-K expects A=[M,total_packed_K], B=[N,total_packed_K]")
@@ -3039,6 +4241,18 @@ def _validate_packed_wgrad_inputs(A, B, D, a_scales, b_scales, cu_seqlens_k, C):
         raise ValueError("wgrad operands, output, and packed offsets must share one CUDA device")
     if C is not None and C.device != A.device:
         raise ValueError("wgrad C must be on the operand CUDA device")
+    if group == 128:
+        # 1x128: segments come 128-aligned from the routing metadata
+        # (routing_block_size = 128); offsets stay on the device (no sync).
+        # Scale shapes are checked by _run_scaled.
+        if int(A.shape[1]) % 128 or int(cu_seqlens_k.shape[0]) != int(D.shape[0]) + 1:
+            raise ValueError("1x128 wgrad needs total_K % 128 == 0 and len(offsets) == E + 1")
+        if _SM90_WGRAD_VALIDATE:
+            offsets = [int(v) for v in cu_seqlens_k.detach().cpu().tolist()]
+            if (offsets[0] != 0 or offsets[-1] > int(A.shape[1])
+                    or any(r < l or (r - l) % 128 for l, r in zip(offsets, offsets[1:]))):
+                raise ValueError(f"1x128 wgrad offsets must be 128-aligned in [0,{A.shape[1]}]")
+        return
     offsets = [int(value) for value in cu_seqlens_k.detach().cpu().tolist()]
     total_k = int(A.shape[1])
     if len(offsets) != int(D.shape[0]) + 1:
@@ -3062,17 +4276,33 @@ def _validate_packed_wgrad_inputs(A, B, D, a_scales, b_scales, cu_seqlens_k, C):
 
 def sm90_scaled_wgrad_varlen_k(
     A, B, D, a_scales, b_scales, cu_seqlens_k, *, C=None, beta=None,
-    add_to_output=False, **kwargs,
+    add_to_output=False, group=32, a_tile_local=False, **kwargs,
 ):
     """Varlen-K Hopper wgrad over contiguous K-major raw operands.
 
-    ``A`` and ``B`` are E4M3 ``[M,total_K]`` and ``[N,total_K]``. Their raw
-    UE8M0 scales are uint8 ``[M,total_K/32]`` and ``[N,total_K/32]``. Scale
-    column zero for expert ``e`` is ``cu_seqlens_k[e] / 32``; no group crosses
-    an expert boundary. ``A_idx`` is intentionally unsupported because gather
-    and transpose happen in the colwise quantizer.
+    ``A`` and ``B`` are E4M3 ``[M,total_K]`` and ``[N,total_K]``.
+    ``group=32``: raw UE8M0 scales are uint8 ``[M,total_K/32]`` and
+    ``[N,total_K/32]``; scale column zero for expert ``e`` is
+    ``cu_seqlens_k[e] / 32``.
+    ``group=128``: scales are k-group-major uint8 ``[total_K/128 + pad, M]``
+    and ``[total_K/128 + pad, N]`` (pad >= 256 bytes); expert segments are
+    128-aligned; one tensor-core promotion per 128 K.
+    No group crosses an expert boundary. ``A_idx`` is intentionally
+    unsupported because gather and transpose happen in the colwise quantizer.
+    ``a_tile_local=True`` (group 128): ``A`` is the bf16 ``[total_K, M]``
+    buffer holding the tile-local E4M3 operand written by
+    ``sm90_scaled_dgated(dz_col_inplace=True)``.
     """
-    _validate_packed_wgrad_inputs(A, B, D, a_scales, b_scales, cu_seqlens_k, C)
+    if group not in (32, 128):
+        raise ValueError(f"unsupported SM90 wgrad group {group}")
+    if a_tile_local:
+        k, m = int(A.shape[0]), int(A.shape[1])
+        if (group != 128 or A.ndim != 2 or not _same_dtype(A.dtype, torch.bfloat16)
+                or not A.is_contiguous() or k % 128 or m % 128):
+            raise ValueError("a_tile_local needs group 128 and a contiguous bf16 "
+                             "[total_K % 128 == 0, M % 128 == 0] buffer")
+        A = A.view(-1).view(torch.uint8)[: m * k].view(m, k).view(torch.float8_e4m3fn)
+    _validate_packed_wgrad_inputs(A, B, D, a_scales, b_scales, cu_seqlens_k, C, group)
     if add_to_output and C is not None:
         raise ValueError("add_to_output uses D as the accumulator and cannot also take C")
     if add_to_output and beta not in (None, 1, 1.0):
@@ -3088,6 +4318,8 @@ def sm90_scaled_wgrad_varlen_k(
         if not force_cute:
             raise ValueError("force_cute=False is not a production mode; use debug_triton_fallback")
     if debug_triton:
+        if group != 32:
+            raise ValueError("debug_triton_fallback supports the 1x32 wgrad ABI only")
         return _run_scaled_wgrad_triton(
             A, B, D, a_scales, b_scales, cu_seqlens_k,
             None if add_to_output else C, beta, add_to_output,
@@ -3096,9 +4328,14 @@ def sm90_scaled_wgrad_varlen_k(
         beta=float(beta) if C is not None and beta is not None else None,
         add_to_output=bool(add_to_output),
     )
+    if group == 128:
+        kwargs.setdefault("tile_shape", _SM90_WGRAD128_TILE)
+        kwargs.setdefault("cluster_shape", _SM90_WGRAD128_CLUSTER)
     return _run_scaled(
-        Sm90ScaledWgradVarlenK, A, B, D, a_scales, b_scales,
-        C=None if add_to_output else C, epi_fields=epi, cu_seqlens_k=cu_seqlens_k, **kwargs,
+        Sm90ScaledWgradVarlenKTileLocal if a_tile_local else Sm90ScaledWgradVarlenK,
+        A, B, D, a_scales, b_scales,
+        C=None if add_to_output else C, epi_fields=epi, cu_seqlens_k=cu_seqlens_k,
+        activation_group=group, weight_block=group, **kwargs,
     )
 
 

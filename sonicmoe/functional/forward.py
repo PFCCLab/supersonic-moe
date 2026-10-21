@@ -198,6 +198,7 @@ def _router_forward(
     varlen_K_max: int,
     H: int,
     is_varlen_K: bool,
+    skip_single: bool = False,
 ) -> None:
     token_gather_and_sum_varlen_K_triton(
         y2,
@@ -209,6 +210,7 @@ def _router_forward(
         varlen_K_max,
         H,
         is_varlen_K,
+        skip_single=skip_single,
     )
 
 

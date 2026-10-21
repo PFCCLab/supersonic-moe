@@ -20,6 +20,8 @@ backend does not implement raises ``NotImplementedError``.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from ..quack_utils import sm90_funcs, sm100_funcs
@@ -69,6 +71,12 @@ def quantize_activation_raw(x: torch.Tensor, cfg):
 def dequantize_activation(data: torch.Tensor, scales: torch.Tensor, cfg) -> torch.Tensor:
     """BF16 view of a rowwise E4M3 payload with raw UE8M0 scales."""
     return _backend().dequantize_activation(data, scales, cfg)
+
+
+def dequantize_activation_routed(data: torch.Tensor, scales: torch.Tensor, cfg, gather_idx: torch.Tensor):
+    """BF16 ``dequantize_activation(data, scales)[gather_idx]`` when the backend's
+    BF16 wgrad is faster on a route-ordered A, else ``None``."""
+    return _backend().dequantize_activation_routed(data, scales, cfg, gather_idx)
 
 
 def quantize_preact(z: torch.Tensor):
@@ -181,16 +189,37 @@ def gemm(
     out_features: int,
     num_experts: int,
     cfg,
+    **route_scatter,
 ) -> torch.Tensor:
     """Varlen grouped ``out = a @ w`` with BF16 output ``[rows, out_features]``.
 
     ``a_fp8``/``a_scales`` come from :func:`quantize_activation`; ``w_fp8`` is
     the K-major ``[E, out_features, K]`` weight. Used for the down-projection
-    forward and the up-projection input gradient.
+    forward and the up-projection input gradient. ``route_scatter`` (SM90 only,
+    see :func:`route_scatter_supported`): ``out`` / ``scatter_dst`` /
+    ``scatter_out`` / ``scatter_w`` of the fused single-route token reduction.
     """
     return _backend().gemm(
         a_fp8, a_scales, w_fp8, w_scales, expert_frequency_offset,
-        out_features=out_features, num_experts=num_experts, cfg=cfg,
+        out_features=out_features, num_experts=num_experts, cfg=cfg, **route_scatter,
+    )
+
+
+def route_scatter_supported(cfg, is_varlen_K: bool, H: int) -> bool:
+    """Whether :func:`gemm` should fuse the single-route token reduction
+    (``SONIC_MOE_SM90_ROUTE_SCATTER=0`` disables it).
+
+    The fusion saves reduce traffic proportional to ``H`` but costs a roughly
+    constant ~60 us of host work per call (dst kernel launch, two extra
+    allocations, extra GEMM args). Below ``SONIC_MOE_SM90_ROUTE_SCATTER_MIN_H``
+    (default 1024) that does not pay off: at H=512 (ERNIELite 4B, launch-bound)
+    it made the MoE forward ~0.1 ms slower.
+    """
+    return (
+        bool(is_varlen_K) and H % 8 == 0 and _backend() is sm90_funcs
+        and cfg.activation_group_size == 128
+        and os.environ.get("SONIC_MOE_SM90_ROUTE_SCATTER", "1") != "0"
+        and H >= int(os.environ.get("SONIC_MOE_SM90_ROUTE_SCATTER_MIN_H", "1024"))
     )
 
 
@@ -213,6 +242,11 @@ def gemm_dgated(
     x_gather_idx: torch.Tensor,
     activation: str,
     cfg,
+    quantize_dz: bool = False,
+    dz_out: torch.Tensor | None = None,
+    col_quant: tuple = (),
+    skip_bf16: tuple = (),
+    dz_col_inplace: bool = False,
 ):
     """Fused down-projection backward + activation backward.
 
@@ -221,9 +255,22 @@ def gemm_dgated(
     the FP8 ``preact_fp8``/``preact_scales`` pair is supplied.
 
     Returns ``(dz, y1s, ds)`` with ``ds`` the per-row router-score gradient.
+    With ``quantize_dz=True`` a fourth item is the rowwise ``(fp8, scales)``
+    of dz (as :func:`quantize_activation`) when the backend fuses it into the
+    epilogue (SM90 profile 128), else ``None``.  ``dz_out`` (SM90 only, else
+    ignored) is the BF16 dz buffer to write, typically ``preact`` itself when
+    z is dead after this call.
+
+    With ``col_quant`` (subset of ``("y1s", "dz")``) a last item is a dict of
+    the wgrad operands (as :func:`quantize_wgrad_operand`) the backend fused
+    into the epilogue; it is empty when unsupported (callers then quantize).
+    ``skip_bf16`` (applied only when fused, see ``sm90_funcs.gemm_dgated``)
+    drops the BF16 outputs whose fp8 forms are all the caller consumes: y1s
+    comes back ``None``, dz with stale contents. ``dz_col_inplace`` (only with
+    the fused col quant) returns dz's operand written into ``preact`` itself.
     """
-    return _backend().gemm_dgated(
-        dout_fp8, dout_scales,
+    backend = _backend()
+    kwargs = dict(
         w2_fp8=w2_fp8, w2_scales=w2_scales,
         preact=preact, preact_fp8=preact_fp8, preact_scales=preact_scales,
         colvec_scale=colvec_scale,
@@ -232,6 +279,25 @@ def gemm_dgated(
         activation=activation,
         cfg=cfg,
     )
+    if backend is sm90_funcs and dz_out is not None:
+        kwargs["dz_out"] = dz_out
+    fuse_col = bool(col_quant) and backend is sm90_funcs and sm90_funcs.dgated_col_quant_supported(
+        cfg, preact, int(x_gather_idx.shape[0])
+    )
+    if fuse_col:
+        kwargs["col_quant"] = tuple(col_quant)
+        kwargs["skip_bf16"] = tuple(skip_bf16)
+        if dz_col_inplace:
+            kwargs["dz_col_inplace"] = True
+    if not quantize_dz:
+        out = backend.gemm_dgated(dout_fp8, dout_scales, **kwargs)
+    elif backend is sm90_funcs:
+        out = backend.gemm_dgated(dout_fp8, dout_scales, quantize_dz=True, **kwargs)
+    else:
+        out = (*backend.gemm_dgated(dout_fp8, dout_scales, **kwargs), None)
+    if not col_quant:
+        return out
+    return out if fuse_col else (*out, {})
 
 
 # ---------------------------------------------------------------------------
@@ -270,16 +336,27 @@ def quantize_dz_dout(
     *,
     dout_fp8: torch.Tensor | None = None,
     dout_scales: torch.Tensor | None = None,
+    dz_rowwise=None,
+    defer_dz_col: bool = False,
 ):
     """Quantize the down-projection backward operands.
 
     Returns ``(dz_rowwise, dz_col, dout_col)``: ``dz_rowwise`` is the
-    ``(data, scales)`` pair for the up-projection :func:`gemm`; the other two
-    are wgrad operands (``dout`` / ``dout_fp8`` gathered by ``x_gather_idx``).
+    ``(data, scales)`` pair for the up-projection :func:`gemm` (passed through
+    when already produced by :func:`gemm_dgated`); the other two are wgrad
+    operands (``dout`` / ``dout_fp8`` gathered by ``x_gather_idx``).
+
+    With ``defer_dz_col`` (SM90 only, else ignored) ``dz_col`` is ``None`` and
+    the caller quantizes it later with :func:`quantize_wgrad_operand` (same
+    result), so it does not coexist with the dw2 operands.
     """
-    return _backend().quantize_dz_dout(
+    backend = _backend()
+    extra = {} if dz_rowwise is None else dict(dz_rowwise=dz_rowwise)
+    if defer_dz_col and backend is sm90_funcs:
+        extra["defer_dz_col"] = True
+    return backend.quantize_dz_dout(
         dz, dout, expert_frequency_offset, x_gather_idx, cfg,
-        dout_fp8=dout_fp8, dout_scales=dout_scales,
+        dout_fp8=dout_fp8, dout_scales=dout_scales, **extra,
     )
 
 

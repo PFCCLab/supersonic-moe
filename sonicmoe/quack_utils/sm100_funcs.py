@@ -648,6 +648,11 @@ def dequantize_activation(data: torch.Tensor, scales: torch.Tensor, cfg) -> torc
     )
 
 
+def dequantize_activation_routed(data, scales, cfg, gather_idx):
+    # The SM100 wgrad consumes the source-order x through its gather path.
+    return None
+
+
 def quantize_preact(z: torch.Tensor):
     return quantize_activation_blockscaled_fast(z)
 
