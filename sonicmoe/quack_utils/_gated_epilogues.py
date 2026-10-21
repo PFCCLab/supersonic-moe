@@ -288,7 +288,12 @@ class GemmGatedMixin(GemmActMixin):
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
         tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
-        if const_expr(self.arch < 100):
+        if const_expr(
+            self.arch < 100 and not self.swiglu_clamp_value > 0.0
+            and _is_quack_act(params.act_fn, "swiglu_precise")
+        ):
+            _swiglu_precise_frag(tRS_rD, tRS_rPostAct)
+        elif const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
                 gate = tRS_rD[2 * i]
                 up = tRS_rD[2 * i + 1]
@@ -357,6 +362,85 @@ def _bf16_trunc_rne(x: Float32, *, loc=None, ip=None) -> Float32:
     roundup = (lower + kept_lsb + Int32(0x7FFF)) >> Int32(16)
     out_bits = ((bits >> Int32(16)) + roundup) << Int32(16)
     return _i32_as_f32(out_bits)
+
+
+# ---------------------------------------------------------------------------
+# Exact sigmoid with the IEEE-division guard hoisted out of the element loop
+# ---------------------------------------------------------------------------
+# quack's *_precise activations compute sigmoid as ``1.0f / (1.0f + expf(-x))``.
+# The correctly rounded division compiles to MUFU.RCP + one Newton step behind a
+# per-element exponent check, BSSY/BRA/BSYNC and a slow-path CALL that is only
+# needed when the denominator's biased exponent is outside [1, 252]. Since
+# ``d = 1 + expf(-x) >= 1``, that only happens for d >= 2**126 (x < -87.3), inf
+# or NaN. The helpers below evaluate the fast path for a whole fragment, track
+# max(bits(d)) and redo the exact division only when some d leaves the range,
+# giving bit-identical results with ~6 fewer instructions per element.
+_RCP_FAST_MAX_BITS = 0x7E800000  # bits of 2**126; d >= 1 (or canonical NaN) so the sign bit is 0
+
+
+@dsl_user_op
+def _rcp_rn_fast(d: Float32, *, loc=None, ip=None) -> Float32:
+    """Fast path of the compiler's ``1.0f / d`` (bitwise equal for 1 <= d < 2**126)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(d).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 r, e; rcp.approx.ftz.f32 r, $1; neg.f32 e, $1; "
+            "fma.rn.f32 e, e, r, 0f3F800000; fma.rn.f32 $0, r, e, r; }",
+            "=f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@cute.jit
+def _sigmoid_precise_frag(tX, tSig, stride: cutlass.Constexpr[int]):
+    """tSig[i] = sigmoid_precise(tX[stride * i]) for the whole fragment, bitwise."""
+    n = cute.size(tSig)
+    big = Int32(0)
+    for i in cutlass.range(n, unroll_full=True):
+        den = Float32(1.0) + cute.math.exp(-tX[stride * i], fastmath=False)
+        tSig[i] = den
+        big = _b32_op("max.s32", big, _f32_as_i32(den))
+    if big >= Int32(_RCP_FAST_MAX_BITS):
+        for i in cutlass.range(n, unroll_full=True):
+            tSig[i] = Float32(1.0) / tSig[i]
+    else:
+        for i in cutlass.range(n, unroll_full=True):
+            tSig[i] = _rcp_rn_fast(tSig[i])
+
+
+def _is_quack_act(fn, name: str) -> bool:
+    import quack.activation as _qa
+    return fn is getattr(_qa, name, None)
+
+
+@cute.jit
+def _swiglu_precise_frag(tXY, tOut):
+    """tOut[i] = swiglu_precise(tXY[2i], tXY[2i+1]), bitwise."""
+    tSig = cute.make_rmem_tensor_like(tOut, Float32)
+    _sigmoid_precise_frag(tXY, tSig, 2)
+    for i in cutlass.range(cute.size(tOut), unroll_full=True):
+        tOut[i] = (tXY[2 * i] * tSig[i]) * tXY[2 * i + 1]
+
+
+@cute.jit
+def _dswiglu_precise_frag(tXY, tDout, tdXY, tOut):
+    """Fragment version of quack's dswiglu_precise (same expression order), bitwise."""
+    tSig = cute.make_rmem_tensor_like(tDout, Float32)
+    _sigmoid_precise_frag(tXY, tSig, 2)
+    for i in cutlass.range(cute.size(tDout), unroll_full=True):
+        x = tXY[2 * i]
+        y = tXY[2 * i + 1]
+        dout = tDout[i]
+        sig = tSig[i]
+        silu_x = x * sig
+        silu_x_dout = silu_x * dout
+        d_silu_x_dout = (sig - silu_x * sig) * dout + silu_x_dout
+        tdXY[2 * i] = d_silu_x_dout * y
+        tdXY[2 * i + 1] = silu_x_dout
+        tOut[i] = silu_x * y
 
 
 # ---------------------------------------------------------------------------
@@ -550,50 +634,95 @@ class Sm90RawGatedQuantMixin(GemmGatedMixin):
             )
             values_for_quant = cute.make_rmem_tensor(values.shape, Float32)
             values_for_quant.store(values.load())
-            for i in cutlass.range(cute.size(values), unroll_full=True):
-                coord = coords[2 * i] if half_n else coords[i]
-                m_local = coord[0]
-                n_local = coord[1]
-                n_out = n_local // Int32(2) if half_n else n_local
-                # R2S coordinates show four adjacent N lanes per row; each lane
-                # owns eight register values, covering one complete 1x32 group.
-                amax = cute.arch.fmax(
-                    values_for_quant[i], Float32(0.0) - values_for_quant[i]
-                )
-                for j in cutlass.range(cute.size(values_for_quant), unroll_full=True):
-                    other = coords[2 * j] if half_n else coords[j]
-                    other_n = other[1] // Int32(2) if half_n else other[1]
-                    same_group = (
-                        cutlass.Boolean(other[0] == m_local)
-                        & cutlass.Boolean((other_n // Int32(32)) == (n_out // Int32(32)))
+            if const_expr(half_n and cute.size(values) == 16 and lanes_n == 4):
+                # PostAct of a 64-column z subtile: value i is z element 2*i, so
+                # its row half is i % 2 and its PostAct column is
+                # lane_n + 4 * ((i // 2) % 2) + 8 * (i // 4).  Each parity class is
+                # therefore 8 values of one row inside one 1x32 group, and the 4
+                # N lanes complete it.  Reduce the two classes directly instead of
+                # the generic all-pairs scan (identical amax: fmax is exact and
+                # the generic scan also folds in 0.0 for out-of-group values).
+                group_amax = [Float32(0.0), Float32(0.0)]
+                for i in cutlass.range_constexpr(16):
+                    group_amax[i % 2] = cute.arch.fmax(
+                        group_amax[i % 2],
+                        cute.arch.fmax(values_for_quant[i], Float32(0.0) - values_for_quant[i]),
                     )
-                    other_abs = cute.arch.fmax(
-                        values_for_quant[j], Float32(0.0) - values_for_quant[j]
+                group_qscale = []
+                group_e8m0 = []
+                for g in cutlass.range_constexpr(2):
+                    h_amax = cute.arch.warp_reduction(
+                        group_amax[g], cute.arch.fmax, threads_in_group=lanes_n
                     )
-                    amax = cute.arch.fmax(amax, other_abs if same_group else Float32(0.0))
-                amax = cute.arch.warp_reduction(
-                    amax, cute.arch.fmax, threads_in_group=lanes_n
-                )
-                amax_bits = _f32_as_i32(amax)
-                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
-                mantissa = amax_bits & Int32(0x7FFFFF)
-                carry = Int32(1) if cutlass.Boolean(mantissa > Int32(0x600000)) else Int32(0)
-                e8m0 = biased_exp - Int32(8) + carry
-                e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
-                e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
-                qexp = Int32(254) - e8m0
-                qexp = Int32(254) if cutlass.Boolean(qexp > Int32(254)) else qexp
-                qexp = Int32(1) if cutlass.Boolean(qexp < Int32(1)) else qexp
-                values[i] = values_for_quant[i] * _i32_as_f32(qexp << Int32(23))
-                m_abs = batch_start + tile_coord[0] * tile_m + m_local
-                output_tile_n = tile_n // Int32(2) if half_n else tile_n
-                n_abs = tile_coord[1] * output_tile_n + n_out
-                if (
-                    cutlass.Boolean(m_abs < m_limit)
-                    & cutlass.Boolean(n_abs < param.shape[1] * Int32(32))
-                    & cutlass.Boolean((n_abs % Int32(32)) == Int32(0))
-                ):
-                    param[m_abs, n_abs // Int32(32)] = cutlass.Int8(e8m0)
+                    h_amax_bits = _f32_as_i32(h_amax)
+                    h_biased_exp = (h_amax_bits >> Int32(23)) & Int32(0xFF)
+                    h_mantissa = h_amax_bits & Int32(0x7FFFFF)
+                    h_carry = Int32(1) if cutlass.Boolean(h_mantissa > Int32(0x600000)) else Int32(0)
+                    h_e8m0 = h_biased_exp - Int32(8) + h_carry
+                    h_e8m0 = h_e8m0 if cutlass.Boolean(h_biased_exp > Int32(0)) else Int32(0)
+                    h_e8m0 = h_e8m0 if cutlass.Boolean(h_e8m0 > Int32(0)) else Int32(0)
+                    h_qexp = Int32(254) - h_e8m0
+                    h_qexp = Int32(254) if cutlass.Boolean(h_qexp > Int32(254)) else h_qexp
+                    h_qexp = Int32(1) if cutlass.Boolean(h_qexp < Int32(1)) else h_qexp
+                    group_e8m0.append(h_e8m0)
+                    group_qscale.append(_i32_as_f32(h_qexp << Int32(23)))
+                h_output_tile_n = tile_n // Int32(2)
+                for i in cutlass.range_constexpr(16):
+                    values[i] = values_for_quant[i] * group_qscale[i % 2]
+                    h_coord = coords[2 * i]
+                    h_m_abs = batch_start + tile_coord[0] * tile_m + h_coord[0]
+                    h_n_abs = tile_coord[1] * h_output_tile_n + h_coord[1] // Int32(2)
+                    if (
+                        cutlass.Boolean(h_m_abs < m_limit)
+                        & cutlass.Boolean(h_n_abs < param.shape[1] * Int32(32))
+                        & cutlass.Boolean((h_n_abs % Int32(32)) == Int32(0))
+                    ):
+                        param[h_m_abs, h_n_abs // Int32(32)] = cutlass.Int8(group_e8m0[i % 2])
+            else:
+                for i in cutlass.range(cute.size(values), unroll_full=True):
+                    coord = coords[2 * i] if half_n else coords[i]
+                    m_local = coord[0]
+                    n_local = coord[1]
+                    n_out = n_local // Int32(2) if half_n else n_local
+                    # R2S coordinates show four adjacent N lanes per row; each lane
+                    # owns eight register values, covering one complete 1x32 group.
+                    amax = cute.arch.fmax(
+                        values_for_quant[i], Float32(0.0) - values_for_quant[i]
+                    )
+                    for j in cutlass.range(cute.size(values_for_quant), unroll_full=True):
+                        other = coords[2 * j] if half_n else coords[j]
+                        other_n = other[1] // Int32(2) if half_n else other[1]
+                        same_group = (
+                            cutlass.Boolean(other[0] == m_local)
+                            & cutlass.Boolean((other_n // Int32(32)) == (n_out // Int32(32)))
+                        )
+                        other_abs = cute.arch.fmax(
+                            values_for_quant[j], Float32(0.0) - values_for_quant[j]
+                        )
+                        amax = cute.arch.fmax(amax, other_abs if same_group else Float32(0.0))
+                    amax = cute.arch.warp_reduction(
+                        amax, cute.arch.fmax, threads_in_group=lanes_n
+                    )
+                    amax_bits = _f32_as_i32(amax)
+                    biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                    mantissa = amax_bits & Int32(0x7FFFFF)
+                    carry = Int32(1) if cutlass.Boolean(mantissa > Int32(0x600000)) else Int32(0)
+                    e8m0 = biased_exp - Int32(8) + carry
+                    e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
+                    e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
+                    qexp = Int32(254) - e8m0
+                    qexp = Int32(254) if cutlass.Boolean(qexp > Int32(254)) else qexp
+                    qexp = Int32(1) if cutlass.Boolean(qexp < Int32(1)) else qexp
+                    values[i] = values_for_quant[i] * _i32_as_f32(qexp << Int32(23))
+                    m_abs = batch_start + tile_coord[0] * tile_m + m_local
+                    output_tile_n = tile_n // Int32(2) if half_n else tile_n
+                    n_abs = tile_coord[1] * output_tile_n + n_out
+                    if (
+                        cutlass.Boolean(m_abs < m_limit)
+                        & cutlass.Boolean(n_abs < param.shape[1] * Int32(32))
+                        & cutlass.Boolean((n_abs % Int32(32)) == Int32(0))
+                    ):
+                        param[m_abs, n_abs // Int32(32)] = cutlass.Int8(e8m0)
 
     @cute.jit
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
@@ -1312,7 +1441,12 @@ class GemmDGatedMixin(GemmActMixin):
                         )
         else:
             tRS_rD_scaled.store(tRS_rD.load())
-        if const_expr(self.arch < 100):
+        if const_expr(
+            self.arch < 100 and not self.swiglu_clamp_value > 0.0
+            and _is_quack_act(params.act_bwd_fn, "dswiglu_precise")
+        ):
+            _dswiglu_precise_frag(tRS_rXY_f32x2, tRS_rD_scaled, tRS_rdXY_f32x2, tRS_rOut)
+        elif const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rD)):
                 gate = tRS_rXY_f32x2[2 * i]
                 up = tRS_rXY_f32x2[2 * i + 1]
@@ -1381,6 +1515,758 @@ class GemmDGatedMixin(GemmActMixin):
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
         # Return PostAct in acc_dtype; conversion happens in epi_convert_postact
         return tRS_rOut
+
+
+@dsl_user_op
+def _cvt_e4m3x4(a: Float32, b: Float32, c: Float32, d: Float32, *, loc=None, ip=None) -> Int32:
+    """Four f32 -> four E4M3 bytes packed little-endian (a in the low byte)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(v).ir_value(loc=loc, ip=ip) for v in (a, b, c, d)],
+            "{ .reg .b16 lo, hi; cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1; "
+            "cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3; mov.b32 $0, {lo, hi}; }",
+            "=r,f,f,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _b32_op(ptx: str, a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    """Binary packed-16-bit PTX op on two b32 words (``$0 = op($1, $2)``)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
+            ptx + " $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+class Sm90DzQuantStore(EpiOp):
+    """State for the fused 1x128 dz quant of the SM90 dGated epilogue.
+
+    ``param`` is the E4M3 dz output viewed as int32 words ``[M, 2N/4]``.  A
+    1x128 dz group is 64 packed (bf16x2) D columns = two 32-column epilogue
+    subtiles, so ``begin`` allocates a register buffer that carries the even
+    subtile's dz values to the odd one, where the group is quantized.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name)
+        return {self.name: None if tensor is None else assume_stride_divisibility(tensor)}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        state = None
+        if const_expr(param is not None):
+            coord = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+            )
+            coord = cute.group_modes(coord, 3, cute.rank(coord))
+            n_vals = cute.size(coord[None, None, None, 0])
+            buf = cute.make_rmem_tensor(cute.make_layout(n_vals), Int32)
+            state = (param, coord, buf, ctx.tile_coord_mnkl, ctx.varlen_manager, ctx.tiled_copy_r2s)
+        return state
+
+    def begin_loop(self, gemm, state, epi_coord):
+        result = None
+        if const_expr(state is not None):
+            param, coord, buf, tile_coord, varlen, tiled_copy = state
+            n_sub = epi_coord[1] if isinstance(epi_coord, tuple) else epi_coord
+            assert isinstance(n_sub, int), "epilogue subtile loop must be unrolled"
+            result = (param, coord[None, None, None, epi_coord], buf, tile_coord, varlen,
+                      tiled_copy, n_sub)
+        return result
+
+
+class Sm90DGatedDzQuantMixin(GemmDGatedMixin):
+    """dGated that also writes dz as E4M3 with raw 1x128 UE8M0 scales.
+
+    Byte-identical to ``quantize_activation_blockscaled_fast(dz_bf16, 128)``:
+    the group amax is taken over the bf16-rounded dz that is stored, with the
+    same integer+carry E8M0 rule and RN-satfinite E4M3 conversion.
+    """
+
+    _epi_ops = (*GemmDGatedMixin._epi_ops, Sm90DzQuantStore("mDzFp8"))
+    _extra_param_fields = (*GemmDGatedMixin._extra_param_fields, ("mDzScale", object, None))
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0  # RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mDzFp8: Optional[cute.Tensor] = None
+        mDzScale: Optional[cute.Tensor] = None
+
+    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+        assert self.cta_tile_shape_mnk[1] % 64 == 0, (
+            "fused 1x128 dz quant needs tile N divisible by 64 (two 32-column subtiles)"
+        )
+        params = GemmDGatedMixin.epi_to_underlying_arguments(self, args, loc=loc, ip=ip)
+        params.mDzScale = args.mDzScale
+        return params
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        tRS_rOut = GemmDGatedMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
+        info = epi_loop_tensors["mDzFp8"]
+        if const_expr(info is not None):
+            param, coords, buf, tile_coord, varlen, tiled_copy, n_sub = info
+            assert self.epi_tile[1] == 32, "fused dz quant needs 32-column subtiles"
+            lane_layout, warp_layout = _get_lane_warp_layouts(tiled_copy, True)
+            assert cute.size(lane_layout, mode=[1]) == 4 and cute.size(warp_layout, mode=[1]) == 1
+            n_vals = cute.size(tRS_rD)
+            # tRS_rD now holds the stored dz as bf16x2 words (low half = even column).
+            if const_expr(n_sub % 2 == 0):
+                for i in cutlass.range_constexpr(n_vals):
+                    buf[i] = _f32_as_i32(tRS_rD[i])
+            else:
+                # SM90 accumulator fragment of a 32-column subtile (16 values):
+                # value i sits in row half (i // 2) % 2 and column
+                # 2 * lane_n + i % 2 + 8 * (i // 4); the 4 N lanes of a row
+                # together cover the 64 packed columns (128 dz values) of a group.
+                # |bf16| bit patterns order like their values -> u16x2 integer max.
+                assert n_vals == 16
+                umax = "max.u16x2"
+                acc = [None, None]
+                for i in cutlass.range_constexpr(n_vals):
+                    ab = _b32_op(umax, buf[i] & Int32(0x7FFF7FFF),
+                                 _f32_as_i32(tRS_rD[i]) & Int32(0x7FFF7FFF))
+                    r = (i // 2) % 2
+                    acc[r] = ab if const_expr(acc[r] is None) else _b32_op(umax, acc[r], ab)
+                e8m0, qscale = [], []
+                for r in cutlass.range_constexpr(2):
+                    h = _b32_op(umax, acc[r], acc[r] >> Int32(16)) & Int32(0xFFFF)
+                    e, q = _ue8m0_from_amax(
+                        cute.arch.warp_reduction(_i32_as_f32(h << Int32(16)), cute.arch.fmax,
+                                                 threads_in_group=4)
+                    )
+                    e8m0.append(e)
+                    qscale.append(q)
+                batch = tile_coord[3]
+                batch_start = varlen.params.cu_seqlens_m[batch] if varlen.varlen_m else Int32(0)
+                m_limit = (
+                    varlen.params.cu_seqlens_m[batch + Int32(1)]
+                    if varlen.varlen_m else param.shape[0]
+                )
+                n_limit = param.shape[1] * Int32(2)  # packed D columns
+                tile_m, tile_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
+                m_base = batch_start + tile_coord[0] * Int32(tile_m)
+                n_lane = tile_coord[1] * Int32(tile_n) + coords[0][1]  # column of value 0
+                w_prev = (n_lane >> Int32(1)) - Int32(16)  # int32 word of value 0, even subtile
+                hi_mask = Int32(-65536)  # 0xFFFF0000
+                # n_limit and the group start are multiples of 64 packed columns,
+                # so a 1x128 group is either fully inside or fully outside N.
+                n_ok = cutlass.Boolean(n_lane < n_limit)
+                ln = cute.arch.lane_idx() & Int32(3)  # == lane_n of the WGMMA fragment
+                w_lane = w_prev + Int32(3) * ln  # group word base + 4 * ln
+                for r in cutlass.range_constexpr(2):
+                    qs = qscale[r]
+                    prev, cur = [], []
+                    for k in cutlass.range_constexpr(4):  # 8-column blocks
+                        i = 4 * k + 2 * r  # words i, i+1: packed columns (n, n+1)
+                        words = []
+                        for src in (buf[i], buf[i + 1], _f32_as_i32(tRS_rD[i]),
+                                    _f32_as_i32(tRS_rD[i + 1])):
+                            words.append((_i32_as_f32(src << Int32(16)) * qs,
+                                          _i32_as_f32(src & hi_mask) * qs))
+                        prev.append(_cvt_e4m3x4(*words[0], *words[1]))
+                        cur.append(_cvt_e4m3x4(*words[2], *words[3]))
+                    # Lane ln holds word 4k + ln of block k; a 4x4 transpose over the
+                    # 4 N lanes gives each lane 4 consecutive words -> 16B stores.
+                    prev = _xpose4_lanes(prev, ln)
+                    cur = _xpose4_lanes(cur, ln)
+                    m_abs = m_base + coords[2 * r][0]
+                    if cutlass.Boolean(m_abs < m_limit) & n_ok:
+                        ptr = cute.domain_offset((m_abs, w_lane), param).iterator
+                        _st_global_v4(ptr, prev)
+                        _st_global_v4(ptr + 16, cur)
+                        if cutlass.Boolean(ln == Int32(0)):
+                            params.mDzScale[m_abs, n_lane >> Int32(6)] = cutlass.Int8(e8m0[r])
+        return tRS_rOut
+
+
+def _xpose4_lanes(v, ln):
+    """4x4 transpose of ``v[k]`` (lane ln, block k) across the 4 adjacent lanes."""
+    v = list(v)
+    for bit, pairs in ((2, ((0, 2), (1, 3))), (1, ((0, 1), (2, 3)))):
+        m = Int32(0) - ((ln >> Int32(bit // 2)) & Int32(1))  # all-ones on "hi" lanes
+        nm = ~m
+        for lo_k, hi_k in pairs:
+            send = (v[lo_k] & m) | (v[hi_k] & nm)
+            recv = cute.arch.shuffle_sync_bfly(send, offset=bit)
+            v[lo_k] = (recv & m) | (v[lo_k] & nm)
+            v[hi_k] = (v[hi_k] & m) | (recv & nm)
+    return v
+
+
+@dsl_user_op
+def _st_global_v4(ptr, vals, *, loc=None, ip=None) -> None:
+    """16B ``st.global.v4.b32`` of four Int32 words at a 16B-aligned gmem pointer."""
+    llvm.inline_asm(
+        None,
+        [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)]
+        + [Int32(v).ir_value(loc=loc, ip=ip) for v in vals],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_global_v4_addr(addr, vals, *, loc=None, ip=None) -> None:
+    """``_st_global_v4`` at a raw Int64 gmem address."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)]
+        + [Int32(v).ir_value(loc=loc, ip=ip) for v in vals],
+        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
+def _prmt2(a: Int32, b: Int32, sel: Int32, *, loc=None, ip=None) -> Int32:
+    """``prmt.b32 d, a, b, sel``: bytes 0-3 from ``a``, 4-7 from ``b``."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip),
+             Int32(sel).ir_value(loc=loc, ip=ip)],
+            "prmt.b32 $0, $1, $2, $3;",
+            "=r,r,r,r",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _absmax_f32(a: Float32, v: Float32, *, loc=None, ip=None) -> Float32:
+    """``max(a, |v|)`` (ptxas folds the abs into one FMNMX)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(a).ir_value(loc=loc, ip=ip), Float32(v).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 t; abs.f32 t, $2; max.f32 $0, $1, t; }",
+            "=f,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _ld_shared_bf16_as_f32(smem_addr, *, loc=None, ip=None) -> Float32:
+    """bf16 at ``smem_addr`` widened to f32 (exact: bf16 is the f32 high half)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b32 t; ld.shared.u16 t, [$1]; shl.b32 $0, t, 16; }",
+            "=f,r",
+            has_side_effects=True, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+def _colq128_group(vals, q):
+    """Quantize one feature's 128-row group held by 8 lanes (lane bits 2-4 = q).
+
+    ``vals[j]`` is row ``16 * q + (j ^ q)`` of the group (the XOR stagger makes
+    the smem column reads bank-conflict free).  Returns ``(e8m0, words)`` where
+    ``words`` are the E4M3 bytes of rows ``16q .. 16q+15`` in order.
+    """
+    a = Float32(0.0)
+    for v in vals:
+        a = _absmax_f32(a, v)
+    for off in (4, 8, 16):
+        a = cute.arch.fmax(a, cute.arch.shuffle_sync_bfly(a, offset=off))
+    e8m0, qs = _ue8m0_from_amax(a)
+    w = [_cvt_e4m3x4(vals[4 * k] * qs, vals[4 * k + 1] * qs, vals[4 * k + 2] * qs,
+                     vals[4 * k + 3] * qs) for k in range(4)]
+    # Slot (k, b) holds row offset 4 * (k ^ q>>2) + (b ^ q&3): output word K takes
+    # byte B from slot (K ^ q>>2, B ^ q&3), i.e. one prmt over (w[K], w[K ^ 1]).
+    sel = ((Int32(0x3210) ^ ((q & Int32(3)) * Int32(0x1111)))
+           + ((q >> Int32(2)) & Int32(1)) * Int32(0x4444))
+    return e8m0, [_prmt2(w[k], w[k ^ 1], sel) for k in range(4)]
+
+
+class Sm90DGatedColQuantMixin(Sm90DGatedDzQuantMixin):
+    """dGated that also emits the colwise 1x128 wgrad operands of y1s and/or dz.
+
+    Byte-identical to ``quantize_wgrad_colwise128_sm90(y1s|dz, offsets)`` on
+    rows ``< offsets[E]``: fp8 ``[F, total_K]`` + u8 scales ``[total_K/128+pad, F]``.
+    Each 128-row CTA tile is one group (expert segments must be 128-aligned).
+    After a subtile is staged in smem for its TMA store, each of the 256
+    epilogue threads reads 16 rows of one column unit (a y1s column / a packed
+    dz word = 2 features) and 8 lanes reduce the group amax by shuffles.
+    """
+
+    dz_col_inplace = False  # dz col written tile-locally into C (see the dz branch)
+
+    _extra_param_fields = (
+        *Sm90DGatedDzQuantMixin._extra_param_fields,
+        ("mY1sCol", object, None), ("mY1sColScale", object, None),
+        ("mDzCol", object, None), ("mDzColScale", object, None),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        swiglu_clamp_value: cutlass.Constexpr[float] = 0.0
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0  # RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mDzFp8: Optional[cute.Tensor] = None
+        mDzScale: Optional[cute.Tensor] = None
+        mY1sCol: Optional[cute.Tensor] = None
+        mY1sColScale: Optional[cute.Tensor] = None
+        mDzCol: Optional[cute.Tensor] = None
+        mDzColScale: Optional[cute.Tensor] = None
+
+    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+        params = Sm90DGatedDzQuantMixin.epi_to_underlying_arguments(self, args, loc=loc, ip=ip)
+        for name in ("mY1sCol", "mY1sColScale", "mDzCol", "mDzColScale"):
+            setattr(params, name, getattr(args, name))
+        return params
+
+    @cute.jit
+    def epi_after_smem_store(self, params, epi_smem_tensors, sD, epi_buffer, gmem_coord,
+                             tile_coord, varlen, tidx, epi_idx: cutlass.Constexpr[int],
+                             epi_tile_num: cutlass.Constexpr[int]):
+        # Runs on odd subtiles only and covers both staged buffers with ONE rolled
+        # loop over (subtile, operand/half) jobs, so the group-quant body is emitted
+        # once: unrolled copies per subtile overflow the icache (dz fusion was 2x slower).
+        # smem is read by raw address with the swizzle folded into 8 per-thread row
+        # offsets (rows j and j + 8 differ by a constant), not per-element crd2idx.
+        has_y = params.mY1sCol is not None
+        has_d = params.mDzCol is not None
+        if const_expr((has_y or has_d) and epi_idx % 2 == 1):
+            assert self.cta_tile_shape_mnk[0] == 128 and tuple(self.epi_tile) == (128, 32)
+            assert self.mma_warp_groups == 2 and not self.pingpong
+            assert self.epi_stage == 2 and epi_tile_num % 2 == 0
+            lane = tidx & Int32(31)
+            q = lane >> Int32(2)
+            u = ((tidx >> Int32(5)) & Int32(7)) * Int32(4) + (lane & Int32(3))
+            batch = tile_coord[3]
+            m_base = varlen.params.cu_seqlens_m[batch] + tile_coord[0] * Int32(128)
+            group = m_base >> Int32(7)
+            k_word = (m_base + q * Int32(16)) >> Int32(2)
+            # Subtile epi_idx - 1 sits in the other buffer; epi tile M == CTA tile M.
+            col0 = (tile_coord[1] * Int32(self.cta_tile_shape_mnk[1])
+                    + Int32((gmem_coord[1] - 1) * 32) + u)
+            xs = [Int32(j) ^ q for j in range(8)]  # row 16q + x (+8 for j >= 8)
+            n_y = 1 if const_expr(has_y) else 0
+            n_k = n_y + (2 if const_expr(has_d) else 0)
+            if const_expr(has_y):
+                # sPostAct: bf16 (128, 32) rows of 64 B, 64B swizzle (S<2,4,3> on bytes).
+                sP = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
+                assert cute.cosize(sP.layout) == 8192 and sP.element_type == cutlass.BFloat16
+                pbase = sP.iterator.toint() + q * Int32(1024) + u * Int32(2)
+                p_off = [pbase + x * Int32(64) ^ ((x << Int32(3)) & Int32(0x30)) for x in xs]
+            if const_expr(has_d):
+                # sD: f32 words (128, 32) rows of 128 B, 128B swizzle (S<3,4,3> on bytes).
+                assert cute.cosize(sD.layout) == 8192 and sD.element_type == cutlass.Float32
+                dbase = sD.iterator.toint() + q * Int32(2048) + u * Int32(4)
+                d_off = [dbase + x * Int32(128) ^ (x << Int32(4)) for x in xs]
+            for s in cutlass.range(2, unroll=1):
+                b = (epi_buffer + Int32(1) + s) & Int32(1)
+                col = col0 + s * Int32(32)
+                if const_expr(has_y):
+                    pa = [o + b * Int32(8192) for o in p_off]
+                if const_expr(has_d):
+                    da = [o + b * Int32(16384) for o in d_off]
+                # k < n_y: y1s column; else dz feature 2 col + h (h = bf16 half of the word).
+                for k in cutlass.range(n_k, unroll=1):
+                    h = k - Int32(n_y)
+                    vals = [Float32(0.0)] * 16
+                    if const_expr(has_y and has_d):
+                        if k < Int32(n_y):
+                            vals = [_ld_shared_bf16_as_f32(pa[j & 7] + Int32(512 * (j >> 3)))
+                                    for j in range(16)]
+                        else:
+                            sh = (Int32(1) - h) * Int32(16)
+                            vals = [_i32_as_f32((_ld_shared_b32(da[j & 7] + Int32(1024 * (j >> 3)))
+                                                 << sh) & Int32(-65536)) for j in range(16)]
+                    elif const_expr(has_y):
+                        vals = [_ld_shared_bf16_as_f32(pa[j & 7] + Int32(512 * (j >> 3)))
+                                for j in range(16)]
+                    else:
+                        sh = (Int32(1) - h) * Int32(16)
+                        vals = [_i32_as_f32((_ld_shared_b32(da[j & 7] + Int32(1024 * (j >> 3)))
+                                             << sh) & Int32(-65536)) for j in range(16)]
+                    e8m0, w = _colq128_group(vals, q)
+                    if const_expr(has_y):
+                        if k < Int32(n_y):
+                            if col < params.mY1sCol.shape[0]:
+                                _st_global_v4(cute.domain_offset((col, k_word),
+                                                                 params.mY1sCol).iterator, w)
+                                if q == Int32(0):
+                                    params.mY1sColScale[group, col] = cutlass.Int8(e8m0)
+                    if const_expr(has_d):
+                        f = col * Int32(2) + h
+                        if k >= Int32(n_y):
+                            if const_expr(self.dz_col_inplace):
+                                # mDzCol = z as int32 [M, F/2]: block (group, f>>7) lands in
+                                # rows m_base + (f&127), bytes 256 (f>>7) + [0, 128), i.e. the
+                                # even subtile's own preact, already consumed by this CTA.
+                                if f < params.mDzCol.shape[1] * Int32(2):
+                                    _st_global_v4(cute.domain_offset(
+                                        (m_base + (f & Int32(127)),
+                                         (f >> Int32(7)) * Int32(64) + q * Int32(4)),
+                                        params.mDzCol).iterator, w)
+                                    if q == Int32(0):
+                                        params.mDzColScale[group, f] = cutlass.Int8(e8m0)
+                            elif f < params.mDzCol.shape[0]:
+                                _st_global_v4(cute.domain_offset((f, k_word),
+                                                                 params.mDzCol).iterator, w)
+                                if q == Int32(0):
+                                    params.mDzColScale[group, f] = cutlass.Int8(e8m0)
+
+@dsl_user_op
+def _cp_async_4(smem_addr, gmem_addr, src_bytes, *, loc=None, ip=None) -> None:
+    """4-byte ``cp.async.ca`` (``src_bytes`` = 0 zero-fills without reading gmem)."""
+    llvm.inline_asm(
+        None,
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip), cutlass.Int64(gmem_addr).ir_value(loc=loc, ip=ip),
+         Int32(src_bytes).ir_value(loc=loc, ip=ip)],
+        "cp.async.ca.shared.global [$0], [$1], 4, $2;",
+        "r,l,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_b32(smem_addr, *, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+            "ld.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _cvt_bf16x2(lo: Float32, hi: Float32, *, loc=None, ip=None) -> Int32:
+    """RN f32 pair -> bf16x2 word (``lo`` in the low half), as the D store's cvt."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Float32(lo).ir_value(loc=loc, ip=ip), Float32(hi).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _route_reduce_f32(x: Float32, w: Float32, *, loc=None, ip=None) -> Float32:
+    """``0.0f + x * w`` as token_gather_sum computes it for one route (one fma.rn)."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(x).ir_value(loc=loc, ip=ip), Float32(w).ir_value(loc=loc, ip=ip)],
+            "fma.rn.f32 $0, $1, $2, 0f00000000;",
+            "=f,f,f",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+class Sm90RouteScatterStore(EpiOp):
+    """Per-row direct store of a bf16 varlen-M GEMM output (replaces the TMA D store).
+
+    ``param`` is D ``[M, N]`` (route order).  The row ``p`` of a token with a
+    single local route (``mScatterDst[p] = token >= 0``) is reduced in place,
+    i.e. written to ``mScatterOut[token]`` as ``bf16(0 + bf16(acc) * w[p])``
+    (``w`` = ``mScatterW`` or 1 with the weightless ``0 + x``), exactly what
+    ``token_gather_sum`` would produce.  Every other row goes to ``D[p]`` for
+    the reduction of the multi-route tokens.  ``begin`` allocates per-thread
+    row state (2 rows of the WGMMA fragment), filled on the first subtile.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name)
+        return {self.name: None if tensor is None else assume_stride_divisibility(tensor)}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        state = None
+        if const_expr(param is not None):
+            coord = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+            )
+            coord = cute.group_modes(coord, 3, cute.rank(coord))
+            state = (param, coord, ctx.tile_coord_mnkl, ctx.varlen_manager, ctx.tiled_copy_r2s)
+        return state
+
+    def begin_loop(self, gemm, state, epi_coord):
+        result = None
+        if const_expr(state is not None):
+            param, coord, tile_coord, varlen, tiled_copy = state
+            result = (param, coord[None, None, None, epi_coord], tile_coord, varlen, tiled_copy)
+        return result
+
+
+@dsl_user_op
+def _stmatrix_x4(smem_addr, vals, *, loc=None, ip=None) -> None:
+    """``stmatrix.x4``: word ``vals[j]`` is lane l's (row l // 4, cols 2 * (l % 4) + {0, 1})
+    of 8x8 bf16 matrix ``j``; lane l gives the smem address of row l % 8 of matrix l // 8."""
+    llvm.inline_asm(
+        None,
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)]
+        + [Int32(v).ir_value(loc=loc, ip=ip) for v in vals],
+        "stmatrix.sync.aligned.m8n8.x4.shared.b16 [$0], {$1, $2, $3, $4};",
+        "r,r,r,r,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
+def _ld_shared_v4(smem_addr, *, loc=None, ip=None):
+    """16B ``ld.shared.v4.b32`` -> 4 Int32 words."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [Int32(smem_addr).ir_value(loc=loc, ip=ip)],
+        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return [Int32(llvm.extractvalue(T.i32(), res, [j], loc=loc, ip=ip)) for j in range(4)]
+
+
+@dsl_user_op
+def _add_zero_bf16x2(word: Int32, *, loc=None, ip=None) -> Int32:
+    """``0 + x`` on both bf16 halves: ``bf16(0.0f + x)`` for a bf16 ``x`` (-0 -> +0)."""
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [Int32(word).ir_value(loc=loc, ip=ip)],
+            "{ .reg .b32 z; mov.b32 z, 0; add.rn.bf16x2 $0, $1, z; }",
+            "=r,r",
+            has_side_effects=False, is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+        )
+    )
+
+
+class Sm90ScaledGemmRouteScatterMixin(GemmDefaultEpiMixin):
+    """Default epilogue with the single-route token reduction fused in.
+
+    Fwd down-proj (``mScatterW`` = router scores) and bwd dx (no weight): the
+    rows of tokens with one local route are written straight to the
+    ``[T, N]`` token output, so ``token_gather_sum`` only reduces the
+    multi-route tokens (``skip_single=True``).  Bitwise identical to the
+    unfused GEMM + ``token_gather_sum``.
+    """
+
+    _epi_ops = (*GemmDefaultEpiMixin._epi_ops, Sm90RouteScatterStore("mScatterD"))
+    _extra_param_fields = (
+        ("mScatterDst", object, None), ("mScatterOut", object, None), ("mScatterW", object, None),
+    )
+    _epi_direct_store = True
+    # Per-warp smem for the fragment -> row transpose: 16 rows x 32 bf16, rows
+    # padded to 80 B so the stmatrix row writes are bank-conflict free.
+    _XPOSE_PITCH = 80
+    _XPOSE_WARP_BYTES = 16 * 80
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = 0  # RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mScatterD: Optional[cute.Tensor] = None
+        mScatterDst: Optional[cute.Tensor] = None
+        mScatterOut: Optional[cute.Tensor] = None
+        mScatterW: Optional[cute.Tensor] = None
+
+    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+        assert args.rounding_mode == 0 and not args.add_to_output
+        self.rounding_mode = args.rounding_mode
+        d = self._epi_ops_to_params_dict(args)
+        d.update(mScatterDst=args.mScatterDst, mScatterOut=args.mScatterOut,
+                 mScatterW=args.mScatterW)
+        return self.EpilogueParams(**d)
+
+    @cute.jit
+    def _epi_tile_rows(self, tiled_copy_r2s, tile_coord, varlen, tidx):
+        """(m_abs of this thread's 2 fragment rows, segment end) of the tile."""
+        tile_m, tile_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
+        coord = partition_for_epilogue(
+            cute.make_identity_tensor((tile_m, tile_n)), epi_tile=self.epi_tile,
+            tiled_copy=tiled_copy_r2s, tidx=tidx, reference_src=True,
+        )
+        coord = cute.group_modes(coord, 3, cute.rank(coord))[None, None, None, 0]
+        batch = tile_coord[3]
+        m_base = varlen.params.cu_seqlens_m[batch] + tile_coord[0] * Int32(tile_m)
+        m_limit = varlen.params.cu_seqlens_m[batch + Int32(1)]
+        return m_base, (m_base + coord[0][0], m_base + coord[2][0]), m_limit
+
+    @cute.jit
+    def epi_tile_prefetch(self, params, tiled_copy_r2s, sD, tile_coord, varlen, tidx):
+        """Start loading the route destination / weight of this thread's 2 fragment rows.
+
+        Called before the mainloop: 4-byte ``cp.async`` into a private 16 B slot
+        at the start of the D staging smem (unused by the direct-store epilogue),
+        so the gmem latency hides behind the MMA without holding registers.
+        The per-warp transpose buffers follow the slots.  Returns the slot address.
+        """
+        assert not self.pingpong, "route scatter slots live in the D smem shared by both WGs"
+        stage_bytes = cute.size(self.epi_tile) * sD.element_type.width // 8
+        assert stage_bytes * self.epi_stage >= (
+            16 * self.num_epi_warps * 32 + self._XPOSE_WARP_BYTES * self.num_epi_warps
+        )
+        m_base, m_abs, m_limit = self._epi_tile_rows(tiled_copy_r2s, tile_coord, varlen, tidx)
+        has_w = const_expr(params.mScatterW is not None)
+        slot = sD.iterator.toint() + tidx * Int32(16)
+        for r in cutlass.range_constexpr(2):
+            ok = m_abs[r] < m_limit
+            m_safe = cutlass.select_(ok, m_abs[r], m_base)  # m_base is a valid row if any is
+            nbytes = cutlass.select_(ok, Int32(4), Int32(0))  # 0: zero-fill, no gmem read
+            _cp_async_4(slot + Int32(4 * r),
+                        cute.domain_offset((m_safe,), params.mScatterDst).iterator.toint(), nbytes)
+            if const_expr(has_w):
+                _cp_async_4(slot + Int32(8 + 4 * r),
+                            cute.domain_offset((m_safe,), params.mScatterW).iterator.toint(),
+                            nbytes)
+        cute.arch.cp_async_commit_group()
+        return slot
+
+    @cute.jit
+    def epi_tile_prefetch_load(self, params, slot, tiled_copy_r2s, tile_coord, varlen, tidx):
+        """Per-tile row state, once before the subtile loop: for each of the 2 rows
+        (gmem row base address, weight, in-segment), plus the stmatrix / ld.shared
+        addresses of the warp's transpose buffer.  Single-route rows go to
+        ``mScatterOut[dst]`` with their router weight; the others to ``D`` with
+        weight 1, i.e. ``bf16(0 + x)`` = x up to the sign of zero, which the
+        +0-seeded fp32 sum of ``token_gather_sum`` cannot observe.
+        """
+        _, m_abs, m_limit = self._epi_tile_rows(tiled_copy_r2s, tile_coord, varlen, tidx)
+        param = params.mScatterD
+        cute.arch.cp_async_wait_group(0)
+        rows = []
+        for r in cutlass.range_constexpr(2):
+            d = _ld_shared_b32(slot + Int32(4 * r))
+            single = cutlass.Boolean(d >= Int32(0))
+            addr = cute.domain_offset((m_abs[r], 0), param).iterator.toint()
+            if single:
+                addr = cute.domain_offset((d, 0), params.mScatterOut).iterator.toint()
+            w = Float32(1.0)
+            if const_expr(params.mScatterW is not None):
+                w = cutlass.select_(single, _i32_as_f32(_ld_shared_b32(slot + Int32(8 + 4 * r))),
+                                    Float32(1.0))
+            rows.append((addr, w, cutlass.Boolean(m_abs[r] < m_limit)))
+        lane = tidx & Int32(31)
+        buf = (slot - tidx * Int32(16) + Int32(16 * self.num_epi_warps * 32)
+               + (tidx >> Int32(5)) * Int32(self._XPOSE_WARP_BYTES))
+        pitch = Int32(self._XPOSE_PITCH)
+        st_addr = buf + (lane & Int32(7)) * pitch + (lane >> Int32(3)) * Int32(16)
+        ld_addr = buf + (lane >> Int32(2)) * pitch + (lane & Int32(3)) * Int32(16)
+        return rows, st_addr, ld_addr
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
+        param, coords, tile_coord, varlen, tiled_copy = epi_loop_tensors["mScatterD"]
+        rows, st_addr, ld_addr = epi_loop_tensors["epi_pre"]
+        tile_n = self.cta_tile_shape_mnk[1]
+        assert self.epi_tile[1] == 32 and self.epi_tile[0] == self.cta_tile_shape_mnk[0], (
+            "route scatter needs full-M, 32-column epilogue subtiles"
+        )
+        lane_layout, warp_layout = _get_lane_warp_layouts(tiled_copy, True)
+        assert cute.size(lane_layout, mode=[1]) == 4 and cute.size(warp_layout, mode=[1]) == 1
+        assert cute.size(tRS_rD) == 16
+        has_w = const_expr(params.mScatterW is not None)
+        ln = cute.arch.lane_idx() & Int32(3)  # == lane_n of the WGMMA fragment
+        # Value 0 of lane ln is at column 2 * ln of the subtile; after the smem
+        # transpose lane ln holds columns 8 * ln .. 8 * ln + 7.
+        col = tile_coord[1] * Int32(tile_n) + coords[0][1] + Int32(6) * ln
+        n_ok = cutlass.Boolean(col < param.shape[1])  # N % 8 == 0: 8-col blocks never straddle
+        col_bytes = cutlass.Int64(col) * cutlass.Int64(param.element_type.width // 8)
+        hi_mask = Int32(-65536)  # 0xFFFF0000
+        half = Int32(8 * self._XPOSE_PITCH)
+        cute.arch.sync_warp()  # previous subtile's ld.shared done before the buffer is rewritten
+        for r in cutlass.range_constexpr(2):
+            wv = rows[r][1]
+            words = []
+            for k in cutlass.range_constexpr(4):  # 8-column blocks
+                i = 4 * k + 2 * r  # values i, i + 1: columns (c, c + 1) of row half r
+                word = _cvt_bf16x2(tRS_rD[i], tRS_rD[i + 1])
+                if const_expr(has_w):
+                    lo = _route_reduce_f32(_i32_as_f32(word << Int32(16)), wv)
+                    hi = _route_reduce_f32(_i32_as_f32(word & hi_mask), wv)
+                    word = _cvt_bf16x2(lo, hi)
+                else:
+                    word = _add_zero_bf16x2(word)
+                words.append(word)
+            # Matrix k of row half r = 8-column block k: the WGMMA fragment layout.
+            _stmatrix_x4(st_addr + Int32(r) * half, words)
+        cute.arch.sync_warp()
+        for r in cutlass.range_constexpr(2):
+            addr, _, ok = rows[r]
+            words = _ld_shared_v4(ld_addr + Int32(r) * half)
+            if ok & n_ok:
+                _st_global_v4_addr(addr + col_bytes, words)
+        return None
+
+
+@dsl_user_op
+@cute.jit
+def _ue8m0_from_amax(amax: Float32, *, loc=None, ip=None):
+    """Integer+carry UE8M0 rule of ``_quantize_flat_v2_kernel``: (e8m0, 2**(127 - e8m0))."""
+    bits = _f32_as_i32(amax)
+    biased_exp = (bits >> Int32(23)) & Int32(0xFF)
+    carry = Int32(1) if cutlass.Boolean((bits & Int32(0x7FFFFF)) > Int32(0x600000)) else Int32(0)
+    e8m0 = biased_exp - Int32(8) + carry
+    e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
+    e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
+    qexp = Int32(254) - e8m0
+    qexp = Int32(254) if cutlass.Boolean(qexp > Int32(254)) else qexp
+    qexp = Int32(1) if cutlass.Boolean(qexp < Int32(1)) else qexp
+    return e8m0, _i32_as_f32(qexp << Int32(23))
 
 
 # ---------------------------------------------------------------------------
@@ -1548,6 +2434,9 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
 
             # Load fp8 bytes using identity-derived coordinates
             # For each D[i] at (row, col), load fp8[row, col*2] and fp8[row, col*2+1]
+            # Columns past N (partial last N tile) are clamped like rows: their
+            # garbage bytes/scales could be NaN/inf and NaN * (zero D) poisons ds.
+            n_lim = Int32(fp8_tensor.shape[1])
             for i in cutlass.range(num_d, unroll_full=True):
                 coord = tDcD_sub[i]
                 row = coord[0]
@@ -1559,6 +2448,7 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
                 # address; the value is dropped by D's predication downstream.
                 m_safe = m_abs if m_abs < m_limit else (m_limit - Int32(1))
                 n0 = n_base + col * 2
+                n0 = n0 if n0 < n_lim else (n_lim - Int32(2))
                 tRS_rFP8[2 * i] = fp8_tensor[m_safe, n0]
                 tRS_rFP8[2 * i + 1] = fp8_tensor[m_safe, n0 + Int32(1)]
 
@@ -1574,6 +2464,7 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
                 m_abs = m_offset + m_base + row
                 m_safe = m_abs if m_abs < m_limit else (m_limit - Int32(1))
                 n0 = n_base + col * 2
+                n0 = n0 if n0 < n_lim else (n_lim - Int32(2))
                 group_0 = n0 >> Int32(5)
                 group_1 = (n0 + Int32(1)) >> Int32(5)
                 scale_0 = _i32_as_f32(Int32(scales_tensor[m_safe, group_0]) << Int32(23))
@@ -1610,7 +2501,12 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
                         )
         else:
             tRS_rD_scaled.store(tRS_rD.load())
-        if const_expr(self.arch < 100):
+        if const_expr(
+            self.arch < 100 and not self.swiglu_clamp_value > 0.0
+            and _is_quack_act(params.act_bwd_fn, "dswiglu_precise")
+        ):
+            _dswiglu_precise_frag(tRS_rXY_f32x2, tRS_rD_scaled, tRS_rdXY_f32x2, tRS_rOut)
+        elif const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rD)):
                 gate = tRS_rXY_f32x2[2 * i]
                 up = tRS_rXY_f32x2[2 * i + 1]
@@ -1809,6 +2705,10 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
                     # buffer (the value is dropped by D predication anyway).
                     m_safe = m_abs if m_abs < m_limit else (m_limit - Int32(1))
                     n0 = n_base + col * 2
+                    # Same for the N tail: a garbage scale (255 -> inf) times the
+                    # zero D of an out-of-range column would make ds NaN.
+                    n_lim = Int32(fp8_tensor.shape[1])
+                    n0 = n0 if n0 < n_lim else (n_lim - Int32(2))
                     group_0 = n0 >> Int32(5)
                     group_1 = (n0 + Int32(1)) >> Int32(5)
                     scale_0 = _i32_as_f32(Int32(scales_tensor[m_safe, group_0]) << Int32(23))
@@ -1842,7 +2742,12 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
                         )
         else:
             tRS_rD_scaled.store(tRS_rD.load())
-        if const_expr(self.arch < 100):
+        if const_expr(
+            self.arch < 100 and not self.swiglu_clamp_value > 0.0
+            and _is_quack_act(params.act_bwd_fn, "dswiglu_precise")
+        ):
+            _dswiglu_precise_frag(tRS_rXY_f32x2, tRS_rD_scaled, tRS_rdXY_f32x2, tRS_rOut)
+        elif const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rD)):
                 gate = tRS_rXY_f32x2[2*i]
                 up = tRS_rXY_f32x2[2*i+1]

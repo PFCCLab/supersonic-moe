@@ -1,3 +1,5 @@
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -83,14 +85,14 @@ def TC_topk_router_metadata_triton(
     TK = T * K
     if topk_router_indices.dtype != torch.int32:
         raise ValueError(f"topk_router_indices: expected int32, got {topk_router_indices.dtype}")
-    if expert_frequency.numel() < E:
-        raise ValueError(f"expert_frequency too small: {expert_frequency.numel()} < E={E}")
-    if expert_frequency_offset.numel() < E + 1:
-        raise ValueError(f"expert_frequency_offset too small: {expert_frequency_offset.numel()} < E+1={E+1}")
+    if math.prod(expert_frequency.shape) < E:
+        raise ValueError(f"expert_frequency too small: {math.prod(expert_frequency.shape)} < E={E}")
+    if math.prod(expert_frequency_offset.shape) < E + 1:
+        raise ValueError(f"expert_frequency_offset too small: {math.prod(expert_frequency_offset.shape)} < E+1={E+1}")
     for name, t in [("x_gather_idx", x_gather_idx), ("s_scatter_idx", s_scatter_idx),
                      ("s_reverse_scatter_idx", s_reverse_scatter_idx)]:
-        if t.numel() < TK:
-            raise ValueError(f"{name} too small: {t.numel()} < TK={TK}")
+        if math.prod(t.shape) < TK:
+            raise ValueError(f"{name} too small: {math.prod(t.shape)} < TK={TK}")
         if t.dtype != torch.int32:
             raise ValueError(f"{name}: expected int32, got {t.dtype}")
     device = topk_router_indices.device

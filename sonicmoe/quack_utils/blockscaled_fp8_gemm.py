@@ -459,65 +459,60 @@ def _quantize_flat_v2_kernel(
     SCALE_PACKED_WORDS: tl.constexpr = False,
     SAFE_INT64: tl.constexpr = False,
 ):
-    """High-BW blockscaled quantize: large tiles, vectorized, pipelined.
+    """High-BW blockscaled quantize.
 
-    Each CTA processes TILE_ROWS × TILE_COLS elements.
-    Within each tile, processes TILE_COLS/GROUP_SIZE groups per row.
-    Uses vectorized loads for full memory bus utilization.
+    Each CTA loads one (TILE_ROWS, TILE_COLS) tile in a single wide access and
+    reduces it as (TILE_ROWS, TILE_COLS // GROUP_SIZE, GROUP_SIZE). Looping
+    over 32-column slices instead issues 64 B-per-row loads and reaches only
+    ~1.2-1.4 TB/s on H800; the single wide tile reaches ~2.5-2.9 TB/s.
 
     Grid: (ceil(rows/TILE_ROWS), ceil(cols/TILE_COLS))
     """
     pid_row = tl.program_id(0)
     pid_col = tl.program_id(1)
 
-    row_base = pid_row * TILE_ROWS
-    col_base = pid_col * TILE_COLS
+    GROUPS_PER_TILE: tl.constexpr = TILE_COLS // GROUP_SIZE
 
-    GROUPS_PER_TILE: tl.constexpr = TILE_COLS // GROUP_SIZE  # 256/32 = 8
-
-    row_offs = row_base + tl.arange(0, TILE_ROWS)
+    row_offs = pid_row * TILE_ROWS + tl.arange(0, TILE_ROWS)
     row_mask = row_offs < rows
     if SAFE_INT64:
         row_offs = row_offs.to(tl.int64)
+    col_offs = pid_col * TILE_COLS + tl.arange(0, TILE_COLS)
+    mask = row_mask[:, None] & (col_offs[None, :] < cols)
 
-    for g in tl.range(0, GROUPS_PER_TILE):
-        col_offs = col_base + g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        col_mask = col_offs[None, :] < cols
-        mask = row_mask[:, None] & col_mask
+    src_ptrs = src_ptr + row_offs[:, None] * src_stride_row + col_offs[None, :] * src_stride_col
+    values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+    values = tl.reshape(values, (TILE_ROWS, GROUPS_PER_TILE, GROUP_SIZE))
 
-        # Vectorized load: (TILE_ROWS, GROUP_SIZE) bf16 tile
-        src_ptrs = src_ptr + row_offs[:, None] * src_stride_row + col_offs[None, :] * src_stride_col
-        values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+    # E8M0 per-(row, group) amax
+    amax = tl.max(tl.abs(values), axis=2)  # (TILE_ROWS, GROUPS_PER_TILE)
+    amax_i32 = amax.to(tl.int32, bitcast=True)
+    bexp = (amax_i32 >> 23) & 0xFF
+    mant = amax_i32 & 0x7FFFFF
+    carry = tl.where(mant > 0x600000, 1, 0)
+    e8m0 = tl.where(bexp > 0, bexp - 8 + carry, 0)
+    e8m0_byte = tl.maximum(e8m0, 0).to(tl.uint8)
 
-        # E8M0 per-row amax (reduce over GROUP_SIZE=32 cols)
-        amax = tl.max(tl.abs(values), axis=1)  # (TILE_ROWS,)
-        amax_i32 = amax.to(tl.int32, bitcast=True)
-        bexp = (amax_i32 >> 23) & 0xFF
-        mant = amax_i32 & 0x7FFFFF
-        carry = tl.where(mant > 0x600000, 1, 0)
-        e8m0 = tl.where(bexp > 0, bexp - 8 + carry, 0)
-        e8m0_byte = tl.maximum(e8m0, 0).to(tl.uint8)
+    # Quant scale
+    qexp = tl.maximum(tl.minimum(254 - e8m0, 254), 1)
+    qscale = (qexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    quantized = tl.reshape(values * qscale[:, :, None], (TILE_ROWS, TILE_COLS)).to(tl.float8e4nv)
 
-        # Quant scale
-        qexp = tl.maximum(tl.minimum(254 - e8m0, 254), 1)
-        qscale = (qexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-        quantized = (values * qscale[:, None]).to(tl.float8e4nv)
+    dst_ptrs = dst_fp8_ptr + row_offs[:, None] * dst_stride_row + col_offs[None, :] * dst_stride_col
+    tl.store(dst_ptrs, quantized, mask=mask)
 
-        # Vectorized store: fp8 data
-        dst_ptrs = dst_fp8_ptr + row_offs[:, None] * dst_stride_row + col_offs[None, :] * dst_stride_col
-        tl.store(dst_ptrs, quantized, mask=mask)
-
-        group_id = (col_base // GROUP_SIZE) + g
-        if SCALE_PACKED_WORDS:
-            scale_byte_ptr = dst_scale_ptr.to(tl.pointer_type(tl.uint8))
-            scale_ptrs = scale_byte_ptr + row_offs * scale_stride_row + group_id
-            tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
-        elif SCALE_OUT_INT32:
-            scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
-            tl.store(scale_ptrs, e8m0_byte.to(tl.int32), mask=row_mask)
-        else:
-            scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
-            tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
+    group_id = pid_col * GROUPS_PER_TILE + tl.arange(0, GROUPS_PER_TILE)
+    scale_mask = row_mask[:, None]
+    if SCALE_PACKED_WORDS:
+        scale_byte_ptr = dst_scale_ptr.to(tl.pointer_type(tl.uint8))
+        scale_ptrs = scale_byte_ptr + row_offs[:, None] * scale_stride_row + group_id[None, :]
+        tl.store(scale_ptrs, e8m0_byte, mask=scale_mask)
+    elif SCALE_OUT_INT32:
+        scale_ptrs = dst_scale_ptr + row_offs[:, None] * scale_stride_row + group_id[None, :] * scale_stride_col
+        tl.store(scale_ptrs, e8m0_byte.to(tl.int32), mask=scale_mask)
+    else:
+        scale_ptrs = dst_scale_ptr + row_offs[:, None] * scale_stride_row + group_id[None, :] * scale_stride_col
+        tl.store(scale_ptrs, e8m0_byte, mask=scale_mask)
 
 
 def quantize_activation_blockscaled_fast(
@@ -563,11 +558,16 @@ def quantize_activation_blockscaled_fast(
         scale_stride_row = scale_out.stride(0)
         scale_stride_col = scale_out.stride(1)
 
-    TILE_ROWS = 128  # Larger tile: fewer CTAs, better wave occupancy
-    TILE_COLS = min(K, 256)
-    TILE_COLS = max(group_size, (TILE_COLS // group_size) * group_size)
-    if K % TILE_COLS:
-        TILE_COLS = group_size
+    # Widest power-of-2 column tile (<= 1024) that divides K; ~8-16K elements
+    # per CTA. Measured on H800 (bitwise identical to the 32-column loop):
+    # K=512 86 -> 48 us (80k rows), K=1024 429 -> 172 us (164k rows).
+    TILE_COLS = group_size
+    for tc in (1024, 512, 256, 128, 64):
+        if tc >= group_size and tc % group_size == 0 and K % tc == 0:
+            TILE_COLS = tc
+            break
+    TILE_ROWS = min(256, max(16, 8192 // TILE_COLS))
+    num_warps = 8 if TILE_COLS >= 1024 else 4
     # INT32 overflow guard
     _max_stride = max(x.stride(0), fp8_out.stride(0))
     _needs_int64 = int((M - 1) * _max_stride > 2**31 - 1)
@@ -591,6 +591,7 @@ def quantize_activation_blockscaled_fast(
         SCALE_OUT_INT32=scale_out_int32,
         SCALE_PACKED_WORDS=pack_scale_words,
         SAFE_INT64=_needs_int64,
+        num_warps=num_warps,
     )
     return fp8_out, scale_out
 
