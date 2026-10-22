@@ -228,10 +228,11 @@ def deepep_topk_to_sonic_metadata(
 
     Other Parameters
     ----------------
-    sync_free_sizing : bool
+    sync_free_sizing : bool or int
         Size the outputs at a shape-only upper bound instead of reading
-        ``tokens_per_expert``. For callers whose counts live on-device and who
-        cannot afford the blocking D2H (the ring dispatcher); see the sizing
+        ``tokens_per_expert``; an int tightens the bound to that many valid
+        entries (it must not be exceeded). For callers whose counts live
+        on-device and who cannot afford the blocking D2H (the ring dispatcher); see the sizing
         comment in ``_deepep_topk_to_sonic_metadata_cuda``. CUDA path only --
         the Python fallback derives its counts from the data itself.
     """
@@ -645,6 +646,10 @@ def _deepep_topk_to_sonic_metadata_cuda(
         # A row holds at most min(topk, E) valid entries: its slots are unique
         # expert ids (enforced contract) or -1.
         TK = N_recv * min(topk, E)
+        if not isinstance(sync_free_sizing, bool):
+            # An int is a caller-known upper bound on the valid entries (e.g.
+            # most lanes route to experts this rank does not hold).
+            TK = min(TK, int(sync_free_sizing))
         TK_padded = ((TK + block - 1) // block) * block + E * block
     else:
         if isinstance(tokens_per_expert, torch.Tensor):

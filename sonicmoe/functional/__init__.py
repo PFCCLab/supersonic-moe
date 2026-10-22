@@ -2448,6 +2448,13 @@ class _DownProjection(torch.autograd.Function):
             # compact metadata scores; backward scatters ds to this original shape.
             ctx._router_score_source_shape = tuple(router_score_source.shape)
             ctx._router_score_source_numel = int(router_score_source.shape[0]) * int(router_score_source.shape[1])
+            # Number of real routes (device scalar): with shape-bound metadata
+            # sizing, routes past it are padding and must not be scattered.
+            ctx._router_score_n_valid = (
+                num_activated_expert_per_token_offset[-1:]
+                if num_activated_expert_per_token_offset is not None
+                else None
+            )
         ctx._w2_original = w2
         # weight2 is Sonic-layout [E, H, I] here, while Fleet keeps its
         # main_grad in grouped layout [E, I, H].
@@ -3207,7 +3214,9 @@ class _DownProjection(torch.autograd.Function):
                 ds.contiguous(),
                 router_score_src_idx,
                 ctx._router_score_source_numel,
+                ctx._router_score_n_valid,
             ).reshape(ctx._router_score_source_shape)
+            ctx._router_score_n_valid = None
 
         if fp8_combine_grad_handle is not None:
             fp8_combine_grad_handle.pop("data", None)

@@ -5532,10 +5532,14 @@ def _gather_router_scores_i32_kernel(src, idx, dst, n, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _scatter_router_scores_i32_kernel(src, idx, dst, n, BLOCK: tl.constexpr):
+def _scatter_router_scores_i32_kernel(
+    src, idx, dst, n, n_valid_ptr, HAS_N_VALID: tl.constexpr, BLOCK: tl.constexpr
+):
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
+    if HAS_N_VALID:
+        mask = mask & (offs < tl.load(n_valid_ptr))
     dst_idx = tl.load(idx + offs, mask=mask, other=0)
     vals = tl.load(src + offs, mask=mask, other=0.0)
     tl.store(dst + dst_idx, vals, mask=mask)
@@ -5552,14 +5556,31 @@ def _gather_router_scores_i32(scores: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
-def _scatter_router_scores_i32(scores: torch.Tensor, idx: torch.Tensor, n_total: int) -> torch.Tensor:
+def _scatter_router_scores_i32(
+    scores: torch.Tensor,
+    idx: torch.Tensor,
+    n_total: int,
+    n_valid: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Scatter metadata-order scores back to their ``[n_total]`` source slots.
+
+    ``n_valid`` (a device int32 scalar tensor) bounds the real entries of
+    ``idx`` when it is sized from a shape bound: the tail is not scattered and
+    slots without a route (dropped lanes) are zero.
+    """
     out = scores.new_empty((n_total,))
     n = int(idx.shape[0])
-    if n < n_total:
+    if n < n_total or n_valid is not None:
         out.zero_()
     if n > 0:
         block = 256
         _scatter_router_scores_i32_kernel[(triton.cdiv(n, block),)](
-            scores, idx, out, n, BLOCK=block,
+            scores,
+            idx,
+            out,
+            n,
+            n_valid if n_valid is not None else idx,
+            HAS_N_VALID=n_valid is not None,
+            BLOCK=block,
         )
     return out
