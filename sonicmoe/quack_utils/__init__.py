@@ -31,6 +31,7 @@ _qgi.get_device_capacity = _safe_get_device_capacity
 from .bf16_wgrad_gemm import (
     bf16_wgrad_gemm_varlen_k,
     bf16_wgrad_gemm_varlen_k_accumulate,
+    bf16_wgrad_gemm_varlen_k_dual,
     bf16_wgrad_gemm_varlen_k_tma_add,
 )
 from .blockscaled_fp8_gemm import (
