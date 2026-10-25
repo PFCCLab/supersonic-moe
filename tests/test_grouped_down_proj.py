@@ -171,11 +171,14 @@ def test_mismatched_routing_sets_error():
 
 @pytest.mark.parametrize("I", [64, 256])
 @pytest.mark.parametrize("bwd", [False, True])
-def test_moe_forward_backward_matches_default(bwd, I):
+@pytest.mark.parametrize("wide", [True, False])
+def test_moe_forward_backward_matches_default(bwd, I, wide, monkeypatch):
     """End to end: output within bf16 error of the default path, and every
     gradient bitwise identical (the backward recomputes y2 and reads neither
     y2 nor o).  bwd: the plan also serves the input gradient (grouped
-    dz @ W1 + combine); x.grad then within bf16 error, the others bitwise."""
+    dz @ W1 + combine); x.grad then within bf16 error, the others bitwise.
+    wide: the H / 2I gate is lowered so this small H takes the grouped input
+    gradient; otherwise the gate keeps it on the default path."""
     T, H, I, E, K = 2048, 512, 128, 32, 8
     rng = np.random.RandomState(9)
     ids = _routing(rng, E, K, T, 0.05)
@@ -205,6 +208,8 @@ def test_moe_forward_backward_matches_default(bwd, I):
     import importlib
 
     fn_mod = importlib.import_module("sonicmoe.functional")
+    if wide:
+        monkeypatch.setattr(fn_mod, "GROUPED_DX_MIN_H_PER_K", 0)
     real, calls = fn_mod.grouped_down_proj, []
 
     def counted(*a, **k):
@@ -219,7 +224,8 @@ def test_moe_forward_backward_matches_default(bwd, I):
         o1, g1 = run(True)
     finally:
         fn_mod.grouped_down_proj = real
-    grouped_dx = bwd and 2 * I <= fn_mod.GROUPED_DX_MAX_K
+    grouped_dx = bwd and 2 * I <= fn_mod.GROUPED_DX_MAX_K and H >= fn_mod.GROUPED_DX_MIN_H_PER_K * 2 * I
+    assert grouped_dx == (bwd and wide)
     assert calls == ([I, 2 * I] if grouped_dx else [I]), calls
     assert int(err.numpy()[0]) == 0
     rel = np.linalg.norm(o1 - o0) / np.linalg.norm(o0)

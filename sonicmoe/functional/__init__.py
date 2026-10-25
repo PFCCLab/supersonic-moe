@@ -32,6 +32,7 @@ from ..quack_utils import (
     quantize_and_pack_activation,
 )
 from quack.gemm_interface import gemm
+from quack.gemm_config import GemmConfig
 from ..quack_utils.gemm_dgated import gemm_dgated as gemm_dgated_kernel
 from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
 from ..quack_utils.gemm_gated import try_gemm_gated_tvm_ffi_sonic_prepared
@@ -1493,9 +1494,11 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
 
 
 _UNIT_SCORES = {}
-# The grouped input gradient pays off only for a shallow per-expert K (2I):
-# deeper, the per-lane GEMM is no longer write-bound and grouping loses.
+# The grouped input gradient pays off only for a shallow per-expert K (2I),
+# where the per-lane GEMM is write-bound, and a wide output: it saves H-wide
+# output rows but packs 2I-wide dz rows, so it needs H >= this ratio x 2I.
 GROUPED_DX_MAX_K = 256
+GROUPED_DX_MIN_H_PER_K = 24
 
 
 def _unit_scores(n):
@@ -1504,6 +1507,26 @@ def _unit_scores(n):
     if t is None:
         t = _UNIT_SCORES[n] = paddle.ones([n], dtype=paddle.float32)
     return t
+
+
+_VARLEN_M_CONFIG = []
+
+
+def _varlen_m_config(k):
+    """Static-persistent config for the bf16 varlen-M GEMMs (down projection, dX).
+
+    ``k`` is the GEMM reduction dim.  quack's SM100 default schedules tiles
+    dynamically; for shallow reductions (k <= 256, i.e. intermediate-sharded
+    experts) static persistent scheduling of the same tile is faster, with
+    bit-identical output.  Deeper reductions keep quack's default (None), as
+    does any device other than SM100.
+    """
+    if not _VARLEN_M_CONFIG:
+        cap = paddle.device.cuda.get_device_capability()[0]
+        _VARLEN_M_CONFIG.append(None if cap != 10 else GemmConfig(
+            tile_m=256, tile_n=256, cluster_m=2, cluster_n=1, pingpong=False,
+            is_dynamic_persistent=False, device_capacity=cap))
+    return _VARLEN_M_CONFIG[0] if k <= 256 else None
 
 
 class _UpProjection(torch.autograd.Function):
@@ -1743,6 +1766,7 @@ class _UpProjection(torch.autograd.Function):
             if _gp is not None and _gp.backward and use_quack_gemm and not cfg.enabled
             and supports_expert_k(w1.shape[1])
             and w1.shape[1] <= GROUPED_DX_MAX_K
+            and w1.shape[2] >= GROUPED_DX_MIN_H_PER_K * w1.shape[1]
             else None
         )
 
@@ -2150,7 +2174,7 @@ class _UpProjection(torch.autograd.Function):
                     dx_expanded = gemm(
                         dz, w1,
                         cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
-                        tuned=False,
+                        tuned=False, config=_varlen_m_config(dz.shape[-1]),
                     )
                 else:
                     # dx[t] = sum_k dz[row(t, k)] @ W1[e_k]: the down projection's
@@ -2392,6 +2416,7 @@ class _DownProjection(torch.autograd.Function):
                         w2.permute(0, 2, 1),
                         cu_seqlens_m=expert_frequency_offset,
                         tuned=False,
+                        config=_varlen_m_config(y1.shape[-1]),
                     )
                     router_perm = s_reverse_scatter_idx
                     y2_for_router = y2
