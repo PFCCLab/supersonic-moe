@@ -122,3 +122,31 @@ def test_pieces_repeat_and_shape_checks():
         pp.merge(paddle.zeros([T - 1, 2 * K + ncols(K)], dtype=paddle.float32))
     with pytest.raises(ValueError):
         PlanPieces(gidx, 8, K, 2)  # fewer tokens per piece than segments
+
+
+def test_pieces_batch_over_int16():
+    """A batch of more than 65536 tokens (int32 token index): the merged down
+    projection matches a dense reference, so no token index wraps."""
+    E, K, NP, TL = 64, 8, 8, 9216
+    T = NP * TL
+    rng, ids = _routing(E, K, T, 0.05, seed=11)
+    w = (2.0 ** -rng.randint(0, 2, (T, K))).astype(np.float32)
+    y1 = (rng.randint(-1, 2, (T * K, 128)) * (rng.rand(T * K, 128) < 0.1)).astype(np.float32)
+    w2 = rng.randint(-1, 2, (E, 256, 128)).astype(np.float32)
+    index = P.build_index(frequent_pairs(ids, 300), E)
+    gidx = GPUIndex(index)
+    pp = PlanPieces(gidx, TL, K, NP)
+    src = _pieces_src(pp, dev(ids, paddle.int32), dev(w, paddle.float32), False)
+    plan = pp.merge(src, slot=None)
+    assert plan.row_tok.dtype == paddle.int32
+    o, e = merged_o(ids, w, y1, w2, plan, GroupList(index), E)
+    assert e == 0
+    ref = np.zeros((T, 256), np.float32)
+    tt, kk = np.nonzero(ids >= 0)
+    for x in range(E):
+        s = ids[tt, kk] == x
+        ref_part = (y1[tt[s] * K + kk[s]] * w[tt[s], kk[s], None]) @ w2[x].T
+        np.add.at(ref, tt[s], ref_part)
+    tol = np.maximum(np.abs(ref), 1.0) / 64
+    assert np.all(np.abs(o - ref) <= tol), np.abs(o - ref).max()
+    assert np.abs(o[65536:]).sum() > 0

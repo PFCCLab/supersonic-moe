@@ -229,7 +229,7 @@ def _merge_rows(
         v = tl.load(xrow + r, mask=tm, other=-1.0).to(tl.int32)
         ok = v >= 0
         row = tl.load(pb + (v >> 8), mask=ok, other=0) + tl.load(xrow + R + r, mask=ok, other=0.0).to(tl.int32)
-        tl.store(rowtok_ptr + row, t.to(tl.int16), mask=ok)
+        tl.store(rowtok_ptr + row, t, mask=ok)
         tl.store(rowcode_ptr + row, (v & 255).to(tl.int16), mask=ok)
         tl.store(perm_ptr + o, row, mask=ok)
         o += ok.to(tl.int32)
@@ -238,7 +238,7 @@ def _merge_rows(
         ok = v >= 0
         e = tl.load(prow + IDC + kk, mask=ok, other=0.0).to(tl.int32)
         row = tl.load(pb + G + e, mask=ok, other=0) + (v & 16383)
-        tl.store(rowtok_ptr + row, t.to(tl.int16), mask=ok)
+        tl.store(rowtok_ptr + row, t, mask=ok)
         tl.store(rowcode_ptr + row, (v >> 14).to(tl.int16), mask=ok)
         tl.store(perm_ptr + o, row, mask=ok)
         o += ok.to(tl.int32)
@@ -254,8 +254,10 @@ class PlanPieces:
         TL, P = int(tokens_per_piece), int(pieces)
         if not 2 <= K <= 11:
             raise ValueError(f"K={K}: needs 2 <= K <= 11")
-        if TL > 16384 or TL * P > 65536:
-            raise ValueError(f"{P} pieces of {TL} tokens: needs <= 16384 tokens per piece and <= 65536 per batch")
+        # A residual lane's slot shares a column with its rank (slot | rank
+        # << 14); the batch's token index is int32.
+        if TL > 16384:
+            raise ValueError(f"{P} pieces of {TL} tokens: needs <= 16384 tokens per piece")
         if gidx.S > TL:
             raise ValueError(f"{gidx.S} segments > {TL} tokens per piece (counts are stored one per row)")
         self.g, self.TL, self.K, self.P, self.BT = gidx, TL, K, P, BT
@@ -277,7 +279,7 @@ class PlanPieces:
         i32 = lambda n: paddle.empty([n], dtype=paddle.int32)  # noqa: E731
         return Plan(
             cu=i32(g.cu_len),
-            row_tok=paddle.empty([TK], dtype=paddle.int16),
+            row_tok=i32(TK),
             row_code=paddle.empty([TK], dtype=paddle.int16),
             perm=i32(TK),
             moff=i32(T + 1),

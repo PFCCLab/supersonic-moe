@@ -98,6 +98,7 @@ def _lane_tables_kernel(
 def _pack_kernel(
     y1_ptr, tok_ptr, code_ptr, row_ptr, w_ptr, cu_ptr, dst_ptr, nseg,
     K: tl.constexpr, I: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, IP: tl.constexpr,
+    TOK16: tl.constexpr,
 ):
     """Rows [cu[0], cu[nseg]) of one GEMM:  dst[r, j*I:(j+1)*I] =
     w[t, l_j] * y1[row[t, l_j]],  l_j = nibble j of code[r] (sorted rank)."""
@@ -105,7 +106,9 @@ def _pack_kernel(
     hi = tl.load(cu_ptr + nseg)
     r = lo + tl.program_id(0) * BR + tl.arange(0, BR)
     m = r < hi
-    t = tl.load(tok_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
+    t = tl.load(tok_ptr + r, mask=m, other=0).to(tl.int32)
+    if TOK16:
+        t = t & 0xFFFF
     code = tl.load(code_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
     c = tl.arange(0, IP)  # IP = next power of 2 >= I
     if IP == I:
@@ -126,7 +129,7 @@ def _pack_kernel(
 def _pack_direct_kernel(
     y1_ptr, tok_ptr, code_ptr, rows_ptr, scores_ptr, off_ptr, efo_ptr, bidx_ptr, cu_ptr, dst_ptr, err_ptr, nseg,
     K: tl.constexpr, I: tl.constexpr, C: tl.constexpr, BR: tl.constexpr, IP: tl.constexpr,
-    VARLEN: tl.constexpr, CHECK: tl.constexpr, LOGS: tl.constexpr,
+    VARLEN: tl.constexpr, CHECK: tl.constexpr, LOGS: tl.constexpr, TOK16: tl.constexpr,
 ):
     """`_pack_kernel` for lane metadata whose lanes of a token are in ascending
     expert order (sorted rank j = the token's j-th lane): reads the lane rows /
@@ -136,7 +139,9 @@ def _pack_direct_kernel(
     hi = tl.load(cu_ptr + nseg)
     r = lo + tl.program_id(0) * BR + tl.arange(0, BR)
     m = r < hi
-    t = tl.load(tok_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
+    t = tl.load(tok_ptr + r, mask=m, other=0).to(tl.int32)
+    if TOK16:
+        t = t & 0xFFFF
     code = tl.load(code_ptr + r, mask=m, other=0).to(tl.int32) & 0xFFFF
     if VARLEN:
         base = tl.load(off_ptr + t, mask=m, other=0)
@@ -231,7 +236,7 @@ class Plan:
     place."""
 
     cu: paddle.Tensor  # [index.cu_len] int32, per-GEMM row offsets
-    row_tok: paddle.Tensor  # [>= nrow] int16
+    row_tok: paddle.Tensor  # [>= nrow] int32, or int16 holding the bits of 0..65535
     row_code: paddle.Tensor  # [>= nrow] int16
     perm: paddle.Tensor  # [>= nrow] int32
     moff: paddle.Tensor  # [T + 1] int32
@@ -328,6 +333,7 @@ def grouped_down_proj(
             BT=_BT, num_warps=4,
         )
     w2t = w2.permute(0, 2, 1)
+    tok16 = plan.row_tok.dtype == paddle.int16
     for c, nseg, at, bidx, nmax, a, y2v in buckets:  # rows of a GEMM are < nmax
         cu = plan.cu_slice(at, nseg)
         if lanes_sorted:
@@ -335,12 +341,12 @@ def grouped_down_proj(
                 y1, plan.row_tok, plan.row_code, lane_rows, lane_scores, off, expert_frequency_offset,
                 bidx if bidx is not None else cu, cu, a, err, nseg, K=K, I=I, C=c, BR=_BR_DIRECT,
                 IP=triton.next_power_of_2(I), VARLEN=varlen, CHECK=_CHECK_DIRECT,
-                LOGS=max(1, int(nseg).bit_length()), num_warps=4,
+                LOGS=max(1, int(nseg).bit_length()), TOK16=tok16, num_warps=4,
             )
         else:
             _pack_kernel[(triton.cdiv(nmax, _BR),)](
                 y1, plan.row_tok, plan.row_code, s.row_s, s.w_s, cu, a, nseg, K=K, I=I, C=c, BR=_BR,
-                IP=triton.next_power_of_2(I), num_warps=4,
+                IP=triton.next_power_of_2(I), TOK16=tok16, num_warps=4,
             )
         gemm(a, w2t, out=y2v, cu_seqlens_m=cu, B_idx=bidx, tuned=False, config=config)
     o = paddle.empty([T, H], dtype=paddle.bfloat16)
