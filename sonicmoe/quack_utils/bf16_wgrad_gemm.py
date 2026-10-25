@@ -12,6 +12,7 @@ from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_config import GemmConfig
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
+from quack.varlen_utils import VarlenArguments
 
 from ..cache_manager import InstrumentedCompileCache as _ICC
 
@@ -63,9 +64,13 @@ def _get_raw_cuda_stream(device=None) -> int:
 _COMPILE_CACHE_BF16_VK = _ICC("bf16_varlen_k")
 _COMPILE_CACHE_BF16_VK_ACCUM = _ICC("bf16_varlen_k_accum")
 _COMPILE_CACHE_BF16_VK_TMA_ADD = _ICC("bf16_varlen_k_tma_add")
+_COMPILE_CACHE_BF16_VK_DUAL_ACCUM = _ICC("bf16_varlen_k_dual_accum")
+_COMPILE_CACHE_BF16_VK_DUAL_TMA_ADD = _ICC("bf16_varlen_k_dual_tma_add")
 _GEMM_FAST_PATH_BF16_VK: dict = {}
 _GEMM_FAST_PATH_BF16_VK_ACCUM: dict = {}
 _GEMM_FAST_PATH_BF16_VK_TMA_ADD: dict = {}
+_GEMM_FAST_PATH_BF16_VK_DUAL_ACCUM: dict = {}
+_GEMM_FAST_PATH_BF16_VK_DUAL_TMA_ADD: dict = {}
 
 
 def _bf16_wgrad_default_config(
@@ -139,6 +144,26 @@ def _prepare_tensors(
     return tensor_infos
 
 
+def _dlpack_index(t: torch.Tensor):
+    return from_dlpack(t, assumed_align=4).mark_layout_dynamic(leading_dim=0)
+
+
+def _make_varlen_args(cu_seqlens_k, A_idx, second, mA2=None, mB2=None):
+    if second is None:
+        return GemmWrapperBase.create_varlen_args(
+            cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx,
+        )
+    _, _, cu_seqlens_k2, A_idx2 = second
+    return VarlenArguments(
+        mCuSeqlensK=_dlpack_index(cu_seqlens_k),
+        mAIdx=_dlpack_index(A_idx),
+        mCuSeqlensK2=_dlpack_index(cu_seqlens_k2),
+        mAIdx2=_dlpack_index(A_idx2),
+        mA2=mA2,
+        mB2=mB2,
+    )
+
+
 def _run_bf16_wgrad_varlen_k(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -157,7 +182,11 @@ def _run_bf16_wgrad_varlen_k(
     fast_cache: dict,
     epi_args,
     config: Optional[GemmConfig] = None,
+    second: Optional[tuple] = None,
 ) -> torch.Tensor:
+    """``second = (A2, B2, cu_seqlens_k2, A_idx2)`` adds a second K segment
+    per expert (dual-source varlen_k): expert e accumulates its rows of
+    (A, B) and then its rows of (A2, B2) into one output tile."""
     expected_out_shape = (int(num_experts), int(M), int(N))
     if tuple(out.shape) != expected_out_shape:
         raise ValueError(
@@ -198,15 +227,31 @@ def _run_bf16_wgrad_varlen_k(
         tuple(out.stride()),
         tuple(C.stride()) if C is not None else None,
         device.index if device.index is not None else -1,
+        None
+        if second is None
+        else (
+            tuple(second[0].shape),
+            tuple(second[0].stride()),
+            tuple(second[1].shape),
+            tuple(second[1].stride()),
+        ),
     )
     cached = fast_cache.get(fast_key)
     tensor_infos = _prepare_tensors(A, B, out, C)
+    mA2 = mB2 = None
+    if second is not None:
+        infos2 = _prepare_tensors(second[0], second[1], out, C)
+        for name in ("A", "B"):
+            if (infos2[name].dtype, infos2[name].major) != (
+                tensor_infos[name].dtype,
+                tensor_infos[name].major,
+            ):
+                raise ValueError(f"dual-source wgrad: {name}2 layout differs from {name}")
+        mA2, mB2 = infos2["A"].cute_tensor, infos2["B"].cute_tensor
 
     if cached is not None:
         compiled, scheduler_args, cached_epi_args = cached
-        varlen_args = GemmWrapperBase.create_varlen_args(
-            cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx,
-        )
+        varlen_args = _make_varlen_args(cu_seqlens_k, A_idx, second, mA2, mB2)
         stream = cuda.CUstream(_get_raw_cuda_stream())
         compiled(
             tensor_infos["A"].cute_tensor,
@@ -241,9 +286,7 @@ def _run_bf16_wgrad_varlen_k(
         batch_idx_permute=None,
         max_swizzle_size=config.max_swizzle_size,
     )
-    varlen_args = GemmWrapperBase.create_varlen_args(
-        cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=A_idx,
-    )
+    varlen_args = _make_varlen_args(cu_seqlens_k, A_idx, second, mA2, mB2)
     current_stream = cuda.CUstream(_get_raw_cuda_stream())
 
     compile_key = (
@@ -264,6 +307,7 @@ def _run_bf16_wgrad_varlen_k(
         True,
         config.is_dynamic_persistent,
         config.device_capacity,
+        second is not None,
     )
     compiled = compile_cache.get(compile_key)
     if compiled is None:
@@ -402,4 +446,59 @@ def bf16_wgrad_gemm_varlen_k_tma_add(
         compile_cache=_COMPILE_CACHE_BF16_VK_TMA_ADD,
         fast_cache=_GEMM_FAST_PATH_BF16_VK_TMA_ADD,
         epi_args=GemmDefaultSm100.EpilogueArguments(add_to_output=True),
+    )
+
+
+def bf16_wgrad_gemm_varlen_k_dual(
+    first: tuple,
+    second: tuple,
+    *,
+    accumulator: torch.Tensor,
+    M: int,
+    N: int,
+    num_experts: int,
+    device: torch.device,
+    tma_add: bool,
+) -> None:
+    """One wgrad GEMM over two row sets, added into ``accumulator``.
+
+    ``first`` / ``second`` are ``(A, B, cu_seqlens_k, A_idx)`` as taken by
+    :func:`bf16_wgrad_gemm_varlen_k_accumulate` / ``_tma_add`` (``tma_add``
+    picks the epilogue). Expert e's output tile accumulates its rows of the
+    first set, then of the second, in fp32 and is added once, so the result
+    equals running both calls up to fp32 summation order, with one
+    accumulator read-modify-write instead of two. Deterministic.
+    """
+    A, B, cu_seqlens_k, A_idx = first
+    if tma_add:
+        variant, compile_cache, fast_cache = (
+            "bf16_vk_dual_tma_add",
+            _COMPILE_CACHE_BF16_VK_DUAL_TMA_ADD,
+            _GEMM_FAST_PATH_BF16_VK_DUAL_TMA_ADD,
+        )
+        C, epi_args = None, GemmDefaultSm100.EpilogueArguments(add_to_output=True)
+    else:
+        variant, compile_cache, fast_cache = (
+            "bf16_vk_dual_accum",
+            _COMPILE_CACHE_BF16_VK_DUAL_ACCUM,
+            _GEMM_FAST_PATH_BF16_VK_DUAL_ACCUM,
+        )
+        C, epi_args = accumulator, GemmDefaultSm100.EpilogueArguments(beta=Float32(1.0))
+    _run_bf16_wgrad_varlen_k(
+        A,
+        B,
+        cu_seqlens_k,
+        A_idx,
+        out=accumulator,
+        C=C,
+        M=M,
+        N=N,
+        total_K=A_idx.shape[0] + second[3].shape[0],
+        num_experts=num_experts,
+        device=device,
+        variant=variant,
+        compile_cache=compile_cache,
+        fast_cache=fast_cache,
+        epi_args=epi_args,
+        second=second,
     )

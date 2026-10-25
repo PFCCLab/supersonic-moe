@@ -16,6 +16,7 @@ from ..enums import ActivationType, is_glu
 from ..quack_utils import (
     bf16_wgrad_gemm_varlen_k,
     bf16_wgrad_gemm_varlen_k_accumulate,
+    bf16_wgrad_gemm_varlen_k_dual,
     bf16_wgrad_gemm_varlen_k_tma_add,
     blockscaled_fp8_gemm,
     blockscaled_fp8_gemm_grouped,
@@ -959,6 +960,63 @@ def _defer_wgrad(point, weight, run_wgrad) -> bool:
     if hook is None:
         return False
     return bool(hook(point, weight, run_wgrad))
+
+
+def _same_tensor_view(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return (
+        a.data_ptr() == b.data_ptr()
+        and tuple(a.shape) == tuple(b.shape)
+        and tuple(a.stride()) == tuple(b.stride())
+        and a.dtype == b.dtype
+    )
+
+
+def merge_deferred_wgrads(first, second):
+    """Fuse two deferred bf16 weight-grad GEMMs into one, or return None.
+
+    ``first`` / ``second`` are ``run_wgrad`` callables handed to the deferral
+    hook for the same weight by two calls of the layer (e.g. two ring
+    rounds). When both are the bf16 varlen-K wgrad adding into the same
+    fp32 accumulator, the returned callable runs one dual-source GEMM: each
+    expert's tile sums ``first``'s rows then ``second``'s in fp32 and adds
+    into the accumulator once (one read-modify-write instead of two).
+    Deterministic; equal to running both up to fp32 summation order.
+    Any other pair (FP8 wgrad, different shapes or accumulators) gives None,
+    and the caller runs them one after the other.
+    """
+    funcs = (bf16_wgrad_gemm_varlen_k_accumulate, bf16_wgrad_gemm_varlen_k_tma_add)
+    if not all(isinstance(run, partial) for run in (first, second)):
+        return None
+    if first.func is not second.func or first.func not in funcs:
+        return None
+    kw0, kw1 = first.keywords, second.keywords
+    if any(kw0.get(k) != kw1.get(k) for k in ("M", "N", "num_experts")):
+        return None
+    acc0, acc1 = kw0.get("accumulator"), kw1.get("accumulator")
+    if acc0 is None or acc1 is None or not _same_tensor_view(acc0, acc1):
+        return None
+    if len(first.args) != 4 or len(second.args) != 4:
+        return None
+    a0, a1 = first.args[0], second.args[0]
+    b0, b1 = first.args[1], second.args[1]
+    if (a0.dtype, b0.dtype, a0.shape[0], b0.shape[1]) != (
+        a1.dtype,
+        b1.dtype,
+        a1.shape[0],
+        b1.shape[1],
+    ):
+        return None
+    return partial(
+        bf16_wgrad_gemm_varlen_k_dual,
+        tuple(first.args),
+        tuple(second.args),
+        accumulator=acc0,
+        M=kw0["M"],
+        N=kw0["N"],
+        num_experts=kw0["num_experts"],
+        device=kw0["device"],
+        tma_add=first.func is bf16_wgrad_gemm_varlen_k_tma_add,
+    )
 
 
 def _main_grad_accumulator(weight, shape=None):

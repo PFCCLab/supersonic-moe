@@ -471,6 +471,64 @@ def test_bf16_wgrad_2cta_large_and_skew_safety() -> None:
         _assert_config_matches_reference(case, "256,256,2,1,1,1")
 
 
+@pytest.mark.parametrize("tma_add", [True, False], ids=["tma_add", "beta_accum"])
+@pytest.mark.parametrize(
+    "M,N,counts0,counts1",
+    [
+        # 1CTA 128x128 tile (N <= 128): ragged segments, empty experts on
+        # either side and an expert empty on both.
+        pytest.param(256, 128, [37, 0, 129, 5, 0], [0, 200, 3, 64, 0], id="1cta"),
+        # 2CTA 256x256 tile (M >= 2048, N > 128).
+        pytest.param(2048, 256, [300, 1, 0, 777], [129, 0, 0, 50], id="2cta"),
+    ],
+)
+def test_bf16_wgrad_dual_matches_two_calls(
+    tma_add: bool, M: int, N: int, counts0: list[int], counts1: list[int]
+) -> None:
+    """One dual-source call == the two single-source calls it replaces.
+
+    The dual GEMM sums each expert's rows of both sources in one fp32
+    accumulation and adds into the accumulator once, so it matches the two
+    sequential calls up to fp32 summation order, and is bitwise
+    reproducible.
+    """
+    from sonicmoe.quack_utils.bf16_wgrad_gemm import (
+        bf16_wgrad_gemm_varlen_k_accumulate,
+        bf16_wgrad_gemm_varlen_k_dual,
+        bf16_wgrad_gemm_varlen_k_tma_add,
+    )
+
+    single = bf16_wgrad_gemm_varlen_k_tma_add if tma_add else bf16_wgrad_gemm_varlen_k_accumulate
+    cases = [
+        _make_case_from_counts(
+            M=M, N=N, expert_counts=counts, source_tokens=512, layout="contiguous", seed=seed
+        )
+        for seed, counts in ((1, counts0), (2, counts1))
+    ]
+    E = len(counts0)
+    init = torch.randn((E, M, N), dtype=torch.float32, device="cuda")
+    expected = init.clone()
+    for case in cases:
+        single(
+            case["A"], case["B"], case["cu"], case["A_idx"],
+            accumulator=expected, M=M, N=N, total_K=case["total_K"],
+            num_experts=E, device=case["device"],
+        )
+    sources = [(c["A"], c["B"], c["cu"], c["A_idx"]) for c in cases]
+    outs = []
+    for _ in range(2):
+        out = init.clone()
+        bf16_wgrad_gemm_varlen_k_dual(
+            *sources, accumulator=out, M=M, N=N, num_experts=E,
+            device=cases[0]["device"], tma_add=tma_add,
+        )
+        outs.append(out)
+    torch.cuda.synchronize()
+    _assert_byte_equal(outs[0], outs[1])
+    rel = ((outs[0] - expected).norm() / (expected - init).norm()).item()
+    assert rel < 1e-5, f"dual vs two calls: rel L2 {rel:.2e}"
+
+
 def test_bf16_wgrad_2cta_sanitizer_safety_smoke() -> None:
     if os.getenv("SONIC_MOE_RUN_BF16_WGRAD_SANITIZER", "0") != "1":
         pytest.skip("Set SONIC_MOE_RUN_BF16_WGRAD_SANITIZER=1 under compute-sanitizer")
