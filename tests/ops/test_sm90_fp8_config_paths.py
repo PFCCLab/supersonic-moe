@@ -117,14 +117,16 @@ def test_sm90_gated_forward_config_variants(torch, modules, profile):
     assert _calc_diff(torch, z_deq, z_ref) < 1e-3
     assert bool((y1 == y1_ref).all().item())
 
-    # fuse_y1_quant: fused only for G == 32 (down GEMM consumes y1 in the G layout).
+    # fuse_y1_quant: raw 1x32 y1 for G == 32; for G == 128 the 1x128 quant is
+    # fused across the 1x2 cluster (192x128 tile) and quantizes the fp32 y1,
+    # byte-identical to the RTO BF16 y1 + 1x128 quant of the reference.
     z, y1, y1q, y1s, _ = _gated(torch, K, p, _cfg(profile, fuse_y1_quant=True))
     assert bool((z == z_ref).all().item())
-    if profile == 32:
-        assert tuple(y1.stride()) == (0, 0)
-    else:
-        assert bool((y1 == y1_ref).all().item())
+    assert tuple(y1.stride()) == (0, 0)
     assert tuple(y1s.shape) == tuple(y1s_ref.shape)
+    if profile == 128:
+        assert bool((y1q.view(torch.uint8) == y1q_ref.view(torch.uint8)).all().item())
+        assert bool((y1s.view(torch.uint8) == y1s_ref.view(torch.uint8)).all().item())
     y1_deq = ref.materialize_activation_sm90(y1q, y1s, profile)
     y1_ref_deq = ref.materialize_activation_sm90(y1q_ref, y1s_ref, profile)
     # The fused epilogue quantizes the fp32 y1, the reference the BF16 y1, so

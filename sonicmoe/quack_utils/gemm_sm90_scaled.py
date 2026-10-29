@@ -63,10 +63,12 @@ from ._gated_epilogues import (
     GemmGatedPostActIsaQuantMixin,
     GemmGatedBlockscaledQuantPostActMixin,
     Sm90RawGatedQuantMixin,
+    Sm90RawGatedQuant128Mixin,
     GemmDGatedFP8PreActMixin,
     Sm90DGatedDzQuantMixin,
     Sm90DGatedColQuantMixin,
     Sm90ScaledGemmRouteScatterMixin,
+    _bf16_round_odd,
 )
 
 
@@ -828,6 +830,8 @@ class _GemmSm90RawScaledBase:
                 varlen_k=varlen_k,
             )
             sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
+        if const_expr(hasattr(self, "epi_cluster_init")):
+            self.epi_cluster_init(epilogue_params, storage)
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mnk[:-1], is_relaxed=True)
@@ -3154,6 +3158,23 @@ class Sm90ScaledGated(GemmGatedMixin, _GemmSm90RawScaledBase):
         return _GemmSm90RawScaledBase._setup_attributes(self, epilogue_args)
 
 
+class Sm90ScaledGatedRTO(Sm90ScaledGated):
+    """Gated forward storing BF16 y1 with round-to-odd.
+
+    The BF16 y1 is only an intermediate for the following 1x128 FP8 quantize.
+    Round-to-odd makes that FP8 RN quantize bit-identical to quantizing the
+    fp32 y1 directly (no biased double rounding).
+    """
+
+    @cute.jit
+    def epi_convert_postact(self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx):
+        for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+            tRS_rPostAct[i] = _bf16_round_odd(tRS_rPostAct[i])
+        return Sm90ScaledGated.epi_convert_postact(
+            self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
+
+
 class Sm90ScaledDGated(GemmDGatedMixin, _GemmSm90RawScaledBase):
     """Scaled Hopper GEMM with gated backward epilogue."""
 
@@ -3266,6 +3287,30 @@ class Sm90ScaledGatedRawQuant(Sm90RawGatedQuantMixin, _GemmSm90RawScaledBase):
         return _GemmSm90RawScaledBase._setup_attributes(self, epilogue_args)
 
 
+class Sm90ScaledGatedRawQuantRTO(Sm90ScaledGatedRawQuant):
+    """Raw-quant gated forward (FP8 z) storing BF16 y1 with round-to-odd.
+
+    Same rationale as ``Sm90ScaledGatedRTO``; only valid for a BF16 y1, which is
+    stored through ``epi_convert_postact``.
+    """
+
+    @cute.jit
+    def epi_convert_postact(self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx):
+        for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
+            tRS_rPostAct[i] = _bf16_round_odd(tRS_rPostAct[i])
+        return Sm90ScaledGatedRawQuant.epi_convert_postact(
+            self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
+
+
+class Sm90ScaledGatedRawQuant128(Sm90RawGatedQuant128Mixin, Sm90ScaledGatedRawQuant):
+    """Raw-quant gated forward with a fused 1x128 FP8 y1 quantized from fp32.
+
+    A 1x128 y1 group spans the two N-adjacent CTAs of a (1, 2) cluster; their
+    per-row amax is exchanged through DSMEM (see ``Sm90RawGatedQuant128Mixin``).
+    """
+
+
 class Sm90ScaledDGatedFP8PreAct(GemmDGatedFP8PreActMixin, _GemmSm90RawScaledBase):
     """Scaled dGated using carrier FP8 preact and raw UE8M0 scales."""
 
@@ -3303,9 +3348,10 @@ _SM90_SCALED_CACHE = InstrumentedCompileCache("sm90_raw_ue8m0_scaled")
 _SM90_SCALED_CLASSES = {
     cls.__name__: cls
     for cls in (
-        Sm90ScaledGemm, Sm90ScaledGated, Sm90ScaledDGated, Sm90ScaledGatedZQuant,
+        Sm90ScaledGemm, Sm90ScaledGated, Sm90ScaledGatedRTO, Sm90ScaledDGated, Sm90ScaledGatedZQuant,
         Sm90ScaledGatedY1Quant, Sm90ScaledGatedZY1Quant, Sm90ScaledGatedRawQuant,
-        Sm90ScaledDGatedFP8PreAct, Sm90ScaledWgradVarlenK, Sm90ScaledRecomputeZ,
+        Sm90ScaledGatedRawQuantRTO, Sm90ScaledGatedRawQuant128, Sm90ScaledDGatedFP8PreAct,
+        Sm90ScaledWgradVarlenK, Sm90ScaledRecomputeZ,
         Sm90ScaledDGatedDzQuant, Sm90ScaledGemmRouteScatter, Sm90ScaledDGatedColQuant,
         Sm90ScaledDGatedColQuantNoY1s, Sm90ScaledDGatedColQuantNoStore,
         Sm90ScaledDGatedColQuantNoStoreInplace, Sm90ScaledWgradVarlenKTileLocal,
@@ -3986,9 +4032,19 @@ def sm90_scaled_gemm(
 def sm90_scaled_gated(
     A, B, D, PostAct, a_scales, b_scales, *, activation="swiglu",
     z_scale_out=None, postact_scale_out=None, swiglu_clamp_value=0.0,
-    postact_bf16_trunc=False, **kwargs,
+    postact_bf16_trunc=False, postact_round_odd=False, postact_group=32, **kwargs,
 ):
-    """Gated forward supporting BF16/FP8/no-z and BF16/FP8 y1 outputs."""
+    """Gated forward supporting BF16/FP8/no-z and BF16/FP8 y1 outputs.
+
+    ``postact_round_odd`` stores BF16 y1 with round-to-odd (for y1 that is only
+    re-quantized to FP8 afterwards); ignored for an FP8 y1.
+
+    ``postact_group`` is the FP8 y1 group (32 or 128). 128 quantizes y1 from
+    the fp32 epilogue registers, byte-identical to
+    ``quantize_activation_blockscaled_fast(y1_bf16_round_odd, 128)``; it needs
+    tile (192, 128), cluster (1, 2, 1), no pingpong and ``2I % 256 == 0``, with
+    ``postact_scale_out`` of shape ``[M, I/128]``.
+    """
     if activation != "swiglu":
         raise ValueError(f"native SM90 scaled gated does not support {activation!r}")
     if PostAct is None:
@@ -4007,7 +4063,20 @@ def sm90_scaled_gated(
     epi = dict(mPostAct=postact, act_fn="swiglu_precise",
                swiglu_clamp_value=float(swiglu_clamp_value))
     if z_fp8 or y1_fp8:
-        GemmCls = Sm90ScaledGatedRawQuant
+        if y1_fp8 and postact_group == 128:
+            if (tuple(kwargs.get("tile_shape", ())) != (192, 128)
+                    or tuple(kwargs.get("cluster_shape", ())) != (1, 2, 1)
+                    or kwargs.get("pingpong", False) or PostAct.shape[-1] % 128 != 0):
+                raise ValueError("fused 1x128 y1 needs tile (192,128), cluster (1,2,1), "
+                                 "no pingpong and 2I % 256 == 0")
+            if postact_scale_out.shape[-1] * 128 != PostAct.shape[-1]:
+                raise ValueError("fused 1x128 y1 scale must be [M, I/128]")
+            GemmCls = Sm90ScaledGatedRawQuant128
+        elif postact_group != 32 and y1_fp8:
+            raise ValueError(f"unsupported FP8 y1 group {postact_group}")
+        else:
+            GemmCls = (Sm90ScaledGatedRawQuantRTO if postact_round_odd and not y1_fp8
+                       else Sm90ScaledGatedRawQuant)
         epi.update(
             postact_bf16_trunc=bool(postact_bf16_trunc),
             mZScale=_epi_operand(z_scale_out, varlen_m=True),
@@ -4015,7 +4084,7 @@ def sm90_scaled_gated(
             mPostActOutput=postact,
         )
     else:
-        GemmCls = Sm90ScaledGated
+        GemmCls = Sm90ScaledGatedRTO if postact_round_odd else Sm90ScaledGated
     return _run_scaled(GemmCls, A, B, D, a_scales, b_scales, epi_fields=epi, **kwargs)
 
 

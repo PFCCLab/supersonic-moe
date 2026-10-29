@@ -364,6 +364,20 @@ def _bf16_trunc_rne(x: Float32, *, loc=None, ip=None) -> Float32:
     return _i32_as_f32(out_bits)
 
 
+@dsl_user_op
+def _bf16_round_odd(x: Float32, *, loc=None, ip=None) -> Float32:
+    """Round-to-odd fp32 -> bf16 (returned as an exactly bf16-representable fp32).
+
+    Truncate the 16 low mantissa bits and set the kept LSB if any of them was
+    non-zero.  A bf16 intermediate rounded this way makes a later RN rounding to
+    a narrower format (e4m3) identical to rounding the original fp32 directly,
+    removing the biased fp32->bf16->fp8 double rounding.  Inf/NaN are preserved.
+    """
+    bits = _f32_as_i32(x)
+    sticky = ((bits & Int32(0xFFFF)) + Int32(0xFFFF)) >> Int32(16)
+    return _i32_as_f32(((bits >> Int32(16)) | sticky) << Int32(16))
+
+
 # ---------------------------------------------------------------------------
 # Exact sigmoid with the IEEE-division guard hoisted out of the element loop
 # ---------------------------------------------------------------------------
@@ -759,6 +773,177 @@ class Sm90RawGatedQuantMixin(GemmGatedMixin):
         return GemmGatedMixin.epi_convert_postact(
             self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
         )
+
+
+class Sm90ClusterAmaxXchg(EpiOp):
+    """Smem + register state of the fused 1x128 y1 quant (1x2 cluster).
+
+    One Int64 smem range: words 0-1 are two mbarriers (double buffered by tile
+    parity), the rest an f32 ``[2, tile_M]`` buffer the peer CTA fills with its
+    per-row amax through ``st.async``.  ``begin`` also allocates the register
+    buffer carrying subtile 0's y1 to subtile 1, where the group is quantized.
+    """
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+        # Fixed per CTA, but reported per epilogue stage (see ``_compute_stages``).
+        epi_stage = 4 if epi_tile[1] <= 16 else 2
+        return -(-(2 + cta_tile_shape_mnk[0]) * 8 // epi_stage)
+
+    def smem_struct_field(self, gemm, params):
+        n_words = 2 + gemm.cta_tile_shape_mnk[0]
+        return (f"s_{self.name}",
+                cute.struct.Align[cute.struct.MemRange[cutlass.Int64, n_words], 16])
+
+    def get_smem_tensor(self, gemm, params, storage_epi):
+        return getattr(storage_epi, f"s_{self.name}").data_ptr()
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        coord = ctx.partition_for_epilogue_fn(
+            cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+        )
+        coord = cute.group_modes(coord, 3, cute.rank(coord))
+        n_vals = cute.size(coord[None, None, None, 0]) // 2  # PostAct values per subtile
+        buf = cute.make_rmem_tensor(cute.make_layout(n_vals), Float32)
+        return (smem_tensor, coord, buf, ctx.tile_coord_mnkl, ctx.varlen_manager, ctx.tidx)
+
+    def begin_loop(self, gemm, state, epi_coord):
+        smem, coord, buf, tile_coord, varlen, tidx = state
+        n_sub = epi_coord[1] if isinstance(epi_coord, tuple) else epi_coord
+        assert isinstance(n_sub, int), "epilogue subtile loop must be unrolled"
+        return (smem, coord[None, None, None, epi_coord], buf, tile_coord, varlen, tidx, n_sub)
+
+
+@dsl_user_op
+def _st_global_v2(ptr, a: Int32, b: Int32, *, loc=None, ip=None) -> None:
+    """8B ``st.global.v2.b32`` at an 8B-aligned gmem pointer."""
+    llvm.inline_asm(
+        None,
+        [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+         Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
+        "st.global.v2.b32 [$0], {$1, $2};",
+        "l,r,r",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+class Sm90RawGatedQuant128Mixin(Sm90RawGatedQuantMixin):
+    """Fused 1x128 y1 quant straight from the fp32 PostAct (single rounding).
+
+    Needs a 192x128 tile in a 1x2 cluster: a CTA covers 64 y1 columns in two
+    32-column subtiles, so a 1x128 group spans the two N-adjacent CTAs of the
+    cluster.  At subtile 1 each quad reduces its row amax over 64 columns,
+    sends it to the peer CTA's smem (``st.async`` + mbarrier complete_tx),
+    waits for the peer's, and quantizes both subtiles with the shared scale.
+    Byte-identical to RTO-bf16 y1 + ``quantize_activation_blockscaled_fast(., 128)``.
+    """
+
+    _epi_ops = (*Sm90RawGatedQuantMixin._epi_ops, Sm90ClusterAmaxXchg("y1_xchg"))
+
+    def epilogue(self, *args, **kwargs):
+        # The exchange buffer / mbarrier phase follow the per-CTA tile count,
+        # which the two CTAs of the cluster advance in lockstep.
+        sched = kwargs["tile_scheduler"] if "tile_scheduler" in kwargs else args[21]
+        self._y1x_tile_idx = sched.num_tiles_executed
+        return super().epilogue(*args, **kwargs)
+
+    @cute.jit
+    def epi_cluster_init(self, params, storage):
+        mbar = getattr(storage.epi, "s_y1_xchg").data_ptr()
+        if cute.arch.thread_idx()[0] == Int32(0):
+            cute.arch.mbarrier_init(mbar, 1)
+            cute.arch.mbarrier_init(mbar + 1, 1)
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        postact = GemmGatedMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+        assert self.cta_tile_shape_mnk[1] == 128 and self.epi_tile[1] == 64
+        assert self.epi_tile[0] == self.cta_tile_shape_mnk[0]
+        assert self.cluster_shape_mnk[0] == 1 and self.cluster_shape_mnk[1] == 2
+        smem, coords, buf, tile_coord, varlen, tidx, n_sub = epi_loop_tensors["y1_xchg"]
+        assert cute.size(postact) == 16
+        if const_expr(params.postact_bf16_trunc):
+            for i in cutlass.range_constexpr(16):
+                postact[i] = _bf16_trunc_rne(postact[i])
+        if const_expr(n_sub == 0):
+            for i in cutlass.range_constexpr(16):
+                buf[i] = postact[i]
+        else:
+            # Value i: row half r = i % 2, y1 column ln + 4 * (i // 2) of the subtile.
+            ln = cute.arch.lane_idx() & Int32(3)
+            amax = [Float32(0.0), Float32(0.0)]
+            for i in cutlass.range_constexpr(16):
+                a = cute.arch.fmax(
+                    cute.arch.fmax(buf[i], Float32(0.0) - buf[i]),
+                    cute.arch.fmax(postact[i], Float32(0.0) - postact[i]),
+                )
+                amax[i % 2] = cute.arch.fmax(amax[i % 2], a)
+            for r in cutlass.range_constexpr(2):
+                amax[r] = cute.arch.warp_reduction(amax[r], cute.arch.fmax, threads_in_group=4)
+            tile_m = self.cta_tile_shape_mnk[0]
+            t = self._y1x_tile_idx
+            stage = t % Int32(2)
+            phase = (t // Int32(2)) % Int32(2)
+            mbar = smem + stage
+            slot = cute.recast_ptr(smem + 2, dtype=Float32) + stage * Int32(tile_m)
+            rows = [coords[0][0], coords[2][0]]
+            if tidx == Int32(0):
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar, tile_m * 4)
+            if ln == Int32(0):
+                peer = cute.arch.block_idx_in_cluster() ^ Int32(1)
+                for r in cutlass.range_constexpr(2):
+                    utils.store_shared_remote(
+                        amax[r], slot + rows[r], mbar, peer_cta_rank_in_cluster=peer
+                    )
+            cute.arch.mbarrier_wait(mbar, phase)
+            for r in cutlass.range_constexpr(2):
+                peer_amax = cute.make_tensor(slot + rows[r], cute.make_layout(1))[0]
+                amax[r] = cute.arch.fmax(amax[r], peer_amax)
+            scale_param = epi_loop_tensors["mPostActScaleRaw"][0]
+            output = params.mPostActOutput
+            batch = tile_coord[3]
+            batch_start = varlen.params.cu_seqlens_m[batch] if varlen.varlen_m else Int32(0)
+            m_limit = (
+                varlen.params.cu_seqlens_m[batch + Int32(1)]
+                if varlen.varlen_m else output.shape[0]
+            )
+            n_abs = tile_coord[1] * Int32(64) + Int32(16) * ln
+            n_ok = cutlass.Boolean(n_abs < output.shape[1])
+            write_scale = cutlass.Boolean(ln == Int32(0)) & cutlass.Boolean(
+                (tile_coord[1] % Int32(2)) == Int32(0)
+            )
+            for r in cutlass.range_constexpr(2):
+                e8m0, qs = _ue8m0_from_amax(amax[r])
+                # Word q packs y1 columns ln + 16q + 4b (b = byte) of the CTA's 64.
+                words = []
+                for q in cutlass.range_constexpr(4):
+                    v = []
+                    for b in cutlass.range_constexpr(4):
+                        k = 4 * q + b
+                        src = buf[2 * k + r] if const_expr(k < 8) else postact[2 * (k - 8) + r]
+                        v.append(src * qs)
+                    words.append(_cvt_e4m3x4(*v))
+                # After the lane transpose, word c holds columns c + 16ln + 4b;
+                # a 4x4 byte transpose gives words of columns 16ln + 4j + (0..3).
+                w = _xpose4_lanes(words, ln)
+                lo01 = _prmt2(w[0], w[1], Int32(0x5140))
+                lo23 = _prmt2(w[2], w[3], Int32(0x5140))
+                hi01 = _prmt2(w[0], w[1], Int32(0x7362))
+                hi23 = _prmt2(w[2], w[3], Int32(0x7362))
+                out = [
+                    _prmt2(lo01, lo23, Int32(0x5410)), _prmt2(lo01, lo23, Int32(0x7632)),
+                    _prmt2(hi01, hi23, Int32(0x5410)), _prmt2(hi01, hi23, Int32(0x7632)),
+                ]
+                m_abs = batch_start + tile_coord[0] * Int32(tile_m) + rows[r]
+                if cutlass.Boolean(m_abs < m_limit) & n_ok:
+                    _st_global_v4(cute.domain_offset((m_abs, n_abs), output).iterator, out)
+                    if write_scale:
+                        scale_param[m_abs, tile_coord[1] // Int32(2)] = cutlass.Int8(e8m0)
+        self._quantize_fragment(tRS_rD, epi_loop_tensors["mZScale"], False)
+        return postact
 
 
 # ---------------------------------------------------------------------------

@@ -839,6 +839,15 @@ def _sm90_cluster(group: int, k: int, kind: str = "gemm", n: int = 0):
     return (1, 1, 1)
 
 
+# Store the BF16 y1 intermediate (re-quantized to FP8 for the down GEMM) with
+# round-to-odd so the FP8 quant equals quantizing the fp32 y1 directly.  RN here
+# double-rounds fp32->bf16->fp8 and biases y1 magnitudes low.
+_SM90_Y1_ROUND_ODD = os.environ.get("SONIC_MOE_SM90_Y1_ROUND_ODD", "1") == "1"
+# Fuse the 1x128 y1 quant into the gated epilogue (from the fp32 y1, single
+# rounding; the two CTAs of the 1x2 cluster exchange row amax via DSMEM).
+_SM90_FUSE_Y1_128 = os.environ.get("SONIC_MOE_SM90_FUSE_Y1_128", "1") == "1"
+
+
 def gemm_gated(
     x,
     w1,
@@ -867,9 +876,17 @@ def gemm_gated(
 
     store_z = not cfg.recompute_z
     z_epilogue_quant = store_z and cfg.epilogue_quant and cfg.save_z_fp8
-    # Epilogue scales are always raw 1x32; the down GEMM needs y1 in the
-    # activation group, so the y1 quant can only be fused when G == 32.
-    fuse_y1 = cfg.fuse_y1_quant and group == 32
+    gather_kw = _sm90_gather_kw(group, "gated", x_fp8, n)
+    # G == 32: raw 1x32 y1 quant in the epilogue.  G == 128: fused 1x128 y1
+    # quant across the 1x2 cluster (tile 192x128 only); otherwise BF16 y1 +
+    # a separate quant kernel.
+    fuse_y1_128 = (
+        cfg.fuse_y1_quant and _SM90_FUSE_Y1_128 and group == 128
+        and gather_kw.get("tile_shape") == (192, 128)
+        and gather_kw.get("cluster_shape") == (1, 2, 1)
+        and n % 256 == 0
+    )
+    fuse_y1 = (cfg.fuse_y1_quant and group == 32) or fuse_y1_128
     if not store_z:
         z_out, z_scale_out = None, None
     elif z_epilogue_quant:
@@ -880,7 +897,9 @@ def gemm_gated(
         z_scale_out = None
     if fuse_y1:
         y1_out = torch.empty((total_m, n // 2), dtype=torch.float8_e4m3fn, device=device)
-        y1_scale_out = torch.empty((total_m, n // 64), dtype=torch.uint8, device=device)
+        y1_scale_out = torch.empty(
+            (total_m, n // (2 * group)), dtype=torch.uint8, device=device
+        )
     else:
         y1_out = torch.empty((total_m, n // 2), dtype=torch.bfloat16, device=device)
         y1_scale_out = None
@@ -890,12 +909,16 @@ def gemm_gated(
         z_scale_out=z_scale_out,
         postact_scale_out=y1_scale_out,
         swiglu_clamp_value=cfg.swiglu_clamp_value,
-        postact_bf16_trunc=fuse_y1 and cfg.fuse_y1_bf16_trunc,
+        # bf16 truncation only mirrors the G == 32 reference; the fused 128
+        # path must quantize the fp32 y1 directly.
+        postact_bf16_trunc=fuse_y1 and group == 32 and cfg.fuse_y1_bf16_trunc,
+        postact_round_odd=_SM90_Y1_ROUND_ODD and not fuse_y1,
+        postact_group=group if fuse_y1 else 32,
         cu_seqlens_m=expert_frequency_offset,
         activation_group=group,
         weight_block=block,
         A_idx=x_gather_idx,
-        **_sm90_gather_kw(group, "gated", x_fp8, n),
+        **gather_kw,
     )
 
     z_fp8_payload = None
