@@ -783,9 +783,10 @@ def _sm90_tile(group: int, kind: str = "gather", k: int = 0):
     """CTA tile per GEMM kind (all choices bitwise: the K order is unchanged).
 
     Profile 128 (one scale per 128-K tile, tensor-core accumulation):
-      * gather kernels (gated / recompute_z / dgated) prefer 128x192 at
-        K >= 2048: the cp.async A gather of 192 rows costs more than the wider
-        N saves. At K <= 1024 (ERNIELite 4B) gated is ~20% faster at 192x128.
+      * cp.async gather kernels (gated / recompute_z / dgated) prefer 128x192
+        at K >= 2048: the cp.async A gather of 192 rows costs more than the
+        wider N saves. At K <= 1024 (ERNIELite 4B) gated is ~20% faster at
+        192x128. The TMA gather path (``_sm90_gather_kw``) uses 192x128.
         dgated stays 128x192 there too: its colvec partial width follows
         tile N, so another tile changes the dprobs summation order.
       * non-gather down / dx: 192x128 (3 MMA warpgroups, block-aligned N) is
@@ -805,17 +806,17 @@ def _sm90_gather_kw(group: int, kind: str, x_fp8: torch.Tensor, n: int):
     gather (``tma_gather=(1, 4)``): each A row is fetched by one 2D TMA
     (indices staged in smem), the rows of a tile split over the 4 load warps
     (one lane each, so the issue rate is not bound by a single lane) and over
-    a 1x2 cluster with multicast. Tile 192x128 for K <= 2048, else 128x192.
-    vs the cp.async-only gather it is 8-25% faster on gated / recompute_z at
-    every bench shape (Round 22), bitwise. No out-of-kernel row permute: that
-    copy costs time and a transient M x K buffer in the end-to-end step.
+    a 1x2 cluster with multicast. Tile 192x128 at every K: it enables the fused
+    1x128 y1 quant in gated (6-14% faster than 128x192 + separate quant at
+    K > 2048). vs the cp.async-only gather it is 8-25% faster on gated /
+    recompute_z at every bench shape (Round 22), bitwise. No out-of-kernel row
+    permute: that copy costs time and a transient M x K buffer in the
+    end-to-end step.
     """
     k = int(x_fp8.shape[1])
     kw = dict(activation_scale_order="source", tile_shape=_sm90_tile(group, kind, k))
-    if group == 128 and k % 128 == 0 and x_fp8.dim() == 2 and x_fp8.is_contiguous():
-        tile = (192, 128) if k <= 2048 else (128, 192)
-        if n > tile[1]:
-            kw.update(tile_shape=tile, cluster_shape=(1, 2, 1), tma_gather=(1, 4))
+    if group == 128 and k % 128 == 0 and x_fp8.dim() == 2 and x_fp8.is_contiguous() and n > 128:
+        kw.update(tile_shape=(192, 128), cluster_shape=(1, 2, 1), tma_gather=(1, 4))
     return kw
 
 
