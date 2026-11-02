@@ -3,6 +3,7 @@
 # ********************************************************************************
 
 import os
+from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -11,6 +12,23 @@ import triton.language as tl
 
 from ..utils import get_powers_of_2
 from ..triton_utils import deterministic_autotune_enabled, wrap_triton_kernel
+
+
+@lru_cache(maxsize=None)
+def _is_sm90() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
+def _small_h_tuning() -> bool:
+    """Whether the full-row prune and the small-H kernel below may be used.
+
+    Both were tuned on H800 and change the fp32 summation order over K for
+    H <= 512. SM90 always uses them. Other archs use them only when
+    deterministic autotune is off: with it on they keep the original config
+    set and kernel, so results stay bitwise identical to the pre-SM90-refactor
+    code (e.g. eb09bc5 on SM100).
+    """
+    return _is_sm90() or not deterministic_autotune_enabled()
 
 
 ### This triton impl is equivalent as the cute-dsl impl shown above,
@@ -54,7 +72,7 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
         # choice for low average K (EP: ~1.3 local experts per token). With it
         # gone the tuner picks BLOCK_K>=2, whose cross-warp K reduction runs
         # ~4.7x slower on H800 at H=512.
-        full_row = BLOCK_H == min(triton.next_power_of_2(H), 4096)
+        full_row = _small_h_tuning() and BLOCK_H == min(triton.next_power_of_2(H), 4096)
         if (
             BLOCK_H <= triton.next_power_of_2(H)
             and BLOCK_K <= triton.next_power_of_2(MAX_K)
@@ -228,7 +246,7 @@ def _small_h_config(H: int):
     H800 microbench (T=414K / 105K, avg K ~1.9, bitwise vs BLOCK_K=1):
     H=256 351->230 us, H=384 390->330 us, H=512 128->112 us; H=768 only -3%.
     """
-    if os.environ.get("SONIC_MOE_TGS_SMALL_H", "1") != "1" or H > 512:
+    if not _small_h_tuning() or os.environ.get("SONIC_MOE_TGS_SMALL_H", "1") != "1" or H > 512:
         return None
     if H <= 256:
         return 2, triton.next_power_of_2(H), 1
