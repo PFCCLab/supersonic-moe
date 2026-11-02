@@ -19,7 +19,7 @@ while it is still initializing), so they are looked up through
 
 from __future__ import annotations
 
-import importlib
+import sys
 
 import torch
 
@@ -68,9 +68,16 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 _GATED_OUTPUT_PAYLOAD_ATTR = "_sonic_preallocated_gated_outputs"
 
 
+# Root package object, captured at import time. paddlefleet_ops renames the
+# sys.modules keys after import (``sonicmoe.*`` -> ``paddlefleet_ops.sonicmoe.*``),
+# so a name-based lookup at call time (``import_module("..functional", __package__)``)
+# raises ModuleNotFoundError. The package attribute survives the rename.
+_ROOT_PKG = sys.modules[__package__.rpartition(".")[0]]
+
+
 def _functional():
     """``sonicmoe.functional`` (fully initialized by the time any op runs)."""
-    return importlib.import_module("..functional", __package__)
+    return _ROOT_PKG.functional
 
 
 # ---------------------------------------------------------------------------
