@@ -70,12 +70,8 @@ class SonicMoEConfig:
             Auto-enabled when ``use_fp8=True``.
         fp8_wgrad: Enable FP8 weight gradients. Env: ``SONIC_MOE_FP8_WGRAD``.
             Default: auto (ON at I>=2048, OFF at I<2048).
-        fused_gated: Use fused gemm_gated/dgated CUTLASS kernels.
-            Env: ``SONIC_MOE_FP8_FUSED_GATED``. Default: True.
         save_z_fp8: Save z tensor in FP8 to reduce memory.
             Env: ``SONIC_MOE_FP8_SAVE_Z_FP8``. Default: True.
-        fused_swiglu_quant: Use fused SwiGLU+quantize kernels.
-            Env: ``SONIC_MOE_FP8_FUSED_SWIGLU_QUANT``. Default: True.
         epilogue_quant: Enable epilogue blockscaled quant of z.
             Env: ``SONIC_MOE_FP8_EPILOGUE_QUANT``. Default: False.
         fused_zy1_quant: Enable fused z+y1 quantization.
@@ -113,10 +109,8 @@ class SonicMoEConfig:
     use_fp8: Optional[bool] = None
     use_quack_gemm: Optional[bool] = None
     fp8_wgrad: Optional[bool] = None
-    fused_gated: Optional[bool] = None
     save_z_fp8: Optional[bool] = None
     recompute_z: Optional[bool] = None
-    fused_swiglu_quant: Optional[bool] = None
     epilogue_quant: Optional[bool] = None
     fused_zy1_quant: Optional[bool] = None
     fuse_y1_quant: Optional[bool] = None
@@ -152,11 +146,6 @@ class SonicMoEConfig:
             return self.fp8_wgrad
         return _env_bool("SONIC_MOE_FP8_WGRAD")
 
-    def resolve_fused_gated(self) -> bool:
-        if self.fused_gated is not None:
-            return self.fused_gated
-        return _env_bool("SONIC_MOE_FP8_FUSED_GATED", True) or False
-
     def resolve_save_z_fp8(self) -> bool:
         if self.save_z_fp8 is not None:
             return self.save_z_fp8
@@ -177,11 +166,6 @@ class SonicMoEConfig:
         if self.recompute_z is not None:
             return self.recompute_z
         return _env_bool("SONIC_MOE_FP8_RECOMPUTE_Z", False) or False
-
-    def resolve_fused_swiglu_quant(self) -> bool:
-        if self.fused_swiglu_quant is not None:
-            return self.fused_swiglu_quant
-        return _env_bool("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", True) or False
 
     def resolve_epilogue_quant(self) -> bool:
         if self.epilogue_quant is not None:

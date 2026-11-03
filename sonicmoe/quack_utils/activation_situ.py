@@ -45,11 +45,15 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 import quack.activation as _qact
 
-from ..situ_params import (
+from ..situ_params import (  # noqa: F401  (re-exported)
     DEFAULT_SITU_BETA,
     DEFAULT_SITU_LINEAR_BETA,
+    SITU_GLU_PREFIX,
     check_beta,
+    encode_situ_activation,
     is_linear_beta_disabled,
+    is_situ_activation,
+    parse_situ_activation,
 )
 
 F32_or_F32x2 = Float32 | Tuple[Float32, Float32]
@@ -197,65 +201,9 @@ def dsitu_glu(
 # ---------------------------------------------------------------------------
 # activation-string encoding / resolution
 # ---------------------------------------------------------------------------
-
-SITU_GLU_PREFIX = "situ_glu"
-
-
-def _fmt(v: Optional[float]) -> str:
-    # repr() of a float round-trips exactly, so the key is lossless.
-    return "none" if v is None else repr(float(v))
-
-
-def encode_situ_activation(
-    beta: float = DEFAULT_SITU_BETA,
-    linear_beta: Optional[float] = DEFAULT_SITU_LINEAR_BETA,
-    precise: bool = True,
-) -> str:
-    """Build the cache-safe activation string for a SiTU-GLU configuration."""
-    beta = check_beta("beta", beta, where="encode_situ_activation")
-    if linear_beta is not None:
-        linear_beta = check_beta(
-            "linear_beta", linear_beta, where="encode_situ_activation"
-        )
-    key = f"{SITU_GLU_PREFIX}:b={_fmt(beta)}:lb={_fmt(linear_beta)}"
-    if not precise:
-        key += ":approx"
-    return key
-
-
-def is_situ_activation(activation) -> bool:
-    return isinstance(activation, str) and (
-        activation == SITU_GLU_PREFIX or activation.startswith(SITU_GLU_PREFIX + ":")
-    )
-
-
-def parse_situ_activation(activation) -> Optional[Tuple[float, Optional[float], bool]]:
-    """``"situ_glu:b=4.0:lb=25.0"`` -> ``(4.0, 25.0, True)``; ``None`` if not SiTU."""
-    if not is_situ_activation(activation):
-        return None
-    beta = DEFAULT_SITU_BETA
-    linear_beta = DEFAULT_SITU_LINEAR_BETA
-    precise = True
-    where = f"in {activation!r}"
-    for field in activation.split(":")[1:]:
-        if field == "approx":
-            precise = False
-        elif field == "precise":
-            precise = True
-        elif field.startswith("b="):
-            # ``check_beta`` does the float() conversion so a bad ``b=`` field
-            # gets the same message here as it would from the config field.
-            beta = check_beta("beta", field[2:], where=where)
-        elif field.startswith("lb="):
-            raw = field[3:]
-            linear_beta = (
-                None
-                if is_linear_beta_disabled(raw)
-                else check_beta("linear_beta", raw, where=where)
-            )
-        else:
-            raise ValueError(f"unrecognized situ_glu activation field {field!r} in {activation!r}")
-    return beta, linear_beta, precise
+# ``SITU_GLU_PREFIX`` / ``encode_situ_activation`` / ``is_situ_activation`` /
+# ``parse_situ_activation`` live in ``situ_params`` (pure Python) so that
+# ``functional/fp8_config.py`` can use them; they are re-exported here.
 
 
 def situ_gate_fn(activation: str) -> Callable:

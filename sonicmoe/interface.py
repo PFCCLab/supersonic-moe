@@ -32,6 +32,7 @@ from .functional import (
 )
 from .functional.grouped_down_proj import current_grouped_plan
 from .functional.utils import enable_fp8
+from .functional.fp8_protocol import resolve_fp8_backend
 
 try:
     from .quack_utils.blockscaled_fp8_gemm import (
@@ -64,56 +65,6 @@ def _resolve_sonic_config_bool(config, name):
     resolver = getattr(config, f"resolve_{name}", None)
     return bool(resolver()) if resolver is not None else False
 
-
-class _SonicRouterScoresFromMetadata(paddle.autograd.PyLayer):
-    @staticmethod
-    def forward(ctx, topk_scores, metadata_scores, score_src_idx):
-        if len(topk_scores.shape) != 2:
-            raise ValueError(
-                f"topk_scores: expected rank 2, got shape {topk_scores.shape}"
-            )
-        if len(metadata_scores.shape) != 1:
-            raise ValueError(
-                "metadata_scores: expected rank 1, got shape "
-                f"{metadata_scores.shape}"
-            )
-        if len(score_src_idx.shape) != 1:
-            raise ValueError(
-                f"score_src_idx: expected rank 1, got shape {score_src_idx.shape}"
-            )
-        if metadata_scores.shape[0] < score_src_idx.shape[0]:
-            raise ValueError(
-                "metadata_scores must include every real score referenced by "
-                f"score_src_idx; got {metadata_scores.shape[0]} scores and "
-                f"{score_src_idx.shape[0]} indices"
-            )
-        if "int32" not in str(score_src_idx.dtype):
-            raise ValueError(
-                f"score_src_idx: expected int32, got {score_src_idx.dtype}"
-            )
-        metadata_scores.stop_gradient = True
-        score_src_idx.stop_gradient = True
-        ctx.save_for_backward(score_src_idx)
-        ctx.input_shape = list(topk_scores.shape)
-        ctx.n_total = int(topk_scores.shape[0]) * int(topk_scores.shape[1])
-        scores = metadata_scores.clone()
-        scores.stop_gradient = topk_scores.stop_gradient
-        return scores
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        (score_src_idx,) = ctx.saved_tensor()
-        if _scatter_router_scores_i32 is None:
-            raise RuntimeError(
-                "SonicMoE metadata router score backward requires "
-                "paddlefleet_ops.sonicmoe.quack_utils.blockscaled_fp8_gemm."
-                "_scatter_router_scores_i32; update paddlefleet_ops or use "
-                "the differentiable router-score fallback."
-            )
-        grad_flat = _scatter_router_scores_i32(
-            grad_out.contiguous(), score_src_idx, ctx.n_total
-        )
-        return grad_flat.reshape(ctx.input_shape), None, None
 
 def run_sonic_moe(
     hidden_states,
@@ -157,7 +108,31 @@ def run_sonic_moe(
 
     fp8_scale_packed = None
     gated_outputs = ()
-    if (
+    backend_resolution = (
+        resolve_fp8_backend(fp8_config, hidden_states.device) if fp8 else None
+    )
+    is_sm90 = backend_resolution is not None and backend_resolution.is_hopper
+    if is_sm90:
+        (
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+            _router_scores,
+            TK_padded,
+            total_pad_rows,
+            _N_recv,
+            _score_src_idx,
+        ) = deepep_topk_to_sonic_metadata(
+            topk_indices_i32,
+            topk_scores,
+            tokens_per_expert,
+            E,
+            block=backend_resolution.routing_block_size,
+            sync_free_sizing=sync_free_sizing,
+        )
+    elif (
         fp8
         and fp8_scale is not None
         and deepep_topk_to_sonic_metadata_with_scales is not None
@@ -169,7 +144,6 @@ def run_sonic_moe(
         preallocate_gated_outputs = (
             hidden_states.dtype == paddle.float8_e4m3fn
             and gated_n % 256 == 0
-            and _resolve_sonic_config_bool(fp8_config, "fused_gated")
             and _resolve_sonic_config_bool(fp8_config, "fuse_y1_quant")
         )
         if preallocate_gated_outputs:
@@ -180,7 +154,7 @@ def run_sonic_moe(
                 E,
                 fp8_scale,
                 int(hidden_states.shape[1]),
-                block=128,
+                block=backend_resolution.routing_block_size,
                 gated_output_prototype=hidden_states,
                 gated_n=gated_n,
                 gated_preact_bf16=not gated_z_quant,
@@ -195,7 +169,7 @@ def run_sonic_moe(
                 E,
                 fp8_scale,
                 int(hidden_states.shape[1]),
-                block=128,
+                block=backend_resolution.routing_block_size,
                 sync_free_sizing=sync_free_sizing,
             )
         (
@@ -252,22 +226,21 @@ def run_sonic_moe(
         hasattr(topk_scores, "stop_gradient") and not topk_scores.stop_gradient
     )
     if not router_scores_need_grad:
-        # Read stop_gradient before entering a PyLayer. Paddle detaches tensor
-        # inputs inside .apply(), so the original caller intent is unavailable
-        # to _DownProjection.forward. Metadata scores are forward-only here.
+        # No router edge is needed. Keep metadata scores forward-only and do not
+        # pass the original source into _DownProjection: Paddle rejects any
+        # tensor returned for a forward input whose stop_gradient is true.
         _router_scores.stop_gradient = True
         scores_for_down = _router_scores
-    elif _score_src_idx is not None:
-        # DownProjection already computes metadata-order ds. Attach the source
-        # edge there instead of scheduling a separate per-microbatch carrier.
+    elif _score_src_idx is not None and _scatter_router_scores_i32 is not None:
+        # DownProjection already computes metadata-order ds. Attach the original
+        # [T, K] score tensor as the backward edge and scatter ds natively.
+        _router_scores.stop_gradient = True
         scores_for_down = _router_scores
         router_score_source = topk_scores
         router_score_src_idx = _score_src_idx
-    elif _score_src_idx is not None and _scatter_router_scores_i32 is not None:
-        scores_for_down = _SonicRouterScoresFromMetadata.apply(
-            topk_scores, _router_scores, _score_src_idx
-        )
     else:
+        # The differentiable gather is the compatibility fallback when metadata
+        # does not provide a source map or the native scatter is unavailable.
         scores_for_down = _differentiable_router_scores(
             topk_scores,
             topk_indices.cast(paddle.int32),
@@ -297,7 +270,6 @@ def run_sonic_moe(
     #     w2_sonic = w2.permute([1, 2, 0])
 
     with enable_fp8(fp8):
-        # _refresh_fp8_config()
         y1, z = _UpProjection.apply(
             hidden_states,
             w1,
@@ -317,7 +289,9 @@ def run_sonic_moe(
             prequant_activation_payload=fp8_hidden_states,
             fp8_config=fp8_config,
         )
-        if release_fp8_weights and not fp8_config.recompute_z:
+        # SM90 weights are quantized and owned by PaddleFleet's moe_expert;
+        # they must not be released per call.
+        if release_fp8_weights and not fp8_config.recompute_z and not is_sm90:
             transposed_fp8 = getattr(w1, "transposed_fp8", None)
             if (
                 transposed_fp8 is None
@@ -357,7 +331,7 @@ def run_sonic_moe(
             hidden_states = _DownProjection.apply(
                 *down_args, fp8_config=fp8_config
             )
-        if release_fp8_weights:
+        if release_fp8_weights and not is_sm90:
             transposed_fp8 = getattr(w2, "transposed_fp8", None)
             if (
                 transposed_fp8 is None

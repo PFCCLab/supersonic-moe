@@ -144,7 +144,15 @@ def _prepared_gated_tvm_ffi_weight(B: Tensor) -> Optional[Tensor]:
 
 
 class GemmGatedSm90(GemmGatedMixin, GemmSm90):
-    pass
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # GemmSm100 defines this flag, while current GemmSm90 does not.
+        # Shared gated epilogue hooks use it to select the non-blockscaled path.
+        self.blockscaled = False
+
+    def _setup_attributes(self, epilogue_args):
+        """Match the one-argument setup hook used by current QuACK Hopper."""
+        return GemmSm90._setup_attributes(self, epilogue_args)
 
 
 class GemmGatedSm100(GemmGatedMixin, GemmSm100):
@@ -997,15 +1005,17 @@ def gemm_gated(
     if compile_key not in cache:
         if device_capacity[0] == 9:
             GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent)
+        gemm_kwargs = {"gather_A": gather_A}
+        if device_capacity[0] >= 10:
+            gemm_kwargs["sf_vec_size"] = sf_vec_size
         gemm_obj = GemmCls(
             acc_dtype,
             tensor_infos["A"].dtype,
             tile_shape_mn,
             cluster_shape_mnk,
-            gather_A=gather_A,
-            sf_vec_size=sf_vec_size,
+            **gemm_kwargs,
         )
-        cache[compile_key] = cute.compile(
+        compile_args = (
             gemm_obj,
             tensor_infos["A"].cute_tensor,
             tensor_infos["B"].cute_tensor,
@@ -1015,10 +1025,11 @@ def gemm_gated(
             scheduler_args,
             varlen_args,
             current_stream,
-            a_scale_cute,
-            b_scale_cute,
         )
-    cache[compile_key](
+        if device_capacity[0] >= 10:
+            compile_args += (a_scale_cute, b_scale_cute)
+        cache[compile_key] = cute.compile(*compile_args)
+    call_args = (
         tensor_infos["A"].cute_tensor,
         tensor_infos["B"].cute_tensor,
         tensor_infos["D"].cute_tensor,
@@ -1027,9 +1038,10 @@ def gemm_gated(
         scheduler_args,
         varlen_args,
         current_stream,
-        a_scale_cute,
-        b_scale_cute,
     )
+    if device_capacity[0] >= 10:
+        call_args += (a_scale_cute, b_scale_cute)
+    cache[compile_key](*call_args)
 
 
 from ..cache_manager import InstrumentedCompileCache as _ICC

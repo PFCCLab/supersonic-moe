@@ -26,14 +26,11 @@
 | `__init__.py` | Package marker for test discovery. | — |
 | `conftest.py` | Pytest fixtures for sonic-moe tests. | — |
 | `count_cumsum_test.py` | Pytest coverage for count cumsum. | — |
-| `fp8_frontier_determinism_test.py` | FP8 Frontier Determinism Test — bit-exact equality across repeated runs. | — |
 | `fp8_frontier_stress_test.py` | FP8 frontier stress tests — multi-shape, multi-routing, multi-iter. | — |
-| `fp8_frontier_strict_test.py` | FP8 Frontier Strict Test — no implicit fallback, no skip, fail-loud. | — |
-| `fp8_large_project_contract_test.py` | Pytest coverage for fp8 large project contract. | — |
+| `fp8_large_project_contract_test.py` | Contract tests for the blockscaled FP8 quantization kernels (weight/activation quant, fused z-save + y1 quant). | — |
 | `fp8_operator_options.py` | Pytest coverage for fp8 operator options. | — |
 | `fp8_protocol_test.py` | Pytest coverage for fp8 protocol. | — |
 | `moe_sm100_test.py` | Pytest coverage for moe sm100. | — |
-| `moe_test.py` | Pytest coverage for moe. | — |
 | `precision_compare_paths.py` | Precision: Path A (direct .apply(), is_varlen_K=False) vs Path B (SonicMoEMlpNode, is_varlen_K=True, route-level padding) Same weights, same routing, same input, same out_grad. | — |
 | `report1.nsys-rep` | nsys report artifact for report1. | untracked in git |
 | `report2.nsys-rep` | nsys report artifact for report2. | untracked in git |
@@ -44,4 +41,3 @@
 | `test_blockscaled_fp8_varlen.py` | Test blockscaled_fp8_gemm_varlen against bf16 gold reference. | — |
 | `test_commons.py` | Pytest coverage for commons. | — |
 | `test_moe_layer.py` | Unit test for MoELayer single-card implementation, adapted from PaddleFleet's moe_layer.py. | — |
-| `test_moe_layer_e2e.py` | Unit test for MoELayer single-card implementation, adapted from PaddleFleet's moe_layer.py. | — |

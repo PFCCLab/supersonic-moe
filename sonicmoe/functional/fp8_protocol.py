@@ -42,6 +42,7 @@ class FP8ScaleGranularity(Enum):
 
 class FP8Backend(Enum):
     BLACKWELL = "blackwell"
+    HOPPER = "hopper"
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,81 @@ class FP8Protocol:
     @property
     def group_size(self) -> int:
         return self.scale_granularity.group_size
+
+
+@dataclass(frozen=True)
+class FP8BackendResolution:
+    """The single architecture/backend decision used by FP8 callers."""
+
+    backend: FP8Backend
+    capability_major: int
+
+    @property
+    def is_hopper(self) -> bool:
+        return self.capability_major == 9
+
+    @property
+    def is_blackwell(self) -> bool:
+        return self.capability_major >= 10
+
+    @property
+    def routing_block_size(self) -> int:
+        # Both Hopper profiles and the Blackwell blockscaled path use
+        # the 128-row metadata contract.  The activation/weight profile remains
+        # in the FP8 config and is not a routing decision.
+        return 128
+
+
+def _coerce_fp8_backend(value) -> FP8Backend | None:
+    if value is None:
+        return None
+    if isinstance(value, FP8Backend):
+        return value
+    try:
+        return FP8Backend(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Unsupported FP8 backend: {value!r}") from exc
+
+
+def resolve_fp8_backend(
+    backend=None,
+    device: Optional[torch.device] = None,
+) -> FP8BackendResolution:
+    """Resolve an optional backend request against the actual CUDA device.
+
+    Exact SM90 resolves to Hopper and SM100+ defaults to Blackwell.
+    Other architectures are rejected rather than silently entering a
+    mismatched kernel path.
+    """
+    if backend is not None and hasattr(backend, "fp8_backend"):
+        backend = getattr(backend, "fp8_backend")
+    requested = _coerce_fp8_backend(backend)
+
+    if device is None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("FP8 backend resolution requires CUDA")
+        device = torch.device("cuda", torch.cuda.current_device())
+    if getattr(device, "type", None) != "cuda":
+        raise RuntimeError(f"FP8 backend resolution requires a CUDA device, got {device!r}")
+
+    major, _ = torch.cuda.get_device_capability(device)
+    if major == 9:
+        default = FP8Backend.HOPPER
+    elif major >= 10:
+        default = FP8Backend.BLACKWELL
+    else:
+        raise RuntimeError(
+            f"SonicMoE FP8 supports exact SM90 and SM100+ GPUs, got SM{major}"
+        )
+
+    resolved = default if requested is None else requested
+    if resolved is FP8Backend.BLACKWELL and major < 10:
+        raise RuntimeError("The Blackwell FP8 backend only supports SM100+ GPUs")
+    if resolved is FP8Backend.HOPPER and major != 9:
+        raise RuntimeError(
+            f"The Hopper FP8 backend requires an exact SM90 GPU, got SM{major}"
+        )
+    return FP8BackendResolution(resolved, major)
 
 
 def get_default_fp8_protocol() -> FP8Protocol:
@@ -95,8 +171,11 @@ def validate_fp8_protocol(protocol: FP8Protocol) -> FP8Protocol:
     }:
         raise ValueError("Only 1x32 and 1x128 scale granularities are supported in the current FP8 protocol")
 
-    if protocol.backend is not FP8Backend.BLACKWELL:
-        raise ValueError("The current FP8 protocol requires SM100+")
+    if protocol.backend not in {
+        FP8Backend.BLACKWELL,
+        FP8Backend.HOPPER,
+    }:
+        raise ValueError("Only Blackwell and Hopper FP8 backends are supported")
 
     return protocol
 
@@ -114,13 +193,12 @@ def validate_fp8_runtime_support(
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
 
-    if not is_blackwell_device(device):
-        raise RuntimeError("The current FP8 protocol only supports SM100+ GPUs")
+    resolve_fp8_backend(protocol.backend, device)
 
     if quack_enabled is None:
         quack_enabled = is_using_quack_gemm()
 
     if protocol.requires_quack_gemm and not quack_enabled:
-        raise RuntimeError("The current FP8 protocol requires the QuACK GEMM path on SM100")
+        raise RuntimeError("The current FP8 protocol requires the QuACK GEMM path")
 
     return protocol

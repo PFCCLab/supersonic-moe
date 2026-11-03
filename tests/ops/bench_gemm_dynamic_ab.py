@@ -76,7 +76,8 @@ def run(mode):
     from sonicmoe.enums import ActivationType
     from sonicmoe.ernie_compat import SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches
     import sonicmoe.functional as functional
-    functional._ALIGNMENT_ASSUMED = True
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
+    sm100_funcs._ALIGNMENT_ASSUMED = True
 
     if mode == "static":
         apply_static_patch()

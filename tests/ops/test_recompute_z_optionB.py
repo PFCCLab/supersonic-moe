@@ -11,7 +11,7 @@ Two layers of validation:
         - z_scale (UE8M0) bytes are byte-equal.
 
   (2) **End-to-end equivalence**: the existing recompute_z=True path now
-      goes through Option B (because we rewired ``_recompute_z_fp8``). Re-
+      goes through Option B (because we rewired ``sm100_funcs._recompute_z_fp8``). Re-
       run a small MLP forward+backward, check out/dx/ds/dw1/dw2 are
       bit-equal (cosine=1, rrmse=0) to the recompute_z=False baseline.
 
@@ -166,8 +166,9 @@ def _e2e_equivalence_child(recompute_z: bool, T: int, K: int, E: int, H: int, I:
 
     from sonicmoe.ernie_compat import SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches
     import sonicmoe.functional as functional
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
-    functional._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_ASSUMED = True
     if recompute_z:
         os.environ["SONIC_MOE_FP8_RECOMPUTE_Z"] = "1"
     else:

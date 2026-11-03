@@ -48,6 +48,7 @@ def main():
     from sonicmoe import MoE, enable_quack_gemm
     from sonicmoe.enums import ActivationType
     import sonicmoe.functional as F_mod
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
     torch.manual_seed(42)
     moe = MoE(
@@ -76,7 +77,7 @@ def main():
     orig_router = F_mod.TC_Softmax_Topk_Router_Function
     F_mod.TC_Softmax_Topk_Router_Function = _UniformRouter
     if args.mode == "fp8":
-        F_mod._ALIGNMENT_ASSUMED = True
+        sm100_funcs._ALIGNMENT_ASSUMED = True
 
     def zero_grads():
         for p in moe.parameters():

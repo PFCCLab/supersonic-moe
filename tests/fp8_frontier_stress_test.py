@@ -40,6 +40,7 @@ from sonicmoe.ernie_compat import (
     invalidate_weight_caches,
 )
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
 
 def _make_node_and_data(T, E, K, H, I, seed=42, imbalance="none"):
@@ -142,8 +143,8 @@ STRESS_SHAPES = [
 def test_shape_no_crash(T, E, K, H, I):
     """Forward+backward completes without crash on this shape."""
     # Force alignment assumed for steady-state path
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     node, x, grad_out, tpe, d_idx, d_probs = _make_node_and_data(T, E, K, H, I)
 
@@ -167,8 +168,8 @@ ROUTING_PATTERNS = ["none", "skew", "extreme"]
 def test_routing_robustness(imbalance):
     """FP8 path handles various routing imbalances without crash."""
     T, E, K, H, I = 4096, 8, 8, 3072, 1536
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     node, x, grad_out, tpe, d_idx, d_probs = _make_node_and_data(
         T, E, K, H, I, imbalance=imbalance
@@ -185,8 +186,8 @@ def test_routing_robustness(imbalance):
 def test_multi_iter_stability():
     """Multiple iterations don't accumulate numerical instability."""
     T, E, K, H, I = 8192, 8, 8, 3072, 1536
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     node, x, grad_out, tpe, d_idx, d_probs = _make_node_and_data(T, E, K, H, I)
 
@@ -208,8 +209,8 @@ def test_multi_iter_stability():
 def test_determinism_reference_shape():
     """production-like reference shape is bit-deterministic across runs."""
     T, E, K, H, I = 8192, 8, 8, 3072, 1536
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     node, x, grad_out, tpe, d_idx, d_probs = _make_node_and_data(T, E, K, H, I)
 
@@ -236,8 +237,8 @@ def test_determinism_reference_shape():
 def test_gradient_flow():
     """All expert parameters receive non-zero gradients (via node.step())."""
     T, E, K, H, I = 4096, 8, 8, 3072, 1536
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     node, x, grad_out, tpe, d_idx, d_probs = _make_node_and_data(T, E, K, H, I)
 

@@ -59,7 +59,6 @@ BF16_DW_RRMSE = 0.02
 
 FP8_RRMSE = 0.10
 FP8_COSINE = 0.99
-FP8_DW_RRMSE = 0.15
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,7 +350,7 @@ def _torch_moe_gold_backward(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SonicMoE runner (calls moe_TC_softmax_topk_layer through _UpProjection/_DownProjection)
+# SonicMoE runner (calls _UpProjection/_DownProjection directly)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _run_sonicmoe_bf16(
@@ -1402,7 +1401,11 @@ def test_down_projection_router_score_bridge_bit_exact():
     T, H, I, E, K = 256, 768, 384, 8, 2
     TK = T * K
     N_PAD = 128
-    x, w1_split, w2, topk_indices, source_values = _make_test_data(T, H, I, E, K, seed=314159)
+    x, w1_split, w2, _, source_values = _make_test_data(T, H, I, E, K, seed=314159)
+    token_ids = torch.arange(T, dtype=torch.int32, device="cuda")
+    expert_lo = token_ids % E
+    topk_indices = torch.stack([(expert_lo + 1) % E, expert_lo], dim=1)
+    assert bool(torch.any(topk_indices[:, 0] > topk_indices[:, 1]).item())
     w1_param, w2_param = _convert_weights_for_sonicmoe(w1_split, w2)
     # The current functional API receives expert-major Sonic weights directly.
     w1_func = w1_param
@@ -1451,9 +1454,15 @@ def test_down_projection_router_score_bridge_bit_exact():
         z = z.detach()
         z.stop_gradient = False
 
-        # DeepEP may reorder received rows.  Reverse order makes an accidental
-        # identity mapping visible while keeping every source index unique.
-        score_src_idx = torch.arange(TK - 1, -1, -1, dtype=torch.int32, device="cuda")
+        # Metadata stores each token's routes in expert order, not the original
+        # top-k slot order.  K=2 and descending route pairs make the mapping
+        # deliberately non-identity.
+        route_slots = torch.argsort(topk_indices, dim=1).cast(torch.int32)
+        score_src_idx = (
+            token_ids.reshape([-1, 1]) * K + route_slots
+        ).reshape([-1]).contiguous()
+        identity = torch.arange(TK, dtype=torch.int32, device="cuda")
+        assert bool(torch.any(score_src_idx != identity).item())
         metadata_values = _gather_router_scores_i32(source_values.detach().reshape([-1]), score_src_idx)
         # Real DeepEP metadata is block-aligned and can contain score padding.
         # Keep source indices route-sized while exercising a larger score buffer.
@@ -1464,6 +1473,7 @@ def test_down_projection_router_score_bridge_bit_exact():
             ]
         )
         grad_out = torch.randn(T, H, dtype=torch.bfloat16, device="cuda")
+        assert bool(torch.any(grad_out != grad_out[0, 0]).item())
 
         metadata_reference = metadata_values.detach().clone()
         metadata_reference.stop_gradient = False
@@ -1530,12 +1540,116 @@ def test_down_projection_router_score_bridge_bit_exact():
         out_fused.backward(grad_out)
 
         assert bool(torch.all(out_fused.view(torch.uint8) == out_reference.view(torch.uint8)).item())
+        assert source_fused.grad is not None
+        assert tuple(source_fused.grad.shape) == (T, K)
+        assert bool(torch.isfinite(source_fused.grad).all().item())
+        assert float(source_fused.grad.float().abs().sum().item()) > 0.0
+        assert bool(torch.isfinite(expected_source_grad).all().item())
         assert bool(torch.all(source_fused.grad.view(torch.uint8) == expected_source_grad.view(torch.uint8)).item())
         assert bool(torch.all(z_fused.grad.view(torch.uint8) == expected_z_grad.view(torch.uint8)).item())
         assert bool(torch.all(w2_fused.grad.view(torch.uint8) == expected_w2_grad.view(torch.uint8)).item())
         assert source_fused.stop_gradient is False
         assert metadata_fused.stop_gradient is True
         assert metadata_fused.grad is None
+
+        # A distributed-style metadata source map may still be supplied by a
+        # lower-level caller when its original router source is frozen. Paddle
+        # requires backward to return None for that tensor input slot.
+        source_frozen = source_values.detach().clone()
+        assert source_frozen.stop_gradient is True
+        metadata_frozen = metadata_values.detach().clone()
+        z_frozen = z.detach().clone()
+        z_frozen.stop_gradient = False
+        w2_frozen = w2_func.detach().clone()
+        assert w2_frozen.stop_gradient is True
+        out_frozen = _DownProjection.apply(
+            y1,
+            z_frozen,
+            w2_frozen,
+            None,
+            metadata_frozen,
+            s_scatter_idx,
+            expert_frequency_offset,
+            T,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            token_offsets,
+            True,
+            ActivationType.SWIGLU,
+            None,
+            None,
+            None,
+            source_frozen,
+            score_src_idx,
+        )
+        out_frozen.backward(grad_out)
+        assert source_frozen.grad is None
+        assert w2_frozen.grad is None
+        assert metadata_frozen.stop_gradient is True
+        assert metadata_frozen.grad is None
+        assert bool(torch.all(out_frozen.view(torch.uint8) == out_reference.view(torch.uint8)).item())
+
+        # Gate-only training: both expert weights are frozen while the original
+        # router score source remains differentiable. Backward must cross both
+        # PyLayers, return None for w2 and w1, and still reach the router edge.
+        source_gate_only = source_values.detach().clone()
+        source_gate_only.stop_gradient = False
+        metadata_gate_only = metadata_values.detach().clone()
+        x_gate_only = x.detach().clone()
+        w1_gate_only = w1_func.detach().clone()
+        w2_gate_only = w2_func.detach().clone()
+        assert w1_gate_only.stop_gradient is True
+        assert w2_gate_only.stop_gradient is True
+        y1_gate_only, z_gate_only = _UpProjection.apply(
+            x_gate_only,
+            w1_gate_only,
+            None,
+            expert_frequency_offset,
+            TK,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            None,
+            False,
+            ActivationType.SWIGLU,
+            False,
+            False,
+        )
+        out_gate_only = _DownProjection.apply(
+            y1_gate_only,
+            z_gate_only,
+            w2_gate_only,
+            None,
+            metadata_gate_only,
+            s_scatter_idx,
+            expert_frequency_offset,
+            T,
+            K,
+            0,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            token_offsets,
+            True,
+            ActivationType.SWIGLU,
+            None,
+            None,
+            None,
+            source_gate_only,
+            score_src_idx,
+        )
+        out_gate_only.backward(grad_out)
+        assert source_gate_only.grad is not None
+        assert bool(torch.isfinite(source_gate_only.grad).all().item())
+        assert float(source_gate_only.grad.float().abs().sum().item()) > 0.0
+        assert bool(torch.all(source_gate_only.grad.view(torch.uint8) == expected_source_grad.view(torch.uint8)).item())
+        assert w1_gate_only.grad is None
+        assert w2_gate_only.grad is None
     finally:
         _fp8_utils._IS_FP8_ACTIVE = old_fp8_active
         if old_env is None:
@@ -1589,149 +1703,6 @@ def test_stability_activation_scale(scale):
     # Relax threshold for larger activations
     threshold = BF16_RRMSE * (1 + scale)
     assert r < threshold, f"RRMSE {r:.6f} >= {threshold:.6f} at scale={scale}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Test 16: Route-level padding — FP8 non-aligned fwd+bwd (subprocess)
-# ═══════════════════════════════════════════════════════════════════════════
-
-_FP8_ROUTE_PAD_TEMPLATE = textwrap.dedent("""\
-    import os, sys, json
-    os.environ["USE_QUACK_GEMM"] = "1"
-    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
-    import torch, torch.nn.functional as F
-    sys.path.insert(0, {project_root!r})
-
-    from tests.ops.test_moe_module import (
-        _make_test_data, _convert_weights_for_sonicmoe,
-        _torch_moe_gold, _torch_moe_gold_backward,
-        rrmse, cosine_sim, split_to_interleaved,
-    )
-    from sonicmoe.functional import (
-        moe_TC_softmax_topk_layer,
-        clear_all_fp8_weight_caches,
-        _refresh_fp8_config,
-    )
-    from sonicmoe.functional.utils import enable_fp8
-    from sonicmoe.enums import ActivationType
-
-    T, H, I, E, K, seed = {T}, {H}, {I}, {E}, {K}, {seed}
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-    x, w1_split, w2_gold, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
-    w1_param, w2_param = _convert_weights_for_sonicmoe(w1_split, w2_gold)
-
-    # Router weights — routing will differ from deterministic, but that's OK
-    router_w = torch.randn(E, H, device="cuda", dtype=torch.bfloat16) * 0.01
-
-    x_input = x.detach().requires_grad_(True)
-    w1_func = w1_param.detach().requires_grad_(True)
-    w2_func = w2_param.detach().requires_grad_(True)
-
-    # Functional layout: parameter (E, 2I, H) -> functional (2I, H, E)
-    w1_f = w1_func.permute(1, 2, 0)
-    w2_f = w2_func.permute(1, 2, 0)
-
-    clear_all_fp8_weight_caches()
-    with enable_fp8(True):
-        _refresh_fp8_config()
-        o, router_logits, expert_freq = moe_TC_softmax_topk_layer(
-            x_input, router_w, w1_f, None, w2_f, None,
-            K=K, stream_id=0, activation_type=ActivationType.SWIGLU,
-        )
-
-    assert o.shape == (T, H), f"Output shape mismatch: {{o.shape}} vs {{(T, H)}}"
-    assert not torch.isnan(o).any(), "Output contains NaN"
-    assert not torch.isinf(o).any(), "Output contains Inf"
-
-    # Run backward
-    grad_out = torch.randn_like(o)
-    o.backward(grad_out)
-
-    assert w1_func.grad is not None, "w1 gradient is None"
-    assert w2_func.grad is not None, "w2 gradient is None"
-    assert not torch.isnan(w1_func.grad).any(), "w1 gradient contains NaN"
-    assert not torch.isnan(w2_func.grad).any(), "w2 gradient contains NaN"
-
-    dw1_norm = w1_func.grad.float().norm().item()
-    dw2_norm = w2_func.grad.float().norm().item()
-    assert dw1_norm > 1e-8, f"dw1 norm too small: {{dw1_norm}}"
-    assert dw2_norm > 1e-8, f"dw2 norm too small: {{dw2_norm}}"
-
-    # Compare FP8 (route-padded) vs BF16 using same router_w (same routing)
-    x_bf16 = x.detach().requires_grad_(True)
-    w1_bf16 = w1_param.detach().requires_grad_(True)
-    w2_bf16 = w2_param.detach().requires_grad_(True)
-    w1_bf16_f = w1_bf16.permute(1, 2, 0)
-    w2_bf16_f = w2_bf16.permute(1, 2, 0)
-
-    o_bf16, _, _ = moe_TC_softmax_topk_layer(
-        x_bf16, router_w, w1_bf16_f, None, w2_bf16_f, None,
-        K=K, stream_id=0, activation_type=ActivationType.SWIGLU,
-    )
-    o_bf16.backward(grad_out.detach())
-
-    r_out = rrmse(o.float(), o_bf16.float())
-    c_out = cosine_sim(o.float(), o_bf16.float())
-    r_dw1 = rrmse(w1_func.grad.float(), w1_bf16.grad.float())
-    r_dw2 = rrmse(w2_func.grad.float(), w2_bf16.grad.float())
-
-    print(json.dumps({{
-        "rrmse_out": round(r_out, 6),
-        "cosine_out": round(c_out, 6),
-        "rrmse_dw1": round(r_dw1, 6),
-        "rrmse_dw2": round(r_dw2, 6),
-        "dw1_norm": round(dw1_norm, 6),
-        "dw2_norm": round(dw2_norm, 6),
-    }}))
-""")
-
-
-@pytest.mark.parametrize("T,H,I,E,K", [
-    pytest.param(300, 768, 384, 32, 8, id="non-aligned-E32"),
-    pytest.param(256, 768, 384, 8, 2, id="aligned-regression"),
-])
-def test_fp8_route_padded_fwd_bwd(T, H, I, E, K):
-    """FP8 route-level padding: fwd+bwd produces valid output and gradients.
-
-    E=32,K=8 with T=300 gives per_expert~75 tokens — non-128-aligned.
-    Route-level padding pads metadata once so aligned fast path runs.
-    """
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    script = _FP8_ROUTE_PAD_TEMPLATE.format(
-        project_root=project_root, T=T, H=H, I=I, E=E, K=K, seed=42
-    )
-    env = os.environ.copy()
-    env["USE_QUACK_GEMM"] = "1"
-    env["SONIC_MOE_FP8_MODE"] = "perf"
-
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        capture_output=True, text=True, env=env, timeout=600,
-    )
-    if result.returncode != 0:
-        pytest.fail(f"FP8 route-pad subprocess failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}")
-
-    import json
-    for line in result.stdout.strip().splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            metrics = json.loads(line)
-            break
-    else:
-        pytest.fail(f"No JSON output from route-pad subprocess:\n{result.stdout}")
-
-    r_out = metrics["rrmse_out"]
-    c_out = metrics["cosine_out"]
-    r_dw1 = metrics["rrmse_dw1"]
-    r_dw2 = metrics["rrmse_dw2"]
-    print(f"  FP8 route-pad: out RRMSE={r_out:.6f}, cosine={c_out:.6f}")
-    print(f"  FP8 route-pad: dw1 RRMSE={r_dw1:.6f}, dw2 RRMSE={r_dw2:.6f}")
-    assert r_out < FP8_RRMSE, f"output RRMSE {r_out:.6f} >= {FP8_RRMSE}"
-    assert c_out > FP8_COSINE, f"output cosine {c_out:.6f} <= {FP8_COSINE}"
-    assert r_dw1 < FP8_DW_RRMSE, f"dw1 RRMSE {r_dw1:.6f} >= {FP8_DW_RRMSE}"
-    assert r_dw2 < FP8_DW_RRMSE, f"dw2 RRMSE {r_dw2:.6f} >= {FP8_DW_RRMSE}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

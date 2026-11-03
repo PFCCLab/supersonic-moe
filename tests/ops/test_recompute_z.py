@@ -49,9 +49,10 @@ def _child_run(recompute_z: bool, N: int, K: int, E: int, I: int):
 
     from sonicmoe.ernie_compat import SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches
     import sonicmoe.functional as functional
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     sys.path.insert(0, str(Path(__file__).parent))
     from test_mlpnode_precision import H, MockExpert, _zero_main_grads

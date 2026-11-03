@@ -40,9 +40,10 @@ import torch.nn.functional as F
 from sonicmoe.enums import ActivationType
 from sonicmoe.ernie_compat import SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
-functional._ALIGNMENT_ASSUMED = True
-functional._ALIGNMENT_STREAK = 100
+sm100_funcs._ALIGNMENT_ASSUMED = True
+sm100_funcs._ALIGNMENT_STREAK = 100
 
 H = 3072
 
@@ -250,7 +251,8 @@ import paddle; paddle.enable_compat()
 import torch
 from sonicmoe.ernie_compat import SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches
 import sonicmoe.functional as functional
-functional._ALIGNMENT_ASSUMED=True; functional._ALIGNMENT_STREAK=100
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
+sm100_funcs._ALIGNMENT_ASSUMED=True; sm100_funcs._ALIGNMENT_STREAK=100
 
 N,K,E,I,h={N},{K},{E},{I},{h}
 class ME:

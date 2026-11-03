@@ -121,8 +121,9 @@ def test_gold_precision(T, E, I):
     # FP8 MlpNode
     from sonicmoe.functional import clear_all_fp8_weight_caches
     import sonicmoe.functional as functional
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
     clear_all_fp8_weight_caches()
     invalidate_weight_caches()
     node = SonicMoEMlpNode(experts=experts, n_experts=E, hidden_size=H, intermediate_size=I)

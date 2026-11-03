@@ -52,13 +52,14 @@ import torch  # noqa: E402
 torch.cuda.set_device(gpu_id)
 
 import sonicmoe.functional as functional  # noqa: E402
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs  # noqa: E402
 from sonicmoe.ernie_compat import (  # noqa: E402
     SonicMoEMlpNode,
     invalidate_weight_caches,
 )
 
-functional._ALIGNMENT_ASSUMED = True
-functional._ALIGNMENT_STREAK = 100
+sm100_funcs._ALIGNMENT_ASSUMED = True
+sm100_funcs._ALIGNMENT_STREAK = 100
 
 E, H, I, T, K = 4, 1024, 512, 1024, 2
 

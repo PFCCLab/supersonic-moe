@@ -84,8 +84,9 @@ def child_run(case_name: str, N_recv: int, topk: int, E: int, I: int, dist: str)
         invalidate_weight_caches,
     )
     import sonicmoe.functional as functional
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     # Reuse gold/fp8 helpers from the existing precision test.
     sys.path.insert(0, str(Path(__file__).parent))

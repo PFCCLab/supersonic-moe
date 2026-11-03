@@ -52,6 +52,7 @@ from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
 S, H, I, E, K = {S}, {H}, {I}, {E}, {K}
 use_fp8 = {use_fp8}
@@ -59,8 +60,8 @@ warmup, iters = {warmup}, {iters}
 mode = "{mode}"
 
 functional.clear_all_fp8_weight_caches()
-functional._ALIGNMENT_ASSUMED = False
-functional._ALIGNMENT_STREAK = 0
+sm100_funcs._ALIGNMENT_ASSUMED = False
+sm100_funcs._ALIGNMENT_STREAK = 0
 paddle.seed(42)
 device = "cuda"
 moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
