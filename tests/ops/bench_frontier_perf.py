@@ -84,7 +84,8 @@ def benchmark_one_shape(T, E, I, topk=K, n_warmup=N_WARMUP, n_iters=N_ITERS):
         SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches,
     )
     import sonicmoe.functional as functional
-    functional._ALIGNMENT_ASSUMED = True
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
+    sm100_funcs._ALIGNMENT_ASSUMED = True
 
     device = "cuda"
     N_recv = T

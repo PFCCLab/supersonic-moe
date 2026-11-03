@@ -4,20 +4,33 @@
 
 """FP8 runtime configuration — extracted to break circular import.
 
-This module contains _FP8Config and its helper functions. It is imported by
-both functional/__init__.py and quack_utils/blockscaled_fp8_gemm.py, so it
-must NOT import from functional/__init__.py or quack_utils to avoid cycles.
+This module contains _FP8Config and its helper functions, plus the
+arch-neutral FP8 runtime state/helpers shared by functional/__init__.py and the
+SM100 backend (``_gemm_activation_name``, ``_STASHED_FP8_WEIGHTS``,
+``_PREQUANT_HIT_COUNT``, ``_use_wgrad_beta_accum``). It is imported by
+functional/__init__.py, quack_utils/blockscaled_fp8_gemm.py and
+quack_utils/sm100_funcs.py, so it must NOT import from functional/__init__.py
+or quack_utils to avoid cycles.
 """
 
 from __future__ import annotations
 
+import collections
 import os
+
+import torch
 
 from ..config import (
     DEFAULT_SITU_BETA,
     DEFAULT_SITU_LINEAR_BETA,
     SonicMoEConfig,
     get_active_config,
+)
+from ..enums import ActivationType
+from ..situ_params import (
+    encode_situ_activation,
+    is_situ_activation,
+    parse_situ_activation,
 )
 from .utils import is_fp8_active
 
@@ -207,8 +220,8 @@ class _FP8Config:
         cfg.activation_group_size = 32
         cfg.weight_block_size = 32
         cfg.fp8_backend = None
-        # BF16 path never reaches a SiTU epilogue (guarded in functional/
-        # __init__.py::_gemm_activation_name), but keep the slots populated so
+        # BF16 path never reaches a SiTU epilogue (guarded in
+        # ``_gemm_activation_name`` below), but keep the slots populated so
         # ``cfg.situ_beta`` is never an AttributeError.
         cfg.situ_beta = DEFAULT_SITU_BETA
         cfg.situ_linear_beta = DEFAULT_SITU_LINEAR_BETA
@@ -229,3 +242,135 @@ def _refresh_fp8_config() -> _FP8Config:
     global _fp8_cfg
     _fp8_cfg = _FP8Config()
     return _fp8_cfg
+
+
+# Stashed FP8 weight references — populated by MoE.stash_bf16_to_cpu(),
+# consumed by the SM100 FP8 backend (quack_utils/sm100_funcs.py) and
+# functional._DownProjection.forward
+# to bypass global cache lookups when bf16 param storage has been freed.
+# Keys: "w1_fused", "w2_varlen", "w2_dgated", "w1T_varlen"
+_STASHED_FP8_WEIGHTS: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+# Counter for pre-quantization hits (testing/diagnostics).
+_PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
+
+
+def _use_wgrad_beta_accum() -> bool:
+    return os.getenv("SONIC_MOE_FP8_WGRAD_TMA_ADD", "1").lower() in {"1", "true", "yes", "on"}
+
+
+# ---------------------------------------------------------------------------
+# Activation representation boundary
+# ---------------------------------------------------------------------------
+# Two representations of "which activation" coexist, and this function is the
+# only place they meet:
+#
+#   1. Upper layers (interface.run_sonic_moe, ernie_compat.mlp_node_v2,
+#      moe.MoE, jit_warmup, moe_TC_softmax_topk_layer, and the
+#      _UpProjection / _DownProjection signatures) carry an
+#      ``ActivationType`` enum member plus, for SiTU, two separate beta
+#      scalars living on ``_FP8Config`` (``cfg.situ_beta`` /
+#      ``cfg.situ_linear_beta``).
+#
+#   2. The quack_utils GEMM kernels (``gemm_gated`` / ``gemm_dgated`` /
+#      ``try_gemm_gated_tvm_ffi_sonic_prepared``) take a *string*, which is
+#      also part of every JIT / autotune cache key.  For SiTU that string
+#      must additionally encode the betas, because they are baked into the
+#      traced kernel as Constexpr values:
+#      ``"situ_glu:b=4.0:lb=25.0"``.
+#
+# ``_gemm_activation_name()`` below is the single conversion point:
+# ``ActivationType`` (+ cfg) -> GEMM string, calling
+# ``encode_situ_activation()`` for SiTU.  Nothing else may build a GEMM
+# activation string by hand.
+#
+# It is also the single place that refuses SiTU on the BF16 path: pass
+# ``fp8=False`` and a SiTU activation raises NotImplementedError, so it is
+# structurally impossible for a BF16 caller to silently fall back to SwiGLU.
+
+# ActivationType -> quack GEMM activation string.  Deliberately NOT
+# ``activation_type.value``: quack's ``"swiglu"`` entry already is
+# ``swiglu_precise``, and ``"swiglu_precise"`` is not a key in its
+# gate_fn_map / dgate_fn_map.  SITU_GLU is absent on purpose — it needs the
+# betas and is handled separately below.
+_GEMM_ACTIVATION_NAMES = {
+    ActivationType.SWIGLU: "swiglu",
+    ActivationType.SWIGLU_PRECISE: "swiglu",
+    ActivationType.GEGLU: "geglu",
+    ActivationType.REGLU: "reglu",
+}
+
+# Raw strings the quack kernels accept directly (no ActivationType member).
+_RAW_GEMM_ACTIVATIONS = frozenset({"swiglu", "swiglu_oai", "reglu", "geglu", "glu"})
+
+
+def _gemm_activation_name(
+    activation_type,
+    cfg=None,
+    *,
+    fp8: bool,
+    site: str,
+) -> str:
+    """Translate an ``ActivationType`` (or raw string) into a GEMM activation.
+
+    Parameters
+    ----------
+    activation_type:
+        ``ActivationType`` member, a raw quack activation string, or an
+        already-encoded ``"situ_glu:..."`` string.
+    cfg:
+        ``_FP8Config`` snapshot supplying ``situ_beta`` / ``situ_linear_beta``.
+        Only consulted for SiTU.
+    fp8:
+        Whether the call site is on the FP8 codepath.  SiTU on ``fp8=False``
+        raises: BF16 SiTU is not implemented in SonicMoE today and must never
+        silently degrade to SwiGLU.
+    site:
+        Human-readable call-site tag used in error messages.
+    """
+    # A bare ``"situ_glu"`` string is the enum's own ``.value``; normalise it so
+    # it resolves its betas from ``cfg`` exactly like the enum member does,
+    # instead of silently taking ``parse_situ_activation``'s built-in defaults.
+    if activation_type == ActivationType.SITU_GLU.value:
+        activation_type = ActivationType.SITU_GLU
+
+    # Already-encoded SiTU string: validate and pass through, re-encoding to
+    # normalise the key.
+    if is_situ_activation(activation_type):
+        if not fp8:
+            raise NotImplementedError(
+                f"sonicmoe/functional/fp8_config.py [{site}]: situ_glu is FP8-only "
+                "on SonicMoE today; the BF16 (non-FP8) GEMM path has no SiTU "
+                "epilogue. Enable FP8 (SonicMoEConfig(use_fp8=True) / "
+                "SONIC_MOE_FP8_MODE=1) or use a SwiGLU-family activation. "
+                "Falling back to swiglu is deliberately not done."
+            )
+        beta, linear_beta, precise = parse_situ_activation(activation_type)
+        return encode_situ_activation(beta, linear_beta, precise)
+
+    if activation_type is ActivationType.SITU_GLU:
+        if not fp8:
+            raise NotImplementedError(
+                f"sonicmoe/functional/fp8_config.py [{site}]: situ_glu is FP8-only "
+                "on SonicMoE today; the BF16 (non-FP8) GEMM path has no SiTU "
+                "epilogue. Enable FP8 (SonicMoEConfig(use_fp8=True) / "
+                "SONIC_MOE_FP8_MODE=1) or use a SwiGLU-family activation. "
+                "Falling back to swiglu is deliberately not done."
+            )
+        if cfg is None:
+            cfg = _get_fp8_config()
+        return encode_situ_activation(
+            getattr(cfg, "situ_beta", None),
+            getattr(cfg, "situ_linear_beta", None),
+        )
+
+    name = _GEMM_ACTIVATION_NAMES.get(activation_type)
+    if name is not None:
+        return name
+    if isinstance(activation_type, str) and activation_type in _RAW_GEMM_ACTIVATIONS:
+        return activation_type
+    raise NotImplementedError(
+        f"sonicmoe/functional/fp8_config.py [{site}]: activation "
+        f"{activation_type!r} has no QuACK gated-GEMM epilogue. Supported: "
+        f"{sorted(_RAW_GEMM_ACTIVATIONS)} plus situ_glu (FP8 only)."
+    )

@@ -123,11 +123,12 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
         invalidate_weight_caches,
     )
     import sonicmoe.functional as functional
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
     # FP8 path: force alignment assumed (skip H2D sync) for steady-state measurement
     if mode == "fp8":
-        functional._ALIGNMENT_ASSUMED = True
-        functional._ALIGNMENT_STREAK = 100
+        sm100_funcs._ALIGNMENT_ASSUMED = True
+        sm100_funcs._ALIGNMENT_STREAK = 100
 
     N_recv = T
     device = "cuda"

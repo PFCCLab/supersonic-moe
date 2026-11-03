@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import collections
 import os
 from functools import lru_cache, partial
 
@@ -84,126 +83,10 @@ from ..quack_utils.sm100_funcs import (
 from ..quack_utils.sm90_funcs import is_sm90_device
 
 
-# ---------------------------------------------------------------------------
-# Activation representation boundary
-# ---------------------------------------------------------------------------
-# Two representations of "which activation" coexist, and this module is the
-# only place they meet:
-#
-#   1. Upper layers (interface.run_sonic_moe, ernie_compat.mlp_node_v2,
-#      moe.MoE, jit_warmup, moe_TC_softmax_topk_layer, and the
-#      _UpProjection / _DownProjection signatures) carry an
-#      ``ActivationType`` enum member plus, for SiTU, two separate beta
-#      scalars living on ``_FP8Config`` (``cfg.situ_beta`` /
-#      ``cfg.situ_linear_beta``).
-#
-#   2. The quack_utils GEMM kernels (``gemm_gated`` / ``gemm_dgated`` /
-#      ``try_gemm_gated_tvm_ffi_sonic_prepared``) take a *string*, which is
-#      also part of every JIT / autotune cache key.  For SiTU that string
-#      must additionally encode the betas, because they are baked into the
-#      traced kernel as Constexpr values:
-#      ``"situ_glu:b=4.0:lb=25.0"``.
-#
-# ``_gemm_activation_name()`` below is the single conversion point:
-# ``ActivationType`` (+ cfg) -> GEMM string, calling
-# ``encode_situ_activation()`` for SiTU.  Nothing else in this file, and
-# nothing above it, may build a GEMM activation string by hand.
-#
-# It is also the single place that refuses SiTU on the BF16 path: pass
-# ``fp8=False`` and a SiTU activation raises NotImplementedError, so it is
-# structurally impossible for a BF16 caller to silently fall back to SwiGLU.
 from ..quack_utils.activation_situ import (
-    encode_situ_activation,
     is_situ_activation,
     parse_situ_activation,
 )
-
-# ActivationType -> quack GEMM activation string.  Deliberately NOT
-# ``activation_type.value``: quack's ``"swiglu"`` entry already is
-# ``swiglu_precise``, and ``"swiglu_precise"`` is not a key in its
-# gate_fn_map / dgate_fn_map.  SITU_GLU is absent on purpose — it needs the
-# betas and is handled separately below.
-_GEMM_ACTIVATION_NAMES = {
-    ActivationType.SWIGLU: "swiglu",
-    ActivationType.SWIGLU_PRECISE: "swiglu",
-    ActivationType.GEGLU: "geglu",
-    ActivationType.REGLU: "reglu",
-}
-
-# Raw strings the quack kernels accept directly (no ActivationType member).
-_RAW_GEMM_ACTIVATIONS = frozenset({"swiglu", "swiglu_oai", "reglu", "geglu", "glu"})
-
-
-def _gemm_activation_name(
-    activation_type,
-    cfg=None,
-    *,
-    fp8: bool,
-    site: str,
-) -> str:
-    """Translate an ``ActivationType`` (or raw string) into a GEMM activation.
-
-    Parameters
-    ----------
-    activation_type:
-        ``ActivationType`` member, a raw quack activation string, or an
-        already-encoded ``"situ_glu:..."`` string.
-    cfg:
-        ``_FP8Config`` snapshot supplying ``situ_beta`` / ``situ_linear_beta``.
-        Only consulted for SiTU.
-    fp8:
-        Whether the call site is on the FP8 codepath.  SiTU on ``fp8=False``
-        raises: BF16 SiTU is not implemented in SonicMoE today and must never
-        silently degrade to SwiGLU.
-    site:
-        Human-readable call-site tag used in error messages.
-    """
-    # A bare ``"situ_glu"`` string is the enum's own ``.value``; normalise it so
-    # it resolves its betas from ``cfg`` exactly like the enum member does,
-    # instead of silently taking ``parse_situ_activation``'s built-in defaults.
-    if activation_type == ActivationType.SITU_GLU.value:
-        activation_type = ActivationType.SITU_GLU
-
-    # Already-encoded SiTU string: validate and pass through, re-encoding to
-    # normalise the key.
-    if is_situ_activation(activation_type):
-        if not fp8:
-            raise NotImplementedError(
-                f"sonicmoe/functional/__init__.py [{site}]: situ_glu is FP8-only "
-                "on SonicMoE today; the BF16 (non-FP8) GEMM path has no SiTU "
-                "epilogue. Enable FP8 (SonicMoEConfig(use_fp8=True) / "
-                "SONIC_MOE_FP8_MODE=1) or use a SwiGLU-family activation. "
-                "Falling back to swiglu is deliberately not done."
-            )
-        beta, linear_beta, precise = parse_situ_activation(activation_type)
-        return encode_situ_activation(beta, linear_beta, precise)
-
-    if activation_type is ActivationType.SITU_GLU:
-        if not fp8:
-            raise NotImplementedError(
-                f"sonicmoe/functional/__init__.py [{site}]: situ_glu is FP8-only "
-                "on SonicMoE today; the BF16 (non-FP8) GEMM path has no SiTU "
-                "epilogue. Enable FP8 (SonicMoEConfig(use_fp8=True) / "
-                "SONIC_MOE_FP8_MODE=1) or use a SwiGLU-family activation. "
-                "Falling back to swiglu is deliberately not done."
-            )
-        if cfg is None:
-            cfg = _get_fp8_config()
-        return encode_situ_activation(
-            getattr(cfg, "situ_beta", None),
-            getattr(cfg, "situ_linear_beta", None),
-        )
-
-    name = _GEMM_ACTIVATION_NAMES.get(activation_type)
-    if name is not None:
-        return name
-    if isinstance(activation_type, str) and activation_type in _RAW_GEMM_ACTIVATIONS:
-        return activation_type
-    raise NotImplementedError(
-        f"sonicmoe/functional/__init__.py [{site}]: activation "
-        f"{activation_type!r} has no QuACK gated-GEMM epilogue. Supported: "
-        f"{sorted(_RAW_GEMM_ACTIVATIONS)} plus situ_glu (FP8 only)."
-    )
 
 
 def _coerce_activation_type(activation_type):
@@ -362,10 +245,6 @@ def _pad_routing_metadata(
 
 # _use_epilogue_quant, _use_fp8_wgrad, _save_z_fp8, _recompute_z are
 # imported from .fp8_config (see the import block further below).
-
-
-def _use_wgrad_beta_accum() -> bool:
-    return os.getenv("SONIC_MOE_FP8_WGRAD_TMA_ADD", "1").lower() in {"1", "true", "yes", "on"}
 
 
 # Optional hook letting the host framework take over the expert weight-grad
@@ -608,17 +487,6 @@ def _prequant_bwd_key(ctx, name: str) -> _PrequantKey:
     token = _get_invocation_token(ctx)
     return name if token is None else (name, token)
 
-# Stashed FP8 weight references — populated by MoE.stash_bf16_to_cpu(),
-# consumed by the SM100 FP8 backend (quack_utils/sm100_funcs.py, read via its
-# lazy ``_functional()`` accessor) and _DownProjection.forward
-# to bypass global cache lookups when bf16 param storage has been freed.
-# Keys: "w1_fused", "w2_varlen", "w2_dgated", "w1T_varlen"
-_STASHED_FP8_WEIGHTS: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-
-# Counter for pre-quantization hits (testing/diagnostics).
-_PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
-
-
 
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
     if lhs is None or rhs is None:
@@ -652,61 +520,6 @@ def _alias_preallocated_pylayer_output(tensor: torch.Tensor) -> torch.Tensor:
     )
     tensor._share_buffer_to(alias)
     return alias
-
-
-def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
-    """Return cu_seqlens values as a Python tuple, cached on the tensor object.
-
-    Exactly ONE D2H sync per tensor object lifetime.  All subsequent calls
-    with the same tensor are pure Python attribute lookups — zero GPU sync.
-    """
-    cached = getattr(cu_seqlens, '_cached_cpu_tuple', None)
-    if cached is not None:
-        return cached
-    cpu_tuple = tuple(cu_seqlens.tolist())
-    cu_seqlens._cached_cpu_tuple = cpu_tuple
-    return cpu_tuple
-
-
-_ALIGNMENT_STREAK: int = 0
-_ALIGNMENT_ASSUMED: bool = True  # route-level padding guarantees 128-alignment
-_ALIGNMENT_STREAK_THRESHOLD: int = 3
-
-
-def _is_alignment_assumed() -> bool:
-    """Check if alignment is assumed via config, env var, or streak."""
-    cfg = get_active_config()
-    if cfg is not None and cfg.assume_aligned is not None:
-        return cfg.assume_aligned
-    return _ALIGNMENT_ASSUMED
-
-
-def _all_segments_128_aligned(cu_seqlens: torch.Tensor) -> bool:
-    """Return True if all expert segments are 128-aligned (no GEMM padding needed).
-
-    Pre-quantized activation input to blockscaled_fp8_gemm_varlen is only
-    beneficial when no padding is required, because the padding fallback must
-    dequantize -> pad -> re-quantize which is very expensive.
-
-    After ``_ALIGNMENT_STREAK_THRESHOLD`` consecutive aligned iterations, the
-    check is skipped entirely (zero D2H sync).  ``SonicMoEConfig(assume_aligned=True)``
-    or env var ``SONIC_MOE_FP8_ASSUME_ALIGNED=1`` forces immediate zero-sync mode.
-    """
-    global _ALIGNMENT_STREAK, _ALIGNMENT_ASSUMED
-    if _is_alignment_assumed():
-        return True
-    if torch.cuda.is_current_stream_capturing():
-        return False
-    vals = _get_cu_seqlens_cpu(cu_seqlens)
-    result = all((vals[i + 1] - vals[i]) % 128 == 0 for i in range(len(vals) - 1))
-    if result:
-        _ALIGNMENT_STREAK += 1
-        if _ALIGNMENT_STREAK >= _ALIGNMENT_STREAK_THRESHOLD:
-            _ALIGNMENT_ASSUMED = True
-    else:
-        _ALIGNMENT_STREAK = 0
-    return result
-
 
 
 def _parse_runtime_precision(name: str, default: str, allowed: set[str]) -> str:
@@ -751,6 +564,10 @@ def _use_blockscaled_fp8_downproj() -> bool:
 
 # Import from fp8_config to break circular import with quack_utils
 from .fp8_config import (  # noqa: E402
+    _PREQUANT_HIT_COUNT,
+    _STASHED_FP8_WEIGHTS,
+    _gemm_activation_name,
+    _use_wgrad_beta_accum,
     _FP8Config,
     _fp8_enabled,
     _fp8_mode,
@@ -1046,11 +863,9 @@ class _UpProjection(torch.autograd.Function):
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             cfg = fp8_config if fp8_config is not None else _get_fp8_config()
             if cfg.enabled:
-                global _ALIGNMENT_ASSUMED
                 fp8_kernels.validate_config(cfg, x.device)
                 _evict_per_tensor_caches_once()
                 aligned = fp8_kernels.segments_aligned(expert_frequency_offset)
-                _ALIGNMENT_ASSUMED = aligned
                 cfg.alignment_assumed = aligned
 
                 if aligned:

@@ -58,7 +58,7 @@ def resolve_warmup_activation(activation_type):
     if bare:
         # Same source of truth as ``_FP8Config.__init__`` (fp8_config.py) and
         # therefore as the GEMM call sites in
-        # ``functional/__init__.py::_gemm_activation_name``.  Read the active
+        # ``functional/fp8_config.py::_gemm_activation_name``.  Read the active
         # config directly rather than the ``_FP8Config`` singleton, which is
         # only refreshed at forward entry and would be stale here.
         from .config import SonicMoEConfig, get_active_config
@@ -316,8 +316,8 @@ def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool,
     from .ernie_compat.mlp_node_v2 import (
         SonicMoEMlpNode, invalidate_weight_caches, flush_native_grads,
     )
-    from . import functional
-    functional._ALIGNMENT_ASSUMED = True
+    from .quack_utils import sm100_funcs
+    sm100_funcs._ALIGNMENT_ASSUMED = True
 
     topk = min(E, 8)
     N_recv = total_K // topk  # approximate: each token routed to topk experts

@@ -54,6 +54,7 @@ def main() -> None:
         SonicMoEMlpNode, flush_native_grads, invalidate_weight_caches,
     )
     import sonicmoe.functional as functional
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
     from sonicmoe.quack_utils import sm100_funcs
 
     # Patch the dGated kernel call site by wrapping the imported alias inside
@@ -84,8 +85,8 @@ def main() -> None:
     args_captures = args.captures  # legacy
     fmod.gemm_dgated_kernel = hooked
 
-    functional._ALIGNMENT_ASSUMED = True
-    functional._ALIGNMENT_STREAK = 100
+    sm100_funcs._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_STREAK = 100
 
     H, I, E, topk, T = args.H, args.I, args.E, args.topk, args.T
 

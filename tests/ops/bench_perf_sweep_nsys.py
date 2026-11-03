@@ -73,7 +73,8 @@ import torch
 import paddle; paddle.enable_compat(); import torch.cuda
 from sonicmoe.ernie_compat import SonicMoEMlpNode, invalidate_weight_caches, flush_native_grads
 import sonicmoe.functional as functional
-functional._ALIGNMENT_ASSUMED = True; functional._ALIGNMENT_STREAK = 100
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
+sm100_funcs._ALIGNMENT_ASSUMED = True; sm100_funcs._ALIGNMENT_STREAK = 100
 E, N_recv, H, I, TOPK = {E}, {N_recv_adj}, {H}, {I}, {TOPK}
 tok_per_expert = {tok_per_expert}
 class ME:
@@ -125,8 +126,9 @@ import torch
 import paddle; paddle.enable_compat(); import torch.cuda
 from sonicmoe.ernie_compat import SonicMoEMlpNode, invalidate_weight_caches, flush_native_grads
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 from bench_mlpnode_topk_nsys import gpu_projection_us
-functional._ALIGNMENT_ASSUMED = True; functional._ALIGNMENT_STREAK = 100
+sm100_funcs._ALIGNMENT_ASSUMED = True; sm100_funcs._ALIGNMENT_STREAK = 100
 
 TOPK = {TOPK}
 tasks = {json.dumps(tasks)}

@@ -4513,7 +4513,7 @@ def blockscaled_fp8_gemm_varlen(
         if pre_quantized_act:
             # Pre-quantized with non-aligned segments: dequant is lossy.
             # This path should be avoided (see _all_segments_128_aligned guard
-            # in functional/__init__.py). Fallback: raw cast + re-quantize.
+            # in quack_utils/sm100_funcs.py). Fallback: raw cast + re-quantize.
             a_bf16 = a.to(torch.bfloat16)
         else:
             a_bf16 = a

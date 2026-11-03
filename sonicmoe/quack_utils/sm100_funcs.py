@@ -8,23 +8,29 @@ CUTLASS blockscaled kernels with E4M3 data, ISA-packed UE8M0 1x32 activation
 scales and per-row 1x32 weight scales; expert segments must be 128-aligned.
 Exposes the same op names, signatures and return arity as ``sm90_funcs``.
 
-Shared runtime state (``_PREQUANT_HIT_COUNT``, ``_STASHED_FP8_WEIGHTS``, the
-alignment streak behind ``_all_segments_128_aligned``) and the activation-name
-conversion point ``_gemm_activation_name`` stay in ``sonicmoe.functional``:
-tests, ``moe.py`` and ``jit_warmup`` read and mutate them there.  This module
-must not import that package at top level (``functional`` imports this module
-while it is still initializing), so they are looked up through
-``_functional()`` at call time.
+The 128-row alignment check ``_all_segments_128_aligned`` and its streak state
+(``_ALIGNMENT_ASSUMED`` / ``_ALIGNMENT_STREAK``; tests set them on this module)
+live here.  Arch-neutral state and helpers shared with ``sonicmoe.functional``
+(``_gemm_activation_name``, ``_STASHED_FP8_WEIGHTS``, ``_PREQUANT_HIT_COUNT``,
+``_use_wgrad_beta_accum``) live in ``functional/fp8_config.py``.  This module
+must not import ``sonicmoe.functional`` itself: ``functional`` imports this
+module while it is still initializing.
 """
 
 from __future__ import annotations
 
-import sys
-
 import torch
 
+from ..config import get_active_config
 from ..enums import ActivationType
-from ..functional.fp8_config import _FP8Config, _get_fp8_config
+from ..functional.fp8_config import (
+    _PREQUANT_HIT_COUNT,
+    _STASHED_FP8_WEIGHTS,
+    _FP8Config,
+    _gemm_activation_name,
+    _get_fp8_config,
+    _use_wgrad_beta_accum,
+)
 from .blockscaled_fp8_gemm import (
     _SF_TILE_K,
     _SF_TILE_M,
@@ -32,6 +38,7 @@ from .blockscaled_fp8_gemm import (
     _SF_VEC_SIZE,
     _div_up,
     _gather_isa_packed_scales_kernel,
+    _get_cu_seqlens_cpu,
     _get_padding_plan,
     _run_cutlass_blockscaled_gemm,
     _run_cutlass_blockscaled_gemm_varlen_k,
@@ -68,16 +75,44 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 _GATED_OUTPUT_PAYLOAD_ATTR = "_sonic_preallocated_gated_outputs"
 
 
-# Root package object, captured at import time. paddlefleet_ops renames the
-# sys.modules keys after import (``sonicmoe.*`` -> ``paddlefleet_ops.sonicmoe.*``),
-# so a name-based lookup at call time (``import_module("..functional", __package__)``)
-# raises ModuleNotFoundError. The package attribute survives the rename.
-_ROOT_PKG = sys.modules[__package__.rpartition(".")[0]]
+_ALIGNMENT_STREAK: int = 0
+_ALIGNMENT_ASSUMED: bool = True  # route-level padding guarantees 128-alignment
+_ALIGNMENT_STREAK_THRESHOLD: int = 3
 
 
-def _functional():
-    """``sonicmoe.functional`` (fully initialized by the time any op runs)."""
-    return _ROOT_PKG.functional
+def _is_alignment_assumed() -> bool:
+    """Check if alignment is assumed via config, env var, or streak."""
+    cfg = get_active_config()
+    if cfg is not None and cfg.assume_aligned is not None:
+        return cfg.assume_aligned
+    return _ALIGNMENT_ASSUMED
+
+
+def _all_segments_128_aligned(cu_seqlens: torch.Tensor) -> bool:
+    """Return True if all expert segments are 128-aligned (no GEMM padding needed).
+
+    Pre-quantized activation input to blockscaled_fp8_gemm_varlen is only
+    beneficial when no padding is required, because the padding fallback must
+    dequantize -> pad -> re-quantize which is very expensive.
+
+    After ``_ALIGNMENT_STREAK_THRESHOLD`` consecutive aligned iterations, the
+    check is skipped entirely (zero D2H sync).  ``SonicMoEConfig(assume_aligned=True)``
+    or env var ``SONIC_MOE_FP8_ASSUME_ALIGNED=1`` forces immediate zero-sync mode.
+    """
+    global _ALIGNMENT_STREAK, _ALIGNMENT_ASSUMED
+    if _is_alignment_assumed():
+        return True
+    if torch.cuda.is_current_stream_capturing():
+        return False
+    vals = _get_cu_seqlens_cpu(cu_seqlens)
+    result = all((vals[i + 1] - vals[i]) % 128 == 0 for i in range(len(vals) - 1))
+    if result:
+        _ALIGNMENT_STREAK += 1
+        if _ALIGNMENT_STREAK >= _ALIGNMENT_STREAK_THRESHOLD:
+            _ALIGNMENT_ASSUMED = True
+    else:
+        _ALIGNMENT_STREAK = 0
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +263,7 @@ def _fused_blockscaled_gated_forward(
             gated_output_payload = getattr(
                 x_scales_tk_pre, _GATED_OUTPUT_PAYLOAD_ATTR, None
             )
-        _functional()._PREQUANT_HIT_COUNT["activation_fwd"] += 1
+        _PREQUANT_HIT_COUNT["activation_fwd"] += 1
     else:
         x_fp8, x_scales_t = quantize_and_pack_activation(x)
 
@@ -257,7 +292,7 @@ def _fused_blockscaled_gated_forward(
     cfg = fp8_config if fp8_config is not None else _get_fp8_config()
     epilogue_quant = cfg.epilogue_quant and cfg.save_z_fp8
     # ActivationType -> GEMM string (SiTU betas baked into the key here).
-    gemm_activation = _functional()._gemm_activation_name(
+    gemm_activation = _gemm_activation_name(
         activation_type, cfg, fp8=True, site="_fused_blockscaled_gated_forward"
     )
     N = w1.shape[1]  # pretransposed weight is (E, 2I, H)
@@ -439,7 +474,7 @@ def _recompute_z_fp8(
             raise ValueError("x_fp8_pre and x_scales_pre must be provided together")
         x_fp8 = x_fp8_pre
         x_scales_t = x_scales_pre
-        _functional()._PREQUANT_HIT_COUNT["activation_recompute"] += 1
+        _PREQUANT_HIT_COUNT["activation_recompute"] += 1
     else:
         if x is None:
             raise ValueError("BF16 x is required when no prequant activation payload is provided")
@@ -488,7 +523,7 @@ def _recompute_z_bf16(
             raise ValueError("x_fp8_pre and x_scales_pre must be provided together")
         x_fp8 = x_fp8_pre
         x_scales_t = x_scales_pre
-        _functional()._PREQUANT_HIT_COUNT["activation_recompute"] += 1
+        _PREQUANT_HIT_COUNT["activation_recompute"] += 1
     else:
         if x is None:
             raise ValueError("BF16 x is required when no prequant activation payload is provided")
@@ -574,7 +609,7 @@ def _padded_blockscaled_gated_forward(
 
     # Step 4: Weight FP8 (cached — same as aligned path)
     w1_fp8, w1_scales = (
-        _functional()._STASHED_FP8_WEIGHTS.get("w1_fused", None)
+        _STASHED_FP8_WEIGHTS.get("w1_fused", None)
         or precompute_weight_fp8_for_fused_gated(w1)
     )
 
@@ -583,7 +618,7 @@ def _padded_blockscaled_gated_forward(
     z_padded, y1_padded = quack_gemm_gated(
         x_fp8,
         w1_fp8,
-        activation=_functional()._gemm_activation_name(
+        activation=_gemm_activation_name(
             activation_type, _padded_cfg, fp8=True,
             site="_padded_blockscaled_gated_forward",
         ),
@@ -630,9 +665,13 @@ def validate_config(cfg, device) -> None:
 
 
 def segments_aligned(expert_frequency_offset: torch.Tensor) -> bool:
-    # ISA-packed scales need 128-row expert segments.  The check (and its
-    # alignment-streak state) lives in functional.
-    return _functional()._all_segments_128_aligned(expert_frequency_offset)
+    # ISA-packed scales need 128-row expert segments.  The result becomes the
+    # assumption for later steps: aligned skips the check (no D2H sync) until a
+    # step is misaligned, which re-enables it.
+    global _ALIGNMENT_ASSUMED
+    aligned = _all_segments_128_aligned(expert_frequency_offset)
+    _ALIGNMENT_ASSUMED = aligned
+    return aligned
 
 
 # ---------------------------------------------------------------------------
@@ -771,7 +810,7 @@ def gemm(
 def gemm_padded(x: torch.Tensor, w2: torch.Tensor, expert_frequency_offset: torch.Tensor):
     # Non-128-aligned segments: blockscaled_fp8_gemm_varlen pads internally.
     w2_fp8, w2_scales = (
-        _functional()._STASHED_FP8_WEIGHTS.get("w2_varlen", None)
+        _STASHED_FP8_WEIGHTS.get("w2_varlen", None)
         or precompute_weight_fp8(w2)
     )
     return blockscaled_fp8_gemm_varlen(
@@ -921,7 +960,7 @@ def wgrad_gemm_varlen_k(
     if accumulator is not None:
         run = (
             _run_cutlass_blockscaled_gemm_varlen_k_accumulate
-            if _functional()._use_wgrad_beta_accum()
+            if _use_wgrad_beta_accum()
             else _run_cutlass_blockscaled_gemm_varlen_k_tma_add
         )
         run(

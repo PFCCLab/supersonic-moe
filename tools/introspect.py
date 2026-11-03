@@ -1104,6 +1104,7 @@ def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
     """
     import torch
     import sonicmoe.functional as functional
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
     from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
     from sonicmoe.functional import moe_TC_softmax_topk_layer
     from sonicmoe.enums import ActivationType
@@ -1114,7 +1115,7 @@ def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
     model, _ = _build_model_and_input(device)
     E, T, H, K = SHAPE["E"], SHAPE["T"], SHAPE["H"], SHAPE["K"]
 
-    functional._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_ASSUMED = True
 
     if mode == "fp8":
         model.refresh_fp8_shadow_weights()
@@ -1444,6 +1445,7 @@ if mode == "fp8":
 from sonicmoe import MoE, enable_fp8, enable_quack_gemm
 from sonicmoe.enums import ActivationType
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
 
 T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
@@ -1451,8 +1453,8 @@ Mtile = 128
 
 # Reset FP8 state cleanly, then let it build up during warmup
 functional.clear_all_fp8_weight_caches()
-functional._ALIGNMENT_ASSUMED = False
-functional._ALIGNMENT_STREAK = 0
+sm100_funcs._ALIGNMENT_ASSUMED = False
+sm100_funcs._ALIGNMENT_STREAK = 0
 
 torch.manual_seed(42)
 device = torch.device("cuda:0")
@@ -1500,7 +1502,7 @@ w2_p = moe.c_proj.weight.permute(1, 2, 0)
 
 # Token rounding guarantees 128-alignment; standard path detects it via streak.
 # Set alignment assumed AFTER stash (stash needs it False during setup).
-functional._ALIGNMENT_ASSUMED = True
+sm100_funcs._ALIGNMENT_ASSUMED = True
 
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 
@@ -3922,6 +3924,7 @@ if mode.startswith("fp8"):
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 from sonicmoe.functional import moe_TC_softmax_topk_layer, count_cumsum, moe_general_routing_inputs
 from sonicmoe.functional.utils import enable_fp8
 
@@ -3938,8 +3941,8 @@ torch.cuda.manual_seed(seed)
 x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_(True)
 
 functional.clear_all_fp8_weight_caches()
-functional._ALIGNMENT_ASSUMED = False
-functional._ALIGNMENT_STREAK = 0
+sm100_funcs._ALIGNMENT_ASSUMED = False
+sm100_funcs._ALIGNMENT_STREAK = 0
 
 use_fp8 = mode.startswith("fp8")
 if use_fp8:
@@ -3970,7 +3973,7 @@ if mode in ("fp8_round", "bf16_round"):
         od = tok_idx.argsort().int()
         tok_idx = tok_idx[od]; exp_idx = exp_idx[od]
         rsc = sc[tok_idx, exp_idx].contiguous()
-    functional._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_ASSUMED = True
     with enable_fp8(use_fp8):
         o, ef_out = moe_general_routing_inputs(
             x_run, rsc, tok_idx, exp_idx, w1_p, None, w2_p, None,
@@ -4193,6 +4196,7 @@ os.environ["SONIC_MOE_FP8_MODE"] = "perf"
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 from sonicmoe.functional.utils import enable_fp8
 
@@ -4205,8 +4209,8 @@ moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
 x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
 
 functional.clear_all_fp8_weight_caches()
-functional._ALIGNMENT_ASSUMED = False
-functional._ALIGNMENT_STREAK = 0
+sm100_funcs._ALIGNMENT_ASSUMED = False
+sm100_funcs._ALIGNMENT_STREAK = 0
 moe.refresh_fp8_shadow_weights()
 moe.stash_bf16_to_cpu()
 w1_p = moe.c_fc.weight.permute(1, 2, 0)
@@ -4322,6 +4326,7 @@ os.environ["SONIC_MOE_FP8_MODE"] = "perf"
 from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 from sonicmoe.functional.utils import enable_fp8
 
@@ -4332,7 +4337,7 @@ moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
            add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
 x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
 functional.clear_all_fp8_weight_caches()
-functional._ALIGNMENT_ASSUMED = False; functional._ALIGNMENT_STREAK = 0
+sm100_funcs._ALIGNMENT_ASSUMED = False; sm100_funcs._ALIGNMENT_STREAK = 0
 moe.refresh_fp8_shadow_weights(); moe.stash_bf16_to_cpu()
 w1_p = moe.c_fc.weight.permute(1, 2, 0)
 w2_p = moe.c_proj.weight.permute(1, 2, 0)

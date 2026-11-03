@@ -6,6 +6,7 @@ paddle.enable_compat()
 import torch
 
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
 from .test_commons import TestCommons
 
@@ -35,8 +36,8 @@ class FP8AlignedContractTest(TestCommons):
         # Strip env var that would make BF16 reference use FP8 path
         os.environ.pop("SONIC_MOE_FP8_MODE", None)
         functional.clear_all_fp8_weight_caches()
-        functional._ALIGNMENT_ASSUMED = False
-        functional._ALIGNMENT_STREAK = 0
+        sm100_funcs._ALIGNMENT_ASSUMED = False
+        sm100_funcs._ALIGNMENT_STREAK = 0
 
     def _rrmse(self, a: torch.Tensor, b: torch.Tensor) -> float:
         return ((a.float() - b.float()).norm() / b.float().norm()).item()

@@ -592,9 +592,10 @@ elif mode == "nsys":
     from sonicmoe.enums import ActivationType
     from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
     import sonicmoe.functional as functional
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
     functional.clear_all_fp8_weight_caches()
-    functional._ALIGNMENT_ASSUMED = True
+    sm100_funcs._ALIGNMENT_ASSUMED = True
 
     moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
                intermediate_size=I, activation_function=ActivationType.SWIGLU,

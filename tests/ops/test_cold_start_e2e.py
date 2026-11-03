@@ -93,7 +93,8 @@ def main():
     )
     import sonicmoe.ernie_compat.mlp_node_v2 as _m
     import sonicmoe.functional as functional
-    functional._ALIGNMENT_ASSUMED = True
+    import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
+    sm100_funcs._ALIGNMENT_ASSUMED = True
 
     _print(f"Import: {time.perf_counter()-t1:.1f}s", 1)
 

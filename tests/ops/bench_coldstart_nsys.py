@@ -35,9 +35,10 @@ from sonicmoe.ernie_compat.mlp_node_v2 import (
 )
 import sonicmoe.ernie_compat.mlp_node_v2 as _m
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
 # ── Nuke all in-memory caches ──
-functional._ALIGNMENT_ASSUMED = True
+sm100_funcs._ALIGNMENT_ASSUMED = True
 functional.clear_all_fp8_weight_caches()
 clear_all_fp8_weight_caches()
 invalidate_weight_caches()

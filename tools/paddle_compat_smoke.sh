@@ -55,6 +55,7 @@ from sonicmoe import MoE
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
 import sonicmoe.functional as functional
+import sonicmoe.quack_utils.sm100_funcs as sm100_funcs
 
 T, H, I, E, K = 8192, 3072, 1536, 8, 8
 WARMUP, MEASURED = 5, 20
@@ -76,7 +77,7 @@ x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16))
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 w1_p = moe.c_fc.weight.permute(1, 2, 0)
 w2_p = moe.c_proj.weight.permute(1, 2, 0)
-functional._ALIGNMENT_ASSUMED = False; functional._ALIGNMENT_STREAK = 0
+sm100_funcs._ALIGNMENT_ASSUMED = False; sm100_funcs._ALIGNMENT_STREAK = 0
 
 xi = x.detach().clone().requires_grad_(True)
 with enable_fp8(False):
